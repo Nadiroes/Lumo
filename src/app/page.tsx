@@ -9,6 +9,7 @@ import { useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { BookWizard } from '@/components/lumo/book-wizard'
 import { ChatWindow } from '@/components/lumo/chat-window'
+import { LumoMark } from '@/components/lumo/logo'
 import { ModeHub } from '@/components/lumo/mode-hub'
 import { useHydrated } from '@/hooks/use-hydrated'
 import { useLumo } from '@/lib/lumo/store'
@@ -28,7 +29,16 @@ export default function Home() {
   }
 
   if (!mounted) {
-    return <main className="h-dvh bg-background" aria-busy="true" />
+    return (
+      <main
+        className="h-dvh bg-background flex flex-col items-center justify-center gap-4"
+        aria-busy="true"
+        aria-label="Chargement de Lumo"
+      >
+        <LumoMark className="h-14 w-14 animate-pulse" />
+        <p className="text-sm text-muted-foreground animate-pulse">Lumo s’allume…</p>
+      </main>
+    )
   }
 
   return (
