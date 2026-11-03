@@ -1,0 +1,282 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root {
+  --radius: 0.75rem;
+  /* Lumo — palette « lumière » : crème chaud, encre brun-charbon, soleil ambré */
+  --background: oklch(0.984 0.009 90);
+  --foreground: oklch(0.245 0.014 65);
+  --card: oklch(0.997 0.003 95);
+  --card-foreground: oklch(0.245 0.014 65);
+  --popover: oklch(0.997 0.003 95);
+  --popover-foreground: oklch(0.245 0.014 65);
+  --primary: oklch(0.72 0.16 65);
+  --primary-foreground: oklch(0.995 0.008 95);
+  --secondary: oklch(0.955 0.015 88);
+  --secondary-foreground: oklch(0.36 0.03 60);
+  --muted: oklch(0.955 0.012 88);
+  --muted-foreground: oklch(0.525 0.02 70);
+  --accent: oklch(0.943 0.032 85);
+  --accent-foreground: oklch(0.42 0.06 60);
+  --destructive: oklch(0.577 0.215 27);
+  --border: oklch(0.9 0.016 85);
+  --input: oklch(0.9 0.016 85);
+  --ring: oklch(0.72 0.16 65);
+  --chart-1: oklch(0.72 0.16 65);
+  --chart-2: oklch(0.64 0.14 40);
+  --chart-3: oklch(0.6 0.1 130);
+  --chart-4: oklch(0.78 0.12 85);
+  --chart-5: oklch(0.5 0.08 50);
+  --sidebar: oklch(0.968 0.014 88);
+  --sidebar-foreground: oklch(0.245 0.014 65);
+  --sidebar-primary: oklch(0.72 0.16 65);
+  --sidebar-primary-foreground: oklch(0.995 0.008 95);
+  --sidebar-accent: oklch(0.935 0.03 85);
+  --sidebar-accent-foreground: oklch(0.36 0.03 60);
+  --sidebar-border: oklch(0.9 0.016 85);
+  --sidebar-ring: oklch(0.72 0.16 65);
+}
+
+.dark {
+  /* Lumo la nuit — brun profond chaud, soleil ambré plus clair */
+  --background: oklch(0.205 0.013 65);
+  --foreground: oklch(0.925 0.013 88);
+  --card: oklch(0.245 0.015 65);
+  --card-foreground: oklch(0.925 0.013 88);
+  --popover: oklch(0.245 0.015 65);
+  --popover-foreground: oklch(0.925 0.013 88);
+  --primary: oklch(0.78 0.15 70);
+  --primary-foreground: oklch(0.2 0.02 65);
+  --secondary: oklch(0.29 0.016 65);
+  --secondary-foreground: oklch(0.9 0.012 88);
+  --muted: oklch(0.29 0.016 65);
+  --muted-foreground: oklch(0.69 0.016 80);
+  --accent: oklch(0.33 0.03 70);
+  --accent-foreground: oklch(0.92 0.02 88);
+  --destructive: oklch(0.65 0.2 25);
+  --border: oklch(0.32 0.016 65);
+  --input: oklch(0.32 0.016 65);
+  --ring: oklch(0.78 0.15 70);
+  --chart-1: oklch(0.78 0.15 70);
+  --chart-2: oklch(0.68 0.14 42);
+  --chart-3: oklch(0.66 0.1 130);
+  --chart-4: oklch(0.8 0.11 85);
+  --chart-5: oklch(0.58 0.08 50);
+  --sidebar: oklch(0.23 0.014 65);
+  --sidebar-foreground: oklch(0.925 0.013 88);
+  --sidebar-primary: oklch(0.78 0.15 70);
+  --sidebar-primary-foreground: oklch(0.2 0.02 65);
+  --sidebar-accent: oklch(0.3 0.025 70);
+  --sidebar-accent-foreground: oklch(0.9 0.012 88);
+  --sidebar-border: oklch(0.31 0.016 65);
+  --sidebar-ring: oklch(0.78 0.15 70);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/* ---- Typographie display Lumo ---- */
+.font-display {
+  font-family: var(--font-outfit), var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  letter-spacing: -0.015em;
+}
+
+/* ---- Scrollbars fins ---- */
+.scrollbar-thin::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: color-mix(in oklab, var(--muted-foreground) 28%, transparent);
+  border-radius: 9999px;
+}
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ---- Corps Markdown des messages ---- */
+.md-body {
+  line-height: 1.65;
+  font-size: 0.925rem;
+  overflow-wrap: break-word;
+}
+.md-body > * + * {
+  margin-top: 0.7em;
+}
+.md-body h1,
+.md-body h2,
+.md-body h3,
+.md-body h4 {
+  font-family: var(--font-outfit), var(--font-geist-sans), sans-serif;
+  font-weight: 650;
+  line-height: 1.3;
+  margin-top: 1.15em;
+}
+.md-body h1 { font-size: 1.3rem; }
+.md-body h2 { font-size: 1.12rem; }
+.md-body h3 { font-size: 1rem; }
+.md-body h4 { font-size: 0.925rem; }
+.md-body ul { list-style: disc; padding-left: 1.3rem; }
+.md-body ol { list-style: decimal; padding-left: 1.3rem; }
+.md-body li + li { margin-top: 0.25em; }
+.md-body code {
+  background: var(--secondary);
+  padding: 0.1em 0.35em;
+  border-radius: 0.375rem;
+  font-size: 0.85em;
+  font-family: var(--font-geist-mono), monospace;
+}
+.md-body pre {
+  background: oklch(0.235 0.012 65);
+  color: oklch(0.93 0.012 88);
+  padding: 0.85rem 1rem;
+  border-radius: 0.75rem;
+  overflow-x: auto;
+  font-size: 0.85em;
+}
+.md-body pre code {
+  background: transparent;
+  padding: 0;
+  color: inherit;
+}
+.md-body a {
+  color: var(--primary);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.md-body blockquote {
+  border-left: 3px solid var(--primary);
+  padding-left: 0.9rem;
+  color: var(--muted-foreground);
+}
+.md-body table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875em;
+  display: block;
+  overflow-x: auto;
+}
+.md-body th,
+.md-body td {
+  border: 1px solid var(--border);
+  padding: 0.45rem 0.6rem;
+  text-align: left;
+}
+.md-body th { background: var(--secondary); }
+.md-body hr { border-color: var(--border); }
+.md-body strong { font-weight: 660; }
+
+/* ---- Animations Lumo ---- */
+@keyframes lumo-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.1; }
+}
+.stream-cursor {
+  display: inline-block;
+  width: 0.5em;
+  height: 1.05em;
+  background: var(--primary);
+  border-radius: 2px;
+  margin-left: 2px;
+  animation: lumo-blink 1s infinite;
+  vertical-align: text-bottom;
+}
+
+@keyframes lumo-wave {
+  0%, 100% { transform: scaleY(0.25); }
+  50% { transform: scaleY(1); }
+}
+.wave-bar {
+  width: 3px;
+  border-radius: 9999px;
+  background: var(--primary);
+  transform-origin: bottom;
+  animation: lumo-wave 1s ease-in-out infinite;
+}
+
+@keyframes lumo-float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-7px); }
+}
+.float-slow { animation: lumo-float 5s ease-in-out infinite; }
+
+@keyframes lumo-typing {
+  0%, 100% { opacity: 0.3; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1); }
+}
+.typing-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  background: var(--muted-foreground);
+  animation: lumo-typing 1.2s infinite;
+}
+
+@keyframes lumo-shimmer {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+.shimmer {
+  background: linear-gradient(90deg, var(--muted) 25%, var(--accent) 50%, var(--muted) 75%);
+  background-size: 200% 100%;
+  animation: lumo-shimmer 1.6s linear infinite;
+}
+
+.glow-amber {
+  box-shadow:
+    0 0 0 1px color-mix(in oklab, var(--primary) 22%, transparent),
+    0 12px 48px -12px color-mix(in oklab, var(--primary) 40%, transparent);
+}
+
+@keyframes lumo-spin {
+  to { transform: rotate(360deg); }
+}
+.spin-slow { animation: lumo-spin 8s linear infinite; }
