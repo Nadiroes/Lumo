@@ -175,6 +175,10 @@ export interface MusicDoneEvent {
 export interface MusicStreamHandlers {
   onLyrics?: (lrc: string, title: string, source: string) => void
   onStudio?: (engine: string) => void
+  /** Une tentative de studio démarre (compte HF, accès public, DiffRhythm 1…) */
+  onStudioAttempt?: (label: string) => void
+  /** Une tentative a échoué, la suivante démarre — reason est lisible par l'utilisateur */
+  onStudioRetry?: (label: string, reason: string) => void
   onFallback?: (reason: string) => void
   onDone?: (evt: MusicDoneEvent) => void
   /** Appelé si le serveur renvoie une erreur HTTP (pas de flux du tout) */
@@ -236,6 +240,12 @@ export async function apiMusicStream(req: MusicRequest, handlers: MusicStreamHan
           break
         case 'studio':
           handlers.onStudio?.(String(evt.engine ?? 'DiffRhythm 2'))
+          break
+        case 'studio-attempt':
+          handlers.onStudioAttempt?.(String(evt.label ?? ''))
+          break
+        case 'studio-retry':
+          handlers.onStudioRetry?.(String(evt.label ?? ''), String(evt.reason ?? ''))
           break
         case 'done':
           handlers.onDone?.(evt as unknown as MusicDoneEvent)

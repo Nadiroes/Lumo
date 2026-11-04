@@ -21,8 +21,23 @@ export const maxDuration = 300
  * permet à l'interface d'afficher chaque étape en temps réel.
  */
 
-const SPACE_URL = 'https://aslp-lab-diffrhythm2.hf.space'
+const SPACE_V2 = 'https://aslp-lab-diffrhythm2.hf.space'
+const SPACE_V1 = 'https://aslp-lab-diffrhythm.hf.space'
 const ENGINE = 'DiffRhythm 2'
+
+/** Erreur typique ZeroGPU : quota gratuit épuisé (repérable pour message clair + repli). */
+function isQuotaError(msg: string): boolean {
+  return /zerogpu|gpu quota|exceeded your/i.test(msg)
+}
+
+/** Extrait « Try again in 21:41:07 » d'un message de quota ZeroGPU. */
+function quotaResetIn(msg: string): string | undefined {
+  return msg.match(/try again in ([\d:]+)/i)?.[1]
+}
+
+/* Mémoire courte (module) : index du dernier chemin studio gagnant, valable 10 min. */
+let lastGoodAttempt = -1
+let lastGoodAt = 0
 
 interface MusicBody {
   prompt: string
@@ -176,14 +191,21 @@ function fallbackTitle(body: MusicBody, lrc: string): string {
   return (words || 'Chanson Lumo').slice(0, 60)
 }
 
-/** Appel du Space DiffRhythm 2 et téléchargement du morceau. */
-async function callDiffRhythm(
+interface AudioResult {
+  base64: string
+  bytes: number
+  mime: string
+  engine: string
+}
+
+/** Appel du Space DiffRhythm 2 (avec ou sans token HF) et téléchargement du morceau. */
+async function callSpaceV2(
   lrc: string,
   body: MusicBody,
   token?: string,
-): Promise<{ base64: string; bytes: number; mime: string }> {
+): Promise<AudioResult> {
   const { Client } = await import('@gradio/client')
-  const client = await Client.connect(SPACE_URL, token ? ({ token } as never) : ({} as never))
+  const client = await Client.connect(SPACE_V2, token ? { token } : {})
 
   const preset = STYLE_TAGS[body.style ?? 'auto'] ?? ''
   const textPrompt = [preset, (body.tags ?? '').trim(), body.prompt].filter(Boolean).join(', ').slice(0, 300)
@@ -211,9 +233,72 @@ async function callDiffRhythm(
   const dl = await fetch(url, { signal: AbortSignal.timeout(90_000) })
   if (!dl.ok) throw new Error(`Téléchargement du morceau impossible (${dl.status})`)
   const buf = await dl.arrayBuffer()
-  const bytes = buf.byteLength
-  const base64 = Buffer.from(buf).toString('base64')
-  return { base64, bytes, mime: format === 'mp3' ? 'audio/mpeg' : format === 'ogg' ? 'audio/ogg' : 'audio/wav' }
+  return {
+    base64: Buffer.from(buf).toString('base64'),
+    bytes: buf.byteLength,
+    mime: format === 'mp3' ? 'audio/mpeg' : format === 'ogg' ? 'audio/ogg' : 'audio/wav',
+    engine: token ? 'DiffRhythm 2 · compte HF' : 'DiffRhythm 2 · accès public',
+  }
+}
+
+/**
+ * Dernier recours : Space officiel DiffRhythm 1 (95 s max, LRC avec timestamps).
+ * Convertit les paroles à sections en LRC horodaté (~4,2 s par ligne, chant régulier).
+ */
+async function callSpaceV1(lrc: string, body: MusicBody): Promise<AudioResult> {
+  const { Client } = await import('@gradio/client')
+  const client = await Client.connect(SPACE_V1, {})
+
+  const lines = lrc
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('['))
+  const START = 12
+  const PER_LINE = 4.2
+  let t = START
+  const stamped = lines.map((line) => {
+    const mm = String(Math.floor(t / 60)).padStart(2, '0')
+    const ss = (t % 60).toFixed(3).padStart(6, '0')
+    const out = `[${mm}:${ss}] ${line}`
+    t += PER_LINE
+    return out
+  })
+
+  const preset = STYLE_TAGS[body.style ?? 'auto'] ?? ''
+  const textPrompt = [preset, (body.tags ?? '').trim(), body.prompt].filter(Boolean).join(', ').slice(0, 300)
+  const format = body.format ?? 'mp3'
+  const duration = Math.max(30, Math.min(95, Math.round(START + lines.length * PER_LINE + 8)))
+
+  const result = (await Promise.race([
+    client.predict('/infer_music', {
+      lrc: stamped.join('\n'),
+      ref_audio_path: null,
+      text_prompt: textPrompt || 'pop, piano, warm vocals',
+      seed: 0,
+      randomize_seed: true,
+      steps: 32,
+      cfg_strength: 4.0,
+      file_type: format,
+      odeint_method: 'euler',
+      preference_infer: 'quality first',
+      Music_Duration: duration,
+    }),
+    new Promise<never>((_, rej) => setTimeout(() => rej(new Error('Délai du studio dépassé (240 s)')), 240_000)),
+  ])) as { data: unknown }
+
+  const first = Array.isArray(result.data) ? result.data[0] : result.data
+  const url = (first as { url?: string })?.url
+  if (!url) throw new Error('Le studio n’a pas renvoyé de fichier audio')
+
+  const dl = await fetch(url, { signal: AbortSignal.timeout(90_000) })
+  if (!dl.ok) throw new Error(`Téléchargement du morceau impossible (${dl.status})`)
+  const buf = await dl.arrayBuffer()
+  return {
+    base64: Buffer.from(buf).toString('base64'),
+    bytes: buf.byteLength,
+    mime: format === 'mp3' ? 'audio/mpeg' : format === 'ogg' ? 'audio/ogg' : 'audio/wav',
+    engine: 'DiffRhythm 1 · accès public',
+  }
 }
 
 export async function POST(req: NextRequest) {
@@ -266,15 +351,50 @@ export async function POST(req: NextRequest) {
           }
         }
 
-        /* ---- 2. Studio DiffRhythm 2 ---- */
+        /* ---- 2. Studio DiffRhythm — chaîne de repli (quota ZeroGPU ≠ par compte) ----
+         *  a) DiffRhythm 2 avec le token HF de l'utilisateur (quota personnel)
+         *  b) DiffRhythm 2 en accès public (seau de quota anonyme, distinct)
+         *  c) DiffRhythm 1 en accès public (95 s max, LRC horodaté)
+         * On ne bascule vers la synthèse locale qu'en dernier ressort. */
         safeEmit({ stage: 'studio', engine: ENGINE })
         const token = await getUserHfToken()
-        try {
-          const audio = await callDiffRhythm(lrc, body, token)
+        const attempts: { label: string; run: () => Promise<AudioResult> }[] = [
+          ...(token ? [{ label: 'votre compte Hugging Face', run: () => callSpaceV2(lrc, body, token) }] : []),
+          { label: 'l’accès public DiffRhythm 2', run: () => callSpaceV2(lrc, body) },
+          { label: 'DiffRhythm 1 (extraits ≤ 95 s)', run: () => callSpaceV1(lrc, body) },
+        ]
+
+        /* On commence directement par le chemin qui a fonctionné récemment
+         * (évite de refaire échouer les tentatives en quota mort à chaque génération). */
+        if (lastGoodAttempt > 0 && lastGoodAttempt < attempts.length && Date.now() - lastGoodAt < 10 * 60_000) {
+          const [good] = attempts.splice(lastGoodAttempt, 1)
+          attempts.unshift(good)
+        }
+
+        let audio: AudioResult | undefined
+        let lastReason = 'studio indisponible'
+        for (let i = 0; i < attempts.length; i++) {
+          const attempt = attempts[i]
+          try {
+            safeEmit({ stage: 'studio-attempt', label: attempt.label })
+            audio = await attempt.run()
+            lastGoodAttempt = i
+            lastGoodAt = Date.now()
+            break
+          } catch (e) {
+            const raw = e instanceof Error ? e.message : String(e)
+            lastReason = isQuotaError(raw)
+              ? `Quota GPU Hugging Face épuisé pour ${attempt.label}` + (quotaResetIn(raw) ? ` (réinitialisation dans ${quotaResetIn(raw)})` : '')
+              : raw.slice(0, 180)
+            safeEmit({ stage: 'studio-retry', label: attempt.label, reason: lastReason })
+          }
+        }
+
+        if (audio) {
           const durationSec = audio.mime === 'audio/mpeg' ? Math.round((audio.bytes * 8) / 128_000) : 0
           safeEmit({
             stage: 'done',
-            engine: ENGINE,
+            engine: audio.engine,
             title,
             lrc,
             base64: audio.base64,
@@ -282,11 +402,8 @@ export async function POST(req: NextRequest) {
             mime: audio.mime,
             durationSec,
           })
-        } catch (e) {
-          safeEmit({
-            stage: 'fallback',
-            reason: e instanceof Error ? e.message.slice(0, 180) : 'studio indisponible',
-          })
+        } else {
+          safeEmit({ stage: 'fallback', reason: lastReason })
         }
       } catch (e) {
         safeEmit({

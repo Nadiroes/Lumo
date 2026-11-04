@@ -778,15 +778,16 @@ export const useLumo = create<LumoState>()(
           return
         }
 
-        /* --- Chanson complète : paroles GLM + studio DiffRhythm 2 --- */
+        /* --- Chanson complète : paroles GLM + studio DiffRhythm (chaîne de repli) --- */
         let done: MusicDoneEvent | undefined
         let fallbackReason = ''
+        let attemptLabel = 'DiffRhythm 2'
         let studioStartedAt = 0
         const tick = setInterval(() => {
           const m = get().sessions.find((s) => s.id === sessionId)?.messages.find((x) => x.id === assistantId)
           if (m?.pending && m.content.startsWith('🎼') && studioStartedAt > 0) {
             const sec = Math.round((Date.now() - studioStartedAt) / 1000)
-            updateMessage(sessionId, assistantId, { content: `🎼 DiffRhythm 2 compose la chanson (voix + accompagnement)… ⏱ ${sec} s` })
+            updateMessage(sessionId, assistantId, { content: `🎼 ${attemptLabel} compose la chanson (voix + accompagnement)… ⏱ ${sec} s` })
           }
         }, 1000)
         try {
@@ -808,13 +809,25 @@ export const useLumo = create<LumoState>()(
                   .slice(0, 4)
                   .join('\n')
                 updateMessage(sessionId, assistantId, {
-                  content: `📝 Paroles prêtes : **« ${title} »** (style ${styleLabel})\n\n« ${preview.replace(/\n/g, ' /\n')} »…\n\n🎧 Connexion au studio DiffRhythm 2 (Hugging Face)…`,
+                  content: `📝 Paroles prêtes : **« ${title} »** (style ${styleLabel})\n\n« ${preview.replace(/\n/g, ' /\n')} »…\n\n🎧 Connexion au studio DiffRhythm (Hugging Face)…`,
                 })
               },
               onStudio: () => {
                 studioStartedAt = Date.now()
                 updateMessage(sessionId, assistantId, {
-                  content: '🎼 DiffRhythm 2 compose la chanson (voix + accompagnement)… ⏱ 0 s',
+                  content: `🎼 ${attemptLabel} compose la chanson (voix + accompagnement)… ⏱ 0 s`,
+                })
+              },
+              onStudioAttempt: (label) => {
+                attemptLabel = label
+                studioStartedAt = Date.now()
+                updateMessage(sessionId, assistantId, {
+                  content: `🎼 Génération via ${label} — composition en cours (voix + accompagnement)… ⏱ 0 s`,
+                })
+              },
+              onStudioRetry: (label, reason) => {
+                updateMessage(sessionId, assistantId, {
+                  content: `⚠️ ${label} : ${reason}.\n\n🔄 Bascule sur la solution suivante…`,
                 })
               },
               onDone: (evt) => {
@@ -840,13 +853,13 @@ export const useLumo = create<LumoState>()(
               name: `${done.title.replace(/[^\wÀ-ÿ]+/g, '_')}.${ext}`,
               mimeType: done.mime || 'audio/mpeg',
               createdAt: Date.now(),
-              provider: 'DiffRhythm 2 · Hugging Face',
+              provider: `DiffRhythm · Hugging Face (${done.engine})`,
               prompt,
               data: done.base64,
               bytes: done.bytes,
               meta: {
                 music: true,
-                engine: 'diffrhythm2',
+                engine: done.engine.includes('DiffRhythm 1') ? 'diffrhythm1' : 'diffrhythm2',
                 style: styleLabel,
                 lyrics: done.lrc,
                 durationSec: done.durationSec,
@@ -856,12 +869,15 @@ export const useLumo = create<LumoState>()(
             const dur = done.durationSec >= 60 ? `${Math.floor(done.durationSec / 60)} min ${String(done.durationSec % 60).padStart(2, '0')}` : `${done.durationSec} s`
             await finishWithArtifact(
               artifact,
-              `Voici **« ${done.title} »** — chanson complète chantée 🎤 (${dur}), générée par **DiffRhythm 2** sur Hugging Face.\n\n` +
+              `Voici **« ${done.title} »** — chanson complète chantée 🎤 (${dur}), générée par **${done.engine}** (Hugging Face).\n\n` +
                 `▶ Écoutez le morceau ci-dessous — les paroles sont dépliables dans la carte audio et le MP3 est téléchargeable.\n` +
                 `Envie d'une autre version ? Demandez : autre style, paroles retouchées, plus longue, voix différente…`,
             )
           } else {
-            await localSynth(`🎛 Studio DiffRhythm indisponible (${fallbackReason || 'raison inconnue'}) — bascule sur la synthèse locale.\n\n`)
+            await localSynth(
+              `🎛 Studio DiffRhythm indisponible (${fallbackReason || 'raison inconnue'}).\n` +
+                `En attendant la réinitialisation du quota GPU (compte gratuit : ~1×/jour), voici un **aperçu instrumental local** — une vraie chanson chantée nécessite le studio.\n\n`,
+            )
           }
         } catch (e) {
           clearInterval(tick)
