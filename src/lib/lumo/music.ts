@@ -168,6 +168,22 @@ interface Ctx {
   noise: AudioBuffer
   master: GainNode
   delaySend: GainNode
+  reverbSend: GainNode
+}
+
+/** Réponse impulsionnelle synthétique pour la réverbération (2,2 s, décroissance exponentielle) */
+function makeReverbIR(ctx: OfflineAudioContext): AudioBuffer {
+  const dur = 2.2
+  const len = Math.floor(ctx.sampleRate * dur)
+  const buf = ctx.createBuffer(2, len, ctx.sampleRate)
+  for (let ch = 0; ch < 2; ch++) {
+    const d = buf.getChannelData(ch)
+    for (let i = 0; i < len; i++) {
+      const t = i / len
+      d[i] = (Math.random() * 2 - 1) * Math.pow(1 - t, 2.6) * (i < ctx.sampleRate * 0.01 ? i / (ctx.sampleRate * 0.01) : 1)
+    }
+  }
+  return buf
 }
 
 function makeNoiseBuffer(ctx: OfflineAudioContext): AudioBuffer {
@@ -262,7 +278,7 @@ function playNoise(
   src.stop(opts.start + opts.dur + 0.02)
 }
 
-/** Kick : sinus dont la hauteur chute */
+/** Kick : sinus dont la hauteur chute + transitoire de clic */
 function playKick(c: Ctx, dest: AudioNode, start: number, gain = 0.9) {
   const osc = c.ctx.createOscillator()
   osc.type = 'sine'
@@ -275,6 +291,63 @@ function playKick(c: Ctx, dest: AudioNode, start: number, gain = 0.9) {
   env.connect(dest)
   osc.start(start)
   osc.stop(start + 0.3)
+  // Clic d'attaque pour percer le mix
+  playNoise(c, dest, { start, dur: 0.014, gain: gain * 0.32, hp: 1200 })
+}
+
+/** Stab d'accord : hit court percussif (house / électro) */
+function playStab(
+  c: Ctx, dest: AudioNode, reverb: AudioNode,
+  freqs: number[], start: number, dur: number, gain: number,
+) {
+  for (const f of freqs) {
+    const osc = c.ctx.createOscillator()
+    osc.type = 'sawtooth'
+    osc.frequency.setValueAtTime(f, start)
+    const env = c.ctx.createGain()
+    env.gain.setValueAtTime(0.0001, start)
+    env.gain.linearRampToValueAtTime(gain, start + 0.008)
+    env.gain.exponentialRampToValueAtTime(0.0001, start + dur)
+    const lp = c.ctx.createBiquadFilter()
+    lp.type = 'lowpass'
+    lp.frequency.setValueAtTime(3600, start)
+    lp.frequency.exponentialRampToValueAtTime(900, start + dur)
+    osc.connect(env)
+    env.connect(lp)
+    lp.connect(dest)
+    const send = c.ctx.createGain()
+    send.gain.value = 0.35
+    lp.connect(send)
+    send.connect(reverb)
+    osc.start(start)
+    osc.stop(start + dur + 0.05)
+  }
+}
+
+/** Arpège : suite de croches pincées dans les notes de l'accord */
+function playArp(
+  c: Ctx, dest: AudioNode, delay: AudioNode,
+  notes: number[], start: number, beat: number, gain: number,
+) {
+  for (let e = 0; e < 8; e++) {
+    const midi = notes[e % notes.length] + (e >= 4 ? 12 : 0)
+    const t = start + e * beat * 0.5
+    const osc = c.ctx.createOscillator()
+    osc.type = 'triangle'
+    osc.frequency.setValueAtTime(midiToFreq(midi), t)
+    const env = c.ctx.createGain()
+    env.gain.setValueAtTime(0.0001, t)
+    env.gain.linearRampToValueAtTime(gain, t + 0.006)
+    env.gain.exponentialRampToValueAtTime(0.0001, t + beat * 0.45)
+    osc.connect(env)
+    env.connect(dest)
+    const send = c.ctx.createGain()
+    send.gain.value = 0.5
+    env.connect(send)
+    send.connect(delay)
+    osc.start(t)
+    osc.stop(t + beat * 0.5)
+  }
 }
 
 function triadChord(rootMidi: number, minor: boolean): number[] {
@@ -308,7 +381,7 @@ export async function generateMusic(req: MusicRequest): Promise<MusicResult> {
   master.gain.linearRampToValueAtTime(0.0001, bars * barSec + 0.3)
 
   const shaper = ctx.createWaveShaper()
-  shaper.curve = softClipCurve()
+  shaper.curve = softClipCurve() as unknown as Float32Array<ArrayBuffer>
   master.connect(shaper)
   shaper.connect(ctx.destination)
 
@@ -324,7 +397,19 @@ export async function generateMusic(req: MusicRequest): Promise<MusicResult> {
   fb.connect(delay)
   delay.connect(master)
 
-  const c: Ctx = { ctx, noise: makeNoiseBuffer(ctx), master, delaySend }
+  // Réverbération commune (nappes + mélodie + stabs) — profondeur selon le style
+  const reverbSend = ctx.createGain()
+  reverbSend.gain.value = preset.id === 'ambient' ? 0.5 : preset.id === 'cinematic' ? 0.42 : preset.id === 'lofi' ? 0.16 : 0.24
+  const conv = ctx.createConvolver()
+  conv.buffer = makeReverbIR(ctx)
+  const revLP = ctx.createBiquadFilter()
+  revLP.type = 'lowpass'
+  revLP.frequency.value = preset.id === 'ambient' ? 2600 : 4200
+  reverbSend.connect(conv)
+  conv.connect(revLP)
+  revLP.connect(master)
+
+  const c: Ctx = { ctx, noise: makeNoiseBuffer(ctx), master, delaySend, reverbSend }
 
   // Tonique : La2 (45) ± 5 demi-tons
   const rootMidi = 45 + Math.floor(rand() * 11) - 5
@@ -338,6 +423,14 @@ export async function generateMusic(req: MusicRequest): Promise<MusicResult> {
   const drumBus = ctx.createGain(); drumBus.gain.value = 0.85; drumBus.connect(master)
 
   const penta = PENTA_MINOR.map((n) => n + rootMidi + 12)
+
+  // Envoi des nappes vers la réverbération (une seule connexion)
+  {
+    const padSend = ctx.createGain()
+    padSend.gain.value = 0.5
+    padBus.connect(padSend)
+    padSend.connect(reverbSend)
+  }
 
   for (let bar = 0; bar < bars; bar++) {
     const barStart = bar * barSec
@@ -361,6 +454,21 @@ export async function generateMusic(req: MusicRequest): Promise<MusicResult> {
         detune: 7,
         pan: i === 0 ? -0.35 : i === 1 ? 0 : 0.35,
       })
+    }
+
+    // --- Stabs / arpèges selon le style ---
+    if ((preset.id === 'electro' || preset.id === 'funk' || preset.id === 'pop') && !intro) {
+      // Stabs sur les contretemps (2 et 4)
+      for (const b of [1, 3]) {
+        playStab(c, drumBus, reverbSend, chord.map((n) => midiToFreq(n + 12)), barStart + b * beat, beat * 0.42, 0.08)
+      }
+      playArp(c, melBus, delaySend, chord.map((n) => n + 12), barStart, beat, 0.085)
+    }
+    if (preset.id === 'jazz' && !intro) {
+      // Voicings pincés syncopés
+      for (const b of [0.5, 2.5]) {
+        playStab(c, padBus, reverbSend, chord.map((n) => midiToFreq(n + 12)), barStart + b * beat, beat * 0.5, 0.06)
+      }
     }
 
     // --- Basse ---

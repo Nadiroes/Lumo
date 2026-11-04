@@ -84,6 +84,22 @@ function dedupe(files: CodeFile[]): CodeFile[] {
   return [...seen.values()]
 }
 
+/**
+ * Détection TEMPS RÉEL : un bloc ```lang:nom ouvert (même non fermé)
+ * compte comme un fichier en cours d'écriture — pour le panneau d'activité.
+ */
+export function parseOpeningFiles(text: string, fallbackLang = 'html'): string[] {
+  const names: string[] = []
+  const re = /```([\w.+-]*)(?::[ \t]*([^\n`]+))?\r?\n/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text)) !== null) {
+    const lang = (m[1] || '').toLowerCase() || fallbackLang
+    const name = (m[2] || '').trim() || fileNameFor(lang, names.length)
+    names.push(name)
+  }
+  return [...new Set(names)]
+}
+
 /* ------------------------------------------------------------------ */
 /* Modèle de design WYSIWYG                                            */
 /* ------------------------------------------------------------------ */
@@ -311,6 +327,9 @@ function elHtml(el: DesignEl): string {
     case 'input':
       return `    <label class="field">\n      <span>${esc(p.label ?? '')}</span>\n      <input type="text" placeholder="${esc(p.placeholder ?? '')}" />\n    </label>`
     case 'image':
+      if (p.src && /^(https?:|data:)/.test(p.src)) {
+        return `    <img src="${esc(p.src)}" alt="${esc(p.alt ?? 'Illustration')}" class="img-real" loading="lazy" />`
+      }
       return `    <div class="img-ph" role="img" aria-label="${esc(p.alt ?? 'Illustration')}">🖼 ${esc(p.alt ?? 'Illustration')}</div>`
     case 'list':
       return `    <ul class="list">\n${(p.items ?? '')
@@ -360,6 +379,7 @@ body { font-family: 'Poppins', system-ui, sans-serif; background: var(--bg); col
 .field input { padding: 11px 14px; border: 1.5px solid rgb(0 0 0 / .15); border-radius: 10px; font: inherit; background: #fff; width: 100%; }
 .field input:focus { outline: 2px solid var(--primary); border-color: transparent; }
 .img-ph { background: linear-gradient(135deg, color-mix(in srgb, var(--primary) 18%, #fff), color-mix(in srgb, var(--primary) 6%, #fff)); border-radius: var(--radius); min-height: 140px; display: grid; place-items: center; font-size: 15px; opacity: .8; }
+.img-real { width: 100%; height: auto; border-radius: var(--radius); object-fit: cover; max-height: 420px; box-shadow: 0 2px 10px rgb(0 0 0 / .08); }
 .list { background: var(--card); border-radius: var(--radius); padding: 14px 18px 14px 34px; }
 .card { background: var(--card); border-radius: var(--radius); padding: 18px; box-shadow: 0 1px 4px rgb(0 0 0 / .05); }
 .card h3 { margin-bottom: 6px; color: var(--primary); }
@@ -432,6 +452,9 @@ ${(p.links ?? '')
         <input className="w-full rounded-xl border border-black/15 bg-white px-4 py-2.5 outline-none focus:ring-2" style={{ outlineColor: primary }} placeholder="${t(p.placeholder)}" />
       </label>`
     case 'image':
+      if (p.src && /^(https?:|data:)/.test(p.src)) {
+        return `      <img src="${t(p.src)}" alt="${t(p.alt)}" className="h-auto w-full rounded-2xl object-cover shadow-sm" loading="lazy" />`
+      }
       return `      <div className="grid min-h-36 place-items-center rounded-2xl opacity-80" style={{ background: primary + '22' }} role="img" aria-label="${t(p.alt)}">🖼 ${t(p.alt)}</div>`
     case 'list':
       return `      <ul className="list-disc space-y-1 rounded-2xl bg-white p-5 pl-9 shadow-sm">
@@ -542,6 +565,24 @@ function dartWidget(el: DesignEl): string {
           ),
         )`
     case 'image':
+      if (p.src && /^(https?:|data:)/.test(p.src)) {
+        const src = p.src.length > 180 && p.src.startsWith('data:') ? '' : p.src
+        return src
+          ? `        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(14),
+            child: Image.network('${t(src)}', height: 180, width: double.infinity, fit: BoxFit.cover),
+          ),
+        )`
+          : `        Container(
+          margin: const EdgeInsets.symmetric(horizontal: 16),
+          height: 160,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(color: primary.withOpacity(0.12), borderRadius: BorderRadius.circular(14)),
+          child: const Text('Image importée (asset local) — remplacez par un fichier asset'),
+        )`
+      }
       return `        Container(
           margin: const EdgeInsets.symmetric(horizontal: 16),
           height: 140,

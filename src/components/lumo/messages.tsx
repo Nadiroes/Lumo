@@ -34,6 +34,7 @@ import {
 } from '@/lib/lumo/api'
 import { ArtifactViewDialog, AudioCard, ImageTile, TextFileCard, VideoCard } from '@/components/lumo/artifacts'
 import { DesignCard, DesignStudioDialog } from '@/components/lumo/app-studio'
+import { AgentActivityPanel } from '@/components/lumo/agent-activity'
 import { LumoMark } from '@/components/lumo/logo'
 import { CodePreviewDialog, WebCodeCard } from '@/components/lumo/web-preview'
 import { useLumo } from '@/lib/lumo/store'
@@ -436,20 +437,21 @@ function AssistantMessage({
         </div>
 
         <div className="rounded-2xl rounded-tl-md border bg-card px-4 py-3">
-          {m.pending && !m.content && m.flow !== 'image' && (
+          {m.pending && !m.content && m.flow !== 'image' && !m.activity && (
             <span className="flex items-center gap-1 py-1" aria-label="Lumo écrit">
               <span className="typing-dot" />
               <span className="typing-dot" style={{ animationDelay: '0.2s' }} />
               <span className="typing-dot" style={{ animationDelay: '0.4s' }} />
             </span>
           )}
+          {m.activity && <AgentActivityPanel activity={m.activity} running={!!m.pending} />}
           {m.content && (
             <>
               <Markdown content={m.content} />
               {streaming && <span className="stream-cursor" aria-hidden="true" />}
             </>
           )}
-          <ArtifactGrid artifacts={m.artifacts ?? []} flow={m.flow} pending={m.pending} onOpen={onOpenArtifact} />
+          <ArtifactGrid artifacts={m.artifacts ?? []} flow={m.flow} pending={!!m.pending} onOpen={onOpenArtifact} />
           {m.error && (
             <div className="mt-2 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
               {m.error}

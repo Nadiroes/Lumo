@@ -15,7 +15,10 @@ import {
   Code2,
   Copy,
   Download,
+  Eye,
+  ImageIcon,
   LayoutDashboard,
+  Loader2,
   Monitor,
   Palette,
   Plus,
@@ -26,6 +29,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react'
+import * as LucideIcons from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -56,6 +60,8 @@ import {
   type ElType,
 } from '@/lib/lumo/codegen'
 import { downloadText } from '@/lib/lumo/export'
+import { apiImage } from '@/lib/lumo/api'
+import { ICON_LIBRARY, PHOTO_LIBRARY, illustrationUrl, photoUrl } from '@/lib/lumo/visuals'
 import { useLumo } from '@/lib/lumo/store'
 import type { Artifact } from '@/lib/lumo/types'
 
@@ -191,7 +197,39 @@ function ElView({ el, palette, selected, onSelect }: { el: DesignEl; palette: De
           <span className="rounded-lg border border-black/15 bg-white px-3 py-2 text-muted-foreground">{p.placeholder}</span>
         </label>
       )
-    case 'image':
+    case 'image': {
+      const src = p.src ?? ''
+      if (src.startsWith('icon:')) {
+        const iconName = src.slice(5)
+        const Icon = (LucideIcons as unknown as Record<string, React.ComponentType<{ className?: string }>>)[iconName]
+        return (
+          <div
+            onClick={onSelect}
+            className={`grid min-h-24 place-items-center rounded-2xl sm:min-h-32 ${common}`}
+            style={{ background: `color-mix(in srgb, ${palette.primary} 14%, white)` }}
+            role="presentation"
+          >
+            {Icon ? (
+              <Icon className="h-12 w-12" />
+            ) : (
+              <span className="text-2xl">⬟</span>
+            )}
+            <span className="sr-only">{p.alt || iconName}</span>
+          </div>
+        )
+      }
+      if (src && /^(https?:|data:)/.test(src)) {
+        return (
+          <div onClick={onSelect} className={`overflow-hidden rounded-2xl ${common}`} role="presentation">
+            <img
+              src={src}
+              alt={p.alt || 'Illustration'}
+              className="h-36 w-full object-cover sm:h-44"
+              loading="lazy"
+            />
+          </div>
+        )
+      }
       return (
         <div
           onClick={onSelect}
@@ -199,9 +237,10 @@ function ElView({ el, palette, selected, onSelect }: { el: DesignEl; palette: De
           style={{ background: `color-mix(in srgb, ${palette.primary} 16%, white)` }}
           role="presentation"
         >
-          🖼 {p.alt || 'Image'}
+          🖼 {p.alt || 'Image — choisissez-en une dans les propriétés'}
         </div>
       )
+    }
     case 'list':
       return (
         <ul onClick={onSelect} className={`list-disc space-y-1 rounded-2xl bg-white p-4 pl-8 text-xs shadow-sm sm:text-sm ${common}`} role="presentation">
@@ -329,6 +368,192 @@ function ScreensPanel({
 }
 
 /* ------------------------------------------------------------------ */
+/* Sélecteur d'images : icônes, photos, illustrations, upload, IA       */
+/* ------------------------------------------------------------------ */
+
+type ImgTab = 'icons' | 'photos' | 'illus' | 'upload' | 'ai'
+
+function ImagePickerDialog({
+  open,
+  onOpenChange,
+  onPick,
+  elementAlt,
+}: {
+  open: boolean
+  onOpenChange: (v: boolean) => void
+  onPick: (src: string, label: string) => void
+  elementAlt: string
+}) {
+  const { toast } = useToast()
+  const [tab, setTab] = useState<ImgTab>('icons')
+  const [customUrl, setCustomUrl] = useState('')
+  const [aiPrompt, setAiPrompt] = useState('')
+  const [aiBusy, setAiBusy] = useState(false)
+  const fileRef = useRef<HTMLInputElement>(null)
+
+  function pick(src: string, label: string) {
+    onPick(src, label)
+    onOpenChange(false)
+  }
+
+  async function generateAi() {
+    const q = aiPrompt.trim() || elementAlt || 'illustration moderne et colorée'
+    setAiBusy(true)
+    try {
+      const r = await apiImage(q, '864x1152')
+      pick(`data:${r.base64.startsWith('/9j/') ? 'image/jpeg' : 'image/png'};base64,${r.base64}`, `IA : ${q.slice(0, 40)}`)
+    } catch {
+      toast({ title: 'Génération IA impossible', description: 'Réessayez — le service image met 30 à 60 s.', variant: 'destructive' })
+    } finally {
+      setAiBusy(false)
+    }
+  }
+
+  function onUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0]
+    e.target.value = ''
+    if (!f) return
+    if (f.size > 2_000_000) {
+      toast({ title: 'Image trop lourde', description: 'Maximum 2 Mo pour un import local.', variant: 'destructive' })
+      return
+    }
+    const reader = new FileReader()
+    reader.onload = () => pick(String(reader.result ?? ''), `Import : ${f.name}`)
+    reader.readAsDataURL(f)
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-xl">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2 font-display">
+            <ImageIcon className="h-4 w-4 text-primary" aria-hidden="true" /> Insérer une image
+          </DialogTitle>
+          <DialogDescription>
+            Icônes, photos libres, illustrations, import local ou génération IA — embellissez votre maquette.
+          </DialogDescription>
+        </DialogHeader>
+
+        <Tabs value={tab} onValueChange={(v) => setTab(v as ImgTab)}>
+          <TabsList className="w-full flex-wrap">
+            <TabsTrigger value="icons" className="gap-1 text-xs">Icônes</TabsTrigger>
+            <TabsTrigger value="photos" className="gap-1 text-xs">Photos</TabsTrigger>
+            <TabsTrigger value="illus" className="gap-1 text-xs">Illustrations</TabsTrigger>
+            <TabsTrigger value="upload" className="gap-1 text-xs">Import</TabsTrigger>
+            <TabsTrigger value="ai" className="gap-1 text-xs">IA ✨</TabsTrigger>
+          </TabsList>
+        </Tabs>
+
+        <div className="max-h-80 overflow-y-auto pr-1 scrollbar-thin">
+          {tab === 'icons' && (
+            <div className="grid grid-cols-6 gap-1.5 sm:grid-cols-8">
+              {ICON_LIBRARY.map((ic) => {
+                const Icon = (LucideIcons as unknown as Record<string, React.ComponentType<{ className?: string }>>)[ic.name]
+                return (
+                  <button
+                    key={ic.name}
+                    onClick={() => pick(`icon:${ic.name}`, `Icône : ${ic.label}`)}
+                    className="flex aspect-square flex-col items-center justify-center gap-1 rounded-lg border bg-card p-1 transition-colors hover:border-primary/50 hover:bg-accent"
+                    title={ic.label}
+                    aria-label={`Icône ${ic.label}`}
+                  >
+                    {Icon ? <Icon className="h-5 w-5 text-primary" aria-hidden="true" /> : <span className="text-lg">⬟</span>}
+                    <span className="w-full truncate text-center text-[8px] leading-none text-muted-foreground">{ic.label}</span>
+                  </button>
+                )
+              })}
+            </div>
+          )}
+
+          {tab === 'photos' && (
+            <div className="space-y-2.5">
+              <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-4">
+                {PHOTO_LIBRARY.map((ph) => (
+                  <button
+                    key={ph.seed}
+                    onClick={() => pick(photoUrl(ph.seed), `Photo : ${ph.label}`)}
+                    className="group overflow-hidden rounded-lg border transition-colors hover:border-primary/50"
+                    aria-label={`Photo ${ph.label}`}
+                  >
+                    <img src={photoUrl(ph.seed, 240, 168)} alt={ph.label} className="aspect-[10/7] w-full object-cover" loading="lazy" />
+                    <span className="block truncate px-1 py-0.5 text-[9px] text-muted-foreground">{ph.label}</span>
+                  </button>
+                ))}
+              </div>
+              <div className="flex gap-1.5">
+                <Input
+                  value={customUrl}
+                  onChange={(e) => setCustomUrl(e.target.value)}
+                  placeholder="…ou collez l’URL d’une image (https://…)"
+                  aria-label="URL d’image personnalisée"
+                  className="h-8 text-xs"
+                />
+                <Button
+                  size="sm"
+                  className="h-8 shrink-0 text-xs"
+                  disabled={!/^https?:\/\//.test(customUrl.trim())}
+                  onClick={() => pick(customUrl.trim(), 'URL personnalisée')}
+                >
+                  Utiliser
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {tab === 'illus' && (
+            <div className="grid grid-cols-3 gap-1.5">
+              {[0, 1, 2, 3, 4, 5].map((i) => (
+                <button
+                  key={i}
+                  onClick={() => pick(illustrationUrl(i), `Illustration ${i + 1}`)}
+                  className="overflow-hidden rounded-lg border transition-colors hover:border-primary/50"
+                  aria-label={`Illustration ${i + 1}`}
+                >
+                  <img src={illustrationUrl(i)} alt={`Illustration ${i + 1}`} className="aspect-[3/2] w-full object-cover" loading="lazy" />
+                </button>
+              ))}
+            </div>
+          )}
+
+          {tab === 'upload' && (
+            <div className="grid place-items-center rounded-xl border border-dashed p-8 text-center">
+              <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={onUpload} aria-hidden="true" />
+              <div className="space-y-2">
+                <p className="text-sm font-medium">Importez votre visuel</p>
+                <p className="text-xs text-muted-foreground">PNG, JPG, WebP — 2 Mo max, conservé localement</p>
+                <Button size="sm" onClick={() => fileRef.current?.click()} className="gap-1.5">
+                  <ImageIcon className="h-3.5 w-3.5" /> Choisir un fichier
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {tab === 'ai' && (
+            <div className="space-y-2.5">
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                Générez un visuel unique avec l’IA image de Lumo (30 à 60 s). L’image est insérée dans la maquette.
+              </p>
+              <Textarea
+                value={aiPrompt}
+                onChange={(e) => setAiPrompt(e.target.value)}
+                placeholder={`Décrivez l’image… (ex. : « bannière chaleureuse pour une boulangerie »)`}
+                aria-label="Prompt de génération IA"
+                rows={2}
+                className="min-h-16 text-xs"
+              />
+              <Button size="sm" disabled={aiBusy} onClick={() => void generateAi()} className="gap-1.5">
+                {aiBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+                {aiBusy ? 'Génération…' : 'Générer avec l’IA'}
+              </Button>
+            </div>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+/* ------------------------------------------------------------------ */
 /* Panneau Propriétés de l’élément sélectionné                         */
 /* ------------------------------------------------------------------ */
 
@@ -345,6 +570,7 @@ function PropsPanel({
   selected: DesignEl | null
   setSelected: (id: string | null) => void
 }) {
+  const [pickerOpen, setPickerOpen] = useState(false)
   const screen = doc.screens.find((s) => s.id === activeScreenId)
   function patchProp(key: string, value: string) {
     if (!selected || !screen) return
@@ -408,6 +634,36 @@ function PropsPanel({
           <X className="h-3.5 w-3.5" />
         </button>
       </div>
+      {selected.type === 'image' && (
+        <div className="rounded-xl border bg-secondary/40 p-2.5">
+          <p className="mb-1.5 text-[11px] font-semibold text-foreground">Visuel de l’élément</p>
+          <p className="mb-2 truncate text-[10px] text-muted-foreground">
+            {selected.props.src
+              ? selected.props.src.startsWith('icon:')
+                ? `Icône : ${selected.props.src.slice(5)}`
+                : selected.props.src.startsWith('data:')
+                  ? 'Image locale (importée / IA)'
+                  : 'Image distante (URL)'
+              : 'Aucune image choisie'}
+          </p>
+          <div className="flex gap-1.5">
+            <Button size="sm" variant="outline" className="h-7 flex-1 gap-1 text-[11px]" onClick={() => setPickerOpen(true)}>
+              <ImageIcon className="h-3 w-3" /> Choisir une image
+            </Button>
+            {selected.props.src && (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7 shrink-0 gap-1 text-[11px] text-muted-foreground"
+                onClick={() => patchProp('src', '')}
+                aria-label="Retirer l’image"
+              >
+                <X className="h-3 w-3" /> Retirer
+              </Button>
+            )}
+          </div>
+        </div>
+      )}
       {PROPERTY_FIELDS[selected.type].map((f) =>
         f.options ? (
           <label key={f.key} className="flex items-center justify-between gap-2 text-xs">
@@ -462,6 +718,12 @@ function PropsPanel({
           <Trash2 className="h-3 w-3" /> Supprimer
         </Button>
       </div>
+      <ImagePickerDialog
+        open={pickerOpen}
+        onOpenChange={setPickerOpen}
+        elementAlt={selected.props.alt ?? ''}
+        onPick={(src) => patchProp('src', src)}
+      />
     </div>
   )
 }
@@ -721,6 +983,136 @@ function CodePanel({ doc }: { doc: DesignDoc }) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Mode Aperçu : navigation interactive entre les écrans               */
+/* ------------------------------------------------------------------ */
+
+function PreviewEl({ el, palette, onNavigate }: { el: DesignEl; palette: DesignDoc['palette']; onNavigate: (name: string) => void }) {
+  const p = el.props
+  switch (el.type) {
+    case 'navbar':
+      return (
+        <header className="flex flex-wrap items-center justify-between gap-2 rounded-2xl bg-white p-3 shadow-sm">
+          <span className="font-bold" style={{ color: palette.primary }}>{p.text || 'Mon app'}</span>
+          <span className="flex flex-wrap gap-2 text-xs">
+            {(p.links ?? '').split(/[,\n]/).map((l) => l.trim()).filter(Boolean).map((l, i) => (
+              <button
+                key={i}
+                onClick={() => onNavigate(l)}
+                className="rounded-full px-2 py-0.5 opacity-75 transition-colors hover:bg-accent hover:opacity-100"
+                title={`Aller à l’écran « ${l} »`}
+              >
+                {l}
+              </button>
+            ))}
+          </span>
+        </header>
+      )
+    case 'hero':
+      return (
+        <section className="flex flex-col items-center gap-2 rounded-2xl bg-white p-6 text-center shadow-sm sm:p-9">
+          <h3 className="text-xl font-bold sm:text-2xl" style={{ color: palette.text }}>{p.title}</h3>
+          <p className="max-w-md text-xs opacity-70 sm:text-sm">{p.subtitle}</p>
+          <button
+            onClick={() => onNavigate(p.cta ?? '')}
+            className="rounded-full px-5 py-2 text-xs font-semibold text-white shadow-sm transition-transform hover:scale-105"
+            style={{ background: palette.primary }}
+          >
+            {p.cta}
+          </button>
+        </section>
+      )
+    case 'button':
+      return (
+        <p className="px-1">
+          <span
+            className={`inline-block rounded-full px-4 py-2 text-xs font-semibold sm:text-sm ${p.variant === 'outline' ? 'border-2' : 'text-white'}`}
+            style={p.variant === 'outline' ? { borderColor: palette.primary, color: palette.primary } : { background: palette.primary }}
+          >
+            {p.text}
+          </span>
+        </p>
+      )
+    default:
+      // Les autres éléments partagent le rendu d’édition, sans sélection ni clic
+      return <ElViewStatic el={el} palette={palette} />
+  }
+}
+
+function ElViewStatic({ el, palette }: { el: DesignEl; palette: DesignDoc['palette'] }) {
+  return <ElView el={el} palette={palette} selected={false} onSelect={() => {}} />
+}
+
+function PreviewCanvas({
+  doc,
+  screenIndex,
+  onScreenChange,
+  onClose,
+}: {
+  doc: DesignDoc
+  screenIndex: number
+  onScreenChange: (i: number) => void
+  onClose: () => void
+}) {
+  const screen = doc.screens[screenIndex]
+  if (!screen) return null
+
+  function navigate(name: string) {
+    const target = doc.screens.findIndex((s) => s.name.toLowerCase().includes(name.toLowerCase().trim()) || name.toLowerCase().includes(s.name.toLowerCase()))
+    if (target >= 0) onScreenChange(target)
+  }
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col bg-secondary/50">
+      <div className="flex items-center justify-between gap-2 border-b bg-background px-3 py-2">
+        <p className="min-w-0 flex-1 truncate text-xs font-semibold">
+          Aperçu — {screen.name} <span className="font-normal text-muted-foreground">({screenIndex + 1}/{doc.screens.length})</span>
+        </p>
+        <div className="flex items-center gap-1">
+          <Button size="sm" variant="outline" className="h-7 gap-1 text-[11px]" disabled={screenIndex === 0} onClick={() => onScreenChange(screenIndex - 1)} aria-label="Écran précédent">
+            ← Précédent
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 gap-1 text-[11px]"
+            disabled={screenIndex >= doc.screens.length - 1}
+            onClick={() => onScreenChange(screenIndex + 1)}
+            aria-label="Écran suivant"
+          >
+            Suivant →
+          </Button>
+          <Button size="sm" variant="secondary" className="h-7 gap-1 text-[11px]" onClick={onClose} aria-label="Quitter l’aperçu">
+            <X className="h-3 w-3" /> Quitter
+          </Button>
+        </div>
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto p-3 scrollbar-thin">
+        <div
+          className="mx-auto flex min-h-full w-full max-w-[560px] flex-col gap-3 rounded-3xl border p-3 shadow-sm"
+          style={{ background: doc.palette.bg, color: doc.palette.text }}
+        >
+          {screen.elements.map((el) => (
+            <PreviewEl key={el.id} el={el} palette={doc.palette} onNavigate={navigate} />
+          ))}
+        </div>
+      </div>
+      {/* Puces de navigation entre écrans */}
+      <div className="flex items-center justify-center gap-1.5 border-t bg-background py-2">
+        {doc.screens.map((s, i) => (
+          <button
+            key={s.id}
+            onClick={() => onScreenChange(i)}
+            className={`h-2 rounded-full transition-all ${i === screenIndex ? 'w-6 bg-primary' : 'w-2 bg-muted-foreground/40 hover:bg-muted-foreground/70'}`}
+            aria-label={`Aller à l’écran ${s.name}`}
+            title={s.name}
+          />
+        ))}
+      </div>
+    </div>
+  )
+}
+
+/* ------------------------------------------------------------------ */
 /* Visionneuse / studio complet                                        */
 /* ------------------------------------------------------------------ */
 
@@ -741,6 +1133,8 @@ export function DesignStudioDialog({
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [viewport, setViewport] = useState<'desktop' | 'mobile'>('desktop')
   const [loadedKey, setLoadedKey] = useState<string | null>(null)
+  const [previewing, setPreviewing] = useState(false)
+  const [previewIndex, setPreviewIndex] = useState(0)
 
   /* Chargement d’un artefact — ajustement de état pendant le rendu (pattern React officiel) */
   const loadKey = open && artifact ? artifact.id : null
@@ -858,15 +1252,44 @@ export function DesignStudioDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="flex h-[94dvh] w-[min(97vw,1400px)] max-w-none! flex-col gap-0 overflow-hidden p-0 sm:h-[92dvh]">
         <DialogHeader className="border-b px-4 py-3 sm:px-5">
-          <DialogTitle className="flex items-center gap-2 font-display text-base">
-            <LayoutDashboard className="h-4.5 w-4.5 text-primary" aria-hidden="true" />
-            Studio visuel — {doc.appName}
-          </DialogTitle>
+          <div className="flex items-center justify-between gap-2">
+            <DialogTitle className="flex min-w-0 items-center gap-2 font-display text-base">
+              <LayoutDashboard className="h-4.5 w-4.5 shrink-0 text-primary" aria-hidden="true" />
+              <span className="truncate">Studio visuel — {doc.appName}</span>
+            </DialogTitle>
+            <Button
+              size="sm"
+              variant={previewing ? 'secondary' : 'outline'}
+              className="h-7 shrink-0 gap-1 text-[11px]"
+              onClick={() => {
+                if (!previewing) {
+                  setPreviewIndex(Math.max(0, doc.screens.findIndex((s) => s.id === activeScreenId)))
+                  setSelectedId(null)
+                }
+                setPreviewing((v) => !v)
+              }}
+              aria-pressed={previewing}
+            >
+              <Eye className="h-3 w-3" /> {previewing ? 'Revenir à l’édition' : 'Aperçu'}
+            </Button>
+          </div>
           <DialogDescription>
-            WYSIWYG responsive · assistant à chaque étape · export HTML, React ou FlutterFlow
+            WYSIWYG responsive · aperçu interactif · assistant à chaque étape · export HTML, React ou FlutterFlow
           </DialogDescription>
         </DialogHeader>
 
+        {/* Mode aperçu : navigation entre les écrans, liens et CTA cliquables */}
+        {previewing ? (
+          <div className="flex min-h-0 flex-1 flex-col">
+            <PreviewCanvas
+              doc={doc}
+              screenIndex={previewIndex}
+              onScreenChange={setPreviewIndex}
+              onClose={() => setPreviewing(false)}
+            />
+          </div>
+        ) : (
+        <>
         {/* Bureau : 3 colonnes */}
         <div className="hidden min-h-0 flex-1 gap-0 lg:grid lg:grid-cols-[230px_minmax(0,1fr)_320px]">
           <aside className="min-h-0 overflow-y-auto border-r p-3 scrollbar-thin">
@@ -921,6 +1344,8 @@ export function DesignStudioDialog({
             </TabsContent>
           </Tabs>
         </div>
+        </>
+        )}
 
         <div className="flex items-center justify-between gap-2 border-t px-4 py-2.5">
           <p className="hidden text-[11px] text-muted-foreground sm:block">

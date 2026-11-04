@@ -4,9 +4,9 @@
 
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import { apiChat, apiImage, type ChatOverride } from './api'
+import { apiAsr, apiChat, apiChatStream, apiImage, apiTts, type ChatOverride } from './api'
 import { deleteArtifactData, putArtifactData } from './artifact-store'
-import { extractDesignDoc, parseCodeBlocks } from './codegen'
+import { extractDesignDoc, parseCodeBlocks, parseOpeningFiles } from './codegen'
 import { generateMusic } from './music'
 import { DEFAULT_MODELS } from './providers'
 import type {
@@ -127,11 +127,15 @@ export interface SendOptions {
   voice?: string
   audioTab?: 'voice' | 'transcript' | 'music'
   file?: { name: string; size: number }
+  /** Audio à transcrire, encodé en base64 par le client */
+  fileBase64?: string
   attachments?: Attachment[]
   musicStyle?: string
   musicDuration?: number
   instrumental?: boolean
   framework?: string
+  /** Durée du clip vidéo (ex. « 8 s ») */
+  duration?: string
 }
 
 interface LumoState {
@@ -173,6 +177,7 @@ const streams = new Map<
   { timer: ReturnType<typeof setInterval>; sessionId: string; resolve: (c: string) => void }
 >()
 const sessionTimers = new Map<string, Set<ReturnType<typeof setTimeout>>>()
+const aborts = new Map<string, AbortController>()
 
 function uid(): string {
   if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) return crypto.randomUUID()
@@ -182,6 +187,17 @@ function uid(): string {
 function truncate(s: string, n: number): string {
   const t = s.trim().replace(/\s+/g, ' ')
   return t.length <= n ? t : t.slice(0, n - 1) + '…'
+}
+
+/** Détecte le vrai format d'une image encodée en base64 (l'API renvoie du JPEG, pas du PNG) */
+function sniffImageMime(b64: string): 'image/png' | 'image/jpeg' | 'image/webp' {
+  if (b64.startsWith('/9j/')) return 'image/jpeg'
+  if (b64.startsWith('UklGR')) return 'image/webp'
+  return 'image/png'
+}
+
+function imageExt(mime: string): string {
+  return mime === 'image/jpeg' ? 'jpg' : mime === 'image/webp' ? 'webp' : 'png'
 }
 
 /** Bloc texte des pièces jointes, injecté dans le prompt du modèle */
@@ -301,14 +317,39 @@ export const useLumo = create<LumoState>()(
             override?.provider && override.provider !== 'lumo-core'
               ? { provider: override.provider as ChatOverride['provider'], hfModel: override.hfModel }
               : undefined
-          const full = await apiChat(turns, system, useOverride)
-          const stillPending = get().sessions
-            .find((s) => s.id === sessionId)
-            ?.messages.find((m) => m.id === assistantId)?.pending
-          if (stillPending) await revealStream(sessionId, assistantId, full)
-          else updateMessage(sessionId, assistantId, { content: full, pending: false })
+
+          // Streaming réel : le texte s'affiche au fil de la génération du modèle
+          const ac = new AbortController()
+          aborts.set(sessionId, ac)
+          let lastPaint = 0
+          const full = await apiChatStream(
+            turns,
+            system,
+            (content) => {
+              const now = Date.now()
+              if (now - lastPaint > 60) {
+                lastPaint = now
+                updateMessage(sessionId, assistantId, { content })
+              }
+            },
+            useOverride,
+            ac.signal,
+          )
+          aborts.delete(sessionId)
+          updateMessage(sessionId, assistantId, { content: full, pending: false })
         } catch (e) {
+          aborts.delete(sessionId)
           const err = e as Error & { fallback?: string[] }
+          if (err.message === 'Génération interrompue.') {
+            updateMessage(sessionId, assistantId, {
+              pending: false,
+              stopped: true,
+              content:
+                get().sessions.find((s) => s.id === sessionId)?.messages.find((m) => m.id === assistantId)?.content ||
+                'Génération interrompue.',
+            })
+            return
+          }
           updateMessage(sessionId, assistantId, {
             pending: false,
             error: err.message,
@@ -335,43 +376,63 @@ export const useLumo = create<LumoState>()(
           flow: 'image',
           provider,
         })
-        const results = await Promise.allSettled(
-          Array.from({ length: count }, (_, i) =>
-            i === 0
-              ? apiImage(fullPrompt, size)
-              : new Promise<{ base64: string; bytes: number }>((resolve, reject) =>
-                  setTimeout(() => apiImage(fullPrompt, size).then(resolve, reject), i * 3000),
-                ),
-          ),
-        )
+
+        // Génération SÉQUENTIELLE : l’API image met 30 à 60 s par visuel,
+        // les appels en parallèle provoquent des échecs en cascade.
+        const started = Date.now()
+        const status = (done: number) => {
+          const sec = Math.round((Date.now() - started) / 1000)
+          const head =
+            count > 1
+              ? `🎨 Génération des visuels — ${done}/${count} prêts · ⏱ ${sec} s`
+              : `🎨 Génération du visuel · ⏱ ${sec} s`
+          return `${head}\n\n*Une création d’image demande habituellement 30 à 60 secondes — gardez l’onglet ouvert.*`
+        }
+        const tick = setInterval(() => {
+          const m = get().sessions.find((s) => s.id === sessionId)?.messages.find((x) => x.id === assistantId)
+          if (m?.pending) updateMessage(sessionId, assistantId, { content: status(artifacts.length) })
+        }, 1000)
+
         const artifacts: Artifact[] = []
-        let ok = 0
-        for (let i = 0; i < results.length; i++) {
-          const r = results[i]
-          if (r.status === 'fulfilled') {
-            ok++
+        let failed = 0
+        for (let i = 0; i < count; i++) {
+          try {
+            const r = await apiImage(fullPrompt, size)
+            const mime = sniffImageMime(r.base64)
             const a: Artifact = {
               id: uid(),
               kind: 'image',
-              name: `image_${String(artifacts.length + 1).padStart(3, '0')}.png`,
-              mimeType: 'image/png',
+              name: `image_${String(artifacts.length + 1).padStart(3, '0')}.${imageExt(mime)}`,
+              mimeType: mime,
               createdAt: Date.now(),
               provider,
               prompt: fullPrompt,
-              data: r.value.base64,
-              bytes: r.value.bytes,
+              data: r.base64,
+              bytes: r.bytes,
               meta: { size },
             }
-            void putArtifactData(a.id, a.data)
+            void putArtifactData(a.id, r.base64)
             artifacts.push(a)
+            // Affichage immédiat de chaque image terminée
+            if (get().sessions.find((s) => s.id === sessionId)?.messages.find((x) => x.id === assistantId)?.pending) {
+              updateMessage(sessionId, assistantId, {
+                artifacts: [...artifacts],
+                content: status(artifacts.length),
+              })
+            }
+          } catch {
+            failed++
           }
         }
-        const failed = count - ok
+        clearInterval(tick)
+
+        const ok = artifacts.length
+        const sec = Math.round((Date.now() - started) / 1000)
         const content =
           ok === 0
-            ? `La génération d’image a échoué pour « ${truncate(prompt, 60)} ». Réessayez dans un instant.`
-            : `Voici ${ok > 1 ? `les ${ok} variations` : 'votre visuel'} pour « ${truncate(prompt, 60)} ».${
-                failed ? ` (${failed} tentative(s) échouée(s))` : ''
+            ? `La génération d’image a échoué pour « ${truncate(prompt, 60)} » (${sec} s d’attente).\n\nLe service image est peut-être momentanément saturé — utilisez le bouton **Réessayer** ci-dessous.`
+            : `Voici ${ok > 1 ? `les ${ok} variations` : 'votre visuel'} pour « ${truncate(prompt, 60)} » (${sec} s).${
+                failed ? `\n\n⚠ ${failed} variation(s) n’ont pas abouti.` : ''
               }`
         updateMessage(sessionId, assistantId, {
           content,
@@ -389,38 +450,83 @@ export const useLumo = create<LumoState>()(
         addMessage(sessionId, {
           id: assistantId,
           role: 'assistant',
-          content: '🎬 Analyse du brief… découpage du storyboard…',
+          content: '🎬 **Analyse du brief**… écriture du script et du découpage en plans.',
           createdAt: Date.now(),
           pending: true,
           flow: 'video',
           provider,
         })
-        later(sessionId, 900, () =>
-          updateMessage(sessionId, assistantId, { content: '🎞 Rendu des plans (1/3)…' }),
-        )
-        later(sessionId, 1800, () =>
-          updateMessage(sessionId, assistantId, { content: '🎞 Rendu des plans (2/3)…' }),
-        )
-        later(sessionId, 2700, () =>
-          updateMessage(sessionId, assistantId, { content: '🎞 Rendu des plans (3/3)…' }),
-        )
-        later(sessionId, 3600, () => {
-          const artifact: Artifact = {
-            id: uid(),
-            kind: 'video',
-            name: `clip_${Date.now().toString().slice(-5)}.mp4`,
-            mimeType: 'video/mp4',
-            createdAt: Date.now(),
-            provider,
-            prompt: prompt + attachmentSummary(opts.attachments),
-            demo: true,
-            meta: { duration: opts.duration ?? '8 s', ratio: '16:9' },
-          }
+
+        const basePrompt = prompt + attachmentSummary(opts.attachments)
+        const duration = opts.duration ?? '8 s'
+        const durSec = Number(String(duration).replace(/\D/g, '')) || 8
+
+        // Plans du storyboard : chaque plan devient une image réelle (effet Ken Burns à la lecture)
+        const plans = [
+          { label: 'Plan 1/3 — cadrage d’ouverture', suffix: 'cinematic opening wide shot, dramatic light, film still' },
+          { label: 'Plan 2/3 — plan rapproché', suffix: 'medium close-up shot, soft depth of field, film still' },
+          { label: 'Plan 3/3 — plan final', suffix: 'final dramatic shot, golden hour lighting, film still' },
+        ]
+        const frames: { mime: string; base64: string }[] = []
+        const started = Date.now()
+
+        later(sessionId, 700, () =>
           updateMessage(sessionId, assistantId, {
-            content: `Aperçu vidéo généré pour « ${truncate(prompt, 60)} ».\n\nLe rendu vidéo complet nécessite le branchement d’Agnes AI (image → vidéo, audio synchronisé). Cet aperçu est une simulation prête à recevoir l’API.`,
-            pending: false,
-            artifacts: [artifact],
+            content: `📝 **Script validé** — ${durSec} s, 3 plans. Génération du storyboard…`,
+          }),
+        )
+
+        // Génération séquentielle des plans (l’API image est lente : 30–60 s / plan)
+        for (let i = 0; i < plans.length; i++) {
+          const p = plans[i]
+          const m = get().sessions.find((s) => s.id === sessionId)?.messages.find((x) => x.id === assistantId)
+          if (!m?.pending) return
+          const sec = Math.round((Date.now() - started) / 1000)
+          updateMessage(sessionId, assistantId, {
+            content: `🎞 ${p.label} — rendu en cours… ⏱ ${sec} s`,
           })
+          try {
+            const r = await apiImage(`${basePrompt}, ${p.suffix}`, '1344x768')
+            frames.push({ mime: sniffImageMime(r.base64), base64: r.base64 })
+            const done = Math.round((Date.now() - started) / 1000)
+            updateMessage(sessionId, assistantId, {
+              content: `✅ ${p.label} prêt (${done} s). ${i < plans.length - 1 ? 'Plan suivant…' : 'Assemblage de l’aperçu animé…'}`,
+            })
+          } catch {
+            updateMessage(sessionId, assistantId, {
+              content: `⚠ ${p.label} indisponible — remplacement par un plan stylisé. ${i < plans.length - 1 ? 'Plan suivant…' : 'Assemblage…'}`,
+            })
+          }
+        }
+
+        const m = get().sessions.find((s) => s.id === sessionId)?.messages.find((x) => x.id === assistantId)
+        if (!m?.pending) return
+
+        // Artefact vidéo : JSON de frames → lecteur animé (Ken Burns + fondus) côté affichage
+        const artifact: Artifact = {
+          id: uid(),
+          kind: 'video',
+          name: `clip_${Date.now().toString().slice(-5)}.mp4`,
+          mimeType: 'application/json',
+          createdAt: Date.now(),
+          provider,
+          prompt: basePrompt,
+          demo: frames.length === 0,
+          meta: { duration, ratio: '16:9', frameCount: frames.length },
+        }
+        // Stockage des frames dans IndexedDB (comme les données binaires)
+        const payload = JSON.stringify({ frames, duration: durSec, ratio: '16:9' })
+        void putArtifactData(artifact.id, payload)
+
+        updateMessage(sessionId, assistantId, {
+          content:
+            `🎬 **Aperçu animé prêt** pour « ${truncate(prompt, 60)} ».\n\n` +
+            `${frames.length > 0
+              ? `${frames.length} plan(s) généré(s) et assemblés en séquence animée (mouvement de caméra + fondus). Appuyez sur ▶ pour lire.`
+              : 'Les plans n’ont pas pu être générés : l’aperçu utilise un rendu animé stylisé. Appuyez sur ▶ pour lire.'}\n\n` +
+            `Pour un rendu vidéo complet (mp4), branchez une API vidéo (Agnes AI) — la structure est prête à la recevoir.`,
+          pending: false,
+          artifacts: [artifact],
         })
       }
 
@@ -430,61 +536,138 @@ export const useLumo = create<LumoState>()(
         const provider = session.models.audio
         const assistantId = uid()
         const voice = opts.voice ?? 'Chloé'
+        const isTranscript = opts.audioTab === 'transcript'
         addMessage(sessionId, {
           id: assistantId,
           role: 'assistant',
-          content:
-            opts.audioTab === 'transcript'
-              ? '🎧 Analyse du fichier… transcription en cours…'
-              : `🎙 Synthèse de la voix « ${voice} »…`,
+          content: isTranscript ? '🎧 Préparation du fichier audio…' : `🎙 Synthèse de la voix « ${voice} »…`,
           createdAt: Date.now(),
           pending: true,
-          flow: opts.audioTab === 'transcript' ? 'audio-transcript' : 'audio-voice',
+          flow: isTranscript ? 'audio-transcript' : 'audio-voice',
           provider,
         })
+
         const firstFile = opts.file ?? opts.attachments?.[0]
-        if (opts.audioTab === 'transcript' && firstFile) {
-          later(sessionId, 1200, () =>
-            updateMessage(sessionId, assistantId, { content: '🎧 Alignement des segments et horodatage…' }),
-          )
-          later(sessionId, 2100, () => {
+
+        /* ---------- Transcription réelle (ASR) ---------- */
+        if (isTranscript) {
+          const base64 = opts.fileBase64
+          const name = firstFile?.name ?? 'audio'
+          if (!base64) {
+            updateMessage(sessionId, assistantId, {
+              pending: false,
+              content: '',
+              error: 'Aucun fichier audio reçu — recommencez via l’onglet Transcription.',
+            })
+            return
+          }
+          later(sessionId, 400, () => {
+            const m = get().sessions.find((s) => s.id === sessionId)?.messages.find((x) => x.id === assistantId)
+            if (m?.pending) {
+              updateMessage(sessionId, assistantId, { content: '🎧 Envoi du fichier au moteur de reconnaissance…' })
+            }
+          })
+          try {
+            const ac = new AbortController()
+            aborts.set(sessionId, ac)
+            const { text: raw, segments } = await apiAsr(base64)
+            aborts.delete(sessionId)
+            const md =
+              `# Transcription — ${name}\n\n` +
+              segments
+                .map((s) => {
+                  const mm = Math.floor(s.start / 60)
+                  const ss = String(Math.round(s.start % 60)).padStart(2, '0')
+                  return `[${String(mm).padStart(2, '0')}:${ss}] ${s.text}`
+                })
+                .join('\n\n')
             const artifact: Artifact = {
               id: uid(),
               kind: 'transcript',
-              name: `transcription_${firstFile.name.replace(/\.[^.]+$/, '')}.md`,
+              name: `transcription_${name.replace(/\.[^.]+$/, '')}.md`,
               mimeType: 'text/markdown',
               createdAt: Date.now(),
               provider,
-              demo: true,
-              text:
-                `# Transcription — ${firstFile.name}\n\n` +
-                `> **Démo** — branchez Voxtral ou Agnes AI pour transcrire réellement ce fichier (${(firstFile.size / 1024).toFixed(0)} Ko).\n\n` +
-                '[00:00] Segment de démonstration : la transcription temps réel s’affichera ici, mot après mot.\n' +
-                '[00:07] Deuxième segment simulé, avec diarisation des locuteurs.\n',
+              text: md,
+              meta: { segments: segments.length, chars: raw.length },
             }
             updateMessage(sessionId, assistantId, {
-              content: `Transcription terminée pour « ${firstFile.name} » (démo).`,
+              content:
+                `✅ Transcription terminée — **${segments.length} segment(s)**, ${raw.split(/\s+/).length} mots.\n\nOuvrez l’artefact pour le texte complet et horodaté, ou copiez-le directement.`,
               pending: false,
               artifacts: [artifact],
             })
+          } catch (e) {
+            aborts.delete(sessionId)
+            updateMessage(sessionId, assistantId, {
+              pending: false,
+              content: '',
+              error: `Transcription impossible : ${e instanceof Error ? e.message : 'erreur inconnue'}`,
+            })
+          }
+          return
+        }
+
+        /* ---------- Voix réelle (TTS) ---------- */
+        const source = text.trim() || opts.attachments?.find((a) => a.text)?.text?.slice(0, 3500) || ''
+        if (!source.trim()) {
+          updateMessage(sessionId, assistantId, {
+            pending: false,
+            content: '',
+            error: 'Écrivez le texte à transformer en voix (ou joignez un fichier texte).',
           })
-        } else {
-          later(sessionId, 1500, () => {
-            const artifact: Artifact = {
-              id: uid(),
-              kind: 'audio',
-              name: `synthese_${Date.now().toString().slice(-5)}.wav`,
-              mimeType: 'audio/wav',
-              createdAt: Date.now(),
-              provider,
-              demo: true,
-              meta: { voice },
-            }
+          return
+        }
+        if (source.length > 4000) {
+          updateMessage(sessionId, assistantId, {
+            pending: false,
+            content: '',
+            error: `Texte trop long (${source.length} caractères). Le moteur vocal accepte jusqu’à 4 000 caractères — découpez-le en plusieurs demandes.`,
+          })
+          return
+        }
+        const tick = setInterval(() => {
+          const m = get().sessions.find((s) => s.id === sessionId)?.messages.find((x) => x.id === assistantId)
+          if (m?.pending && m.content.startsWith('🎙')) {
+            const sec = Math.round((Date.now() - m.createdAt) / 1000)
             updateMessage(sessionId, assistantId, {
-              content: `Voix « ${voice} » générée pour votre texte (démo).\n\nLe flux vocal complet nécessite le branchement de l’API audio choisie. Ce lecteur est prêt à recevoir le flux.`,
-              pending: false,
-              artifacts: [artifact],
+              content: `🎙 Synthèse de la voix « ${voice} »… ⏱ ${sec} s`,
             })
+          }
+        }, 1000)
+        try {
+          const ac = new AbortController()
+          aborts.set(sessionId, ac)
+          const { base64, bytes } = await apiTts(source, voice)
+          aborts.delete(sessionId)
+          clearInterval(tick)
+          const artifact: Artifact = {
+            id: uid(),
+            kind: 'audio',
+            name: `voix_${voice.normalize('NFD').replace(/[^\w]/g, '')}_${Date.now().toString().slice(-5)}.wav`,
+            mimeType: 'audio/wav',
+            createdAt: Date.now(),
+            provider,
+            prompt: source.slice(0, 200),
+            data: base64,
+            bytes,
+            meta: { voice, tts: true },
+          }
+          void putArtifactData(artifact.id, base64)
+          updateMessage(sessionId, assistantId, {
+            content:
+              `🔊 Voix « ${voice} » générée (${(bytes / 1024).toFixed(0)} Ko).\n\n` +
+              `▶ Écoutez ci-dessous — le WAV est téléchargeable et réutilisable dans vos montages.`,
+            pending: false,
+            artifacts: [artifact],
+          })
+        } catch (e) {
+          aborts.delete(sessionId)
+          clearInterval(tick)
+          updateMessage(sessionId, assistantId, {
+            pending: false,
+            content: '',
+            error: `Synthèse vocale impossible : ${e instanceof Error ? e.message : 'erreur inconnue'}`,
           })
         }
       }
@@ -505,11 +688,22 @@ export const useLumo = create<LumoState>()(
           provider,
         })
         try {
-          later(sessionId, 500, () =>
-            updateMessage(sessionId, assistantId, {
-              content: '🎼 Style, tempo et tonalité choisis — enregistrement des pistes (nappes, basse, mélodie, batterie)…',
-            }),
-          )
+          later(sessionId, 500, () => {
+            const m = get().sessions.find((s) => s.id === sessionId)?.messages.find((x) => x.id === assistantId)
+            if (m?.pending) {
+              updateMessage(sessionId, assistantId, {
+                content: '🎼 Style, tempo et tonalité choisis — enregistrement des pistes (nappes, basse, mélodie, batterie)…',
+              })
+            }
+          })
+          later(sessionId, 1600, () => {
+            const m = get().sessions.find((s) => s.id === sessionId)?.messages.find((x) => x.id === assistantId)
+            if (m?.pending) {
+              updateMessage(sessionId, assistantId, {
+                content: '🎚 Mixage et rendu audio… réverbération, écho, masterisation.',
+              })
+            }
+          })
           const res = await generateMusic({
             prompt,
             style: opts.musicStyle ?? 'auto',
@@ -560,6 +754,12 @@ export const useLumo = create<LumoState>()(
         const framework = ((opts.framework ?? 'html') as WebFramework) || 'html'
         const provider = session.models.text
         const assistantId = uid()
+        const steps = [
+          { label: 'Analyse du brief et de l’expérience attendue', state: 'run' as const },
+          { label: 'Conception de l’architecture et de l’arborescence', state: 'todo' as const },
+          { label: `Écriture du code ${framework.toUpperCase()} (composants, styles, responsive)`, state: 'todo' as const },
+          { label: 'Assemblage du projet et vérification', state: 'todo' as const },
+        ]
         addMessage(sessionId, {
           id: assistantId,
           role: 'assistant',
@@ -568,17 +768,68 @@ export const useLumo = create<LumoState>()(
           pending: true,
           flow: 'webdev',
           provider,
+          activity: { label: 'Lumo Dev — agents en action', steps, note: 'Suivez la création des fichiers en temps réel ↓' },
         })
+        const ac = new AbortController()
+        aborts.set(sessionId, ac)
+        let lastPaint = 0
+        let gotFirst = false
+        const filesLive: { name: string; state: 'writing' | 'done' }[] = []
         try {
-          const full = await apiChat(
-            [
-              {
-                role: 'user',
-                content: prompt + attachmentSummary(opts.attachments),
-              },
-            ],
+          const full = await apiChatStream(
+            [{ role: 'user', content: prompt + attachmentSummary(opts.attachments) }],
             webDevSystem(framework),
+            (acc) => {
+              const now = Date.now()
+              if (now - lastPaint < 220) return
+              lastPaint = now
+              if (!gotFirst) {
+                // Dès le premier token : le brief est analysé, l'architecture se dessine
+                gotFirst = true
+                updateMessage(sessionId, assistantId, {
+                  activity: {
+                    label: 'Lumo Dev — agents en action',
+                    steps: steps.map((s, i) => ({ ...s, state: i === 0 ? 'done' : i === 1 ? 'run' : 'todo' })),
+                    note: 'Lecture du brief… planification de l’arborescence…',
+                  },
+                })
+                return
+              }
+              // Aperçu de l’introduction en direct
+              const introCut = acc.indexOf('```')
+              if (introCut > 0) {
+                updateMessage(sessionId, assistantId, { content: acc.slice(0, introCut) })
+              }
+              // Détection en direct : tout bloc ouvert (même en cours d'écriture) apparaît
+              const opened = parseOpeningFiles(acc, framework)
+              if (opened.length === 0 && filesLive.length === 0) return
+              const next = opened.map((name, i) => ({
+                name,
+                state: (i < opened.length - 1 ? 'done' : 'writing') as 'writing' | 'done',
+              }))
+              const treeChanged =
+                next.length !== filesLive.length ||
+                next.some((f, i) => filesLive[i]?.name !== f.name || filesLive[i]?.state !== f.state)
+              if (treeChanged) {
+                filesLive.splice(0, filesLive.length, ...next)
+                updateMessage(sessionId, assistantId, {
+                  activity: {
+                    label: 'Lumo Dev — agents en action',
+                    steps: steps.map((s, i) => ({
+                      ...s,
+                      state: i <= 1 ? 'done' : i === 2 ? 'run' : 'todo',
+                    })),
+                    files: [...filesLive],
+                    note: next.length ? 'Les fichiers apparaissent au fil de l’écriture ↓' : 'Planification de l’arborescence…',
+                  },
+                })
+              }
+            },
+            undefined,
+            ac.signal,
           )
+          aborts.delete(sessionId)
+
           const files = parseCodeBlocks(full, framework)
           if (files.length === 0) {
             throw new Error('Aucun code exploitable dans la réponse — reformulez ou réessayez.')
@@ -601,9 +852,28 @@ export const useLumo = create<LumoState>()(
               `\n\n**${files.length} fichier(s)** généré(s). Ouvrez l’artefact ci-dessous pour l’aperçu live et le téléchargement.`,
             pending: false,
             artifacts: [artifact],
+            activity: {
+              label: 'Lumo Dev — projet assemblé',
+              steps: steps.map((s) => ({ ...s, state: 'done' })),
+              files: files.map((f) => ({ name: f.name, state: 'done' })),
+            },
           })
         } catch (e) {
+          aborts.delete(sessionId)
           const err = e as Error & { fallback?: string[] }
+          if (err.message === 'Génération interrompue.') {
+            updateMessage(sessionId, assistantId, {
+              pending: false,
+              stopped: true,
+              content: 'Génération interrompue — relancez pour reprendre le développement.',
+              activity: {
+                label: 'Lumo Dev — interrompu',
+                steps: steps.map((s, i) => ({ ...s, state: i < 2 ? 'done' : 'todo' })),
+                files: [...filesLive],
+              },
+            })
+            return
+          }
           updateMessage(sessionId, assistantId, {
             pending: false,
             error: `Génération du code impossible : ${err.message}`,
@@ -624,6 +894,12 @@ export const useLumo = create<LumoState>()(
         if (!session) return
         const provider = session.models.text
         const assistantId = uid()
+        const steps = [
+          { label: 'Analyse du besoin et du public cible', state: 'run' as const },
+          { label: 'Choix du style, de la palette et du ton', state: 'todo' as const },
+          { label: 'Composition des écrans et des composants', state: 'todo' as const },
+          { label: 'Préparation du studio visuel', state: 'todo' as const },
+        ]
         addMessage(sessionId, {
           id: assistantId,
           role: 'assistant',
@@ -632,12 +908,26 @@ export const useLumo = create<LumoState>()(
           pending: true,
           flow: 'appdesign',
           provider,
+          activity: { label: 'Studio de conception — assistant en action', steps },
         })
+        const advance = (upTo: number, note?: string) =>
+          updateMessage(sessionId, assistantId, {
+            activity: {
+              label: 'Studio de conception — assistant en action',
+              steps: steps.map((s, i) => ({ ...s, state: i < upTo ? 'done' : i === upTo ? 'run' : 'todo' })),
+              ...(note ? { note } : {}),
+            },
+          })
         try {
+          const ac = new AbortController()
+          aborts.set(sessionId, ac)
+          advance(1, 'L’assistant analyse votre demande…')
           const full = await apiChat(
             [{ role: 'user', content: prompt + attachmentSummary(opts.attachments) }],
             DESIGN_SYSTEM,
           )
+          aborts.delete(sessionId)
+          advance(2, 'Extraction de la structure de la maquette…')
           let doc = extractDesignDoc(full)
 
           // Passe de réparation : le modèle renvoie parfois un JSON mal formé
@@ -660,6 +950,7 @@ export const useLumo = create<LumoState>()(
             }
           }
           if (!doc) throw new Error('structure de design illisible')
+          advance(3, `${doc.screens.length} écran(s) composé(s) — ouverture du studio…`)
 
           const intro = full.replace(/```json[\s\S]*?```/, '').trim()
           const elCount = doc.screens.reduce((n, s) => n + s.elements.length, 0)
@@ -679,9 +970,13 @@ export const useLumo = create<LumoState>()(
               (intro || `Voici la maquette de **${doc.appName}**.`) +
               `\n\n**${doc.screens.length} écran(s)** · ${elCount} éléments · palette ${doc.palette.primary}.\n\n` +
               `▶ **Ouvrez le studio visuel** (bouton sous ce message ou artefact) pour tout ajuster en WYSIWYG, ` +
-              `parler à l’assistant de conception et exporter le code : React, HTML ou FlutterFlow.`,
+              `prévisualiser l’app, insérer images et icônes, et exporter le code : React, HTML ou FlutterFlow.`,
             pending: false,
             artifacts: [artifact],
+            activity: {
+              label: 'Studio de conception — maquette prête',
+              steps: steps.map((s) => ({ ...s, state: 'done' })),
+            },
           })
         } catch {
           // Repli : réponse guidée en texte quand le JSON n’a pas abouti
@@ -837,6 +1132,9 @@ export const useLumo = create<LumoState>()(
         },
 
         stopGeneration: (sessionId) => {
+          // Arrête les flux réseau en cours (streaming chat / dev web / TTS / ASR)
+          aborts.get(sessionId)?.abort()
+          aborts.delete(sessionId)
           const timers = sessionTimers.get(sessionId)
           if (timers) {
             timers.forEach((t) => clearTimeout(t))
@@ -941,9 +1239,8 @@ export const useLumo = create<LumoState>()(
 
         addHfModel: (model) =>
           set((st) => ({
-            hfModels: st.hfModels.some((m) => m.id === model.id)
-              ? st.hfModels
-              : [model, ...st.hfModels],
+            // Remplace l'entrée existante (même id) pour rafraîchir fichiers / type / tâche
+            hfModels: [model, ...st.hfModels.filter((m) => m.id !== model.id)],
           })),
 
         removeHfModel: (id) =>
@@ -964,7 +1261,7 @@ export const useLumo = create<LumoState>()(
     {
       name: 'lumo-store-v1',
       version: 2,
-      migrate: (state) => state as LumoState,
+      migrate: (state) => state as never,
       partialize: (state) => ({
         sessions: state.sessions.map((s) => ({
           ...s,

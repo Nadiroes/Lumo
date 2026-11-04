@@ -88,6 +88,15 @@ export interface Attachment {
   text?: string
 }
 
+/** Suivi d'activité des agents Lumo (style DeepSeek/ChatGPT, repliable) */
+export interface AgentActivity {
+  label: string
+  steps: { label: string; state: 'done' | 'run' | 'todo' }[]
+  /** Arborescence en cours de création (mode Dev Web) */
+  files?: { name: string; state: 'writing' | 'done' }[]
+  note?: string
+}
+
 export interface Message {
   id: string
   role: 'user' | 'assistant'
@@ -102,6 +111,8 @@ export interface Message {
   attachments?: Attachment[]
   /** Alternatives proposées quand le modèle est indisponible */
   fallback?: string[]
+  /** Suivi temps réel des agents (Dev Web, App Design…) */
+  activity?: AgentActivity
 }
 
 export interface BookBrief {
@@ -156,6 +167,13 @@ export interface HfModel {
   likes?: number
   source: 'api' | 'heuristique'
   addedAt: number
+  /** Fichier de poids choisi (.safetensors, .gguf…) quand on connecte un fichier précis */
+  file?: string
+  sizeBytes?: number
+  /** « model » par défaut — « dataset » pour les jeux de données HF (non exécutables) */
+  kind?: 'model' | 'dataset'
+  /** Fichiers détectés sur le dépôt HF (proposés au branchement / téléchargement) */
+  files?: { path: string; size: number; ext: string }[]
 }
 
 export interface ModeInfo {
@@ -196,7 +214,8 @@ export const MODE_INFO: Record<Mode, ModeInfo> = {
   video: {
     label: 'Vidéo',
     tagline: 'Créer des clips, animer des images',
-    description: 'Clips courts et animations (rendu Agnes AI à brancher).',
+    description:
+      'Storyboard en plans réels, aperçu animé jouable (mouvement de caméra + fondus) — rendu mp4 à brancher.',
     capability: 'video',
   },
   audio: {

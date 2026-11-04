@@ -1,0 +1,984 @@
+     1→/** Store central Lumo — orchestration des sessions et des flux de génération */
+     2→
+     3→'use client'
+     4→
+     5→import { create } from 'zustand'
+     6→import { persist } from 'zustand/middleware'
+     7→import { apiChat, apiImage, type ChatOverride } from './api'
+     8→import { deleteArtifactData, putArtifactData } from './artifact-store'
+     9→import { extractDesignDoc, parseCodeBlocks } from './codegen'
+    10→import { generateMusic } from './music'
+    11→import { DEFAULT_MODELS } from './providers'
+    12→import type {
+    13→  Artifact,
+    14→  Attachment,
+    15→  BookBrief,
+    16→  ExportRecord,
+    17→  HfModel,
+    18→  Message,
+    19→  Mode,
+    20→  ModelSelection,
+    21→  Session,
+    22→  WebFramework,
+    23→} from './types'
+    24→
+    25→const LUMO_SYSTEM =
+    26→  'Tu es Lumo, un agent conversationnel chaleureux, lumineux et efficace. ' +
+    27→  'Réponds dans la langue de l’utilisateur (français par défaut). ' +
+    28→  'Structure tes réponses en Markdown lisible : titres courts, listes, gras sur les points clés. ' +
+    29→  'Sois concret et utile, jamais verbeux. Termine par une suggestion d’action quand c’est pertinent. ' +
+    30→  'Tu es intégré à Lumo, un studio de création multimodal avec export .zip versionné. ' +
+    31→  'Tu es un agent auto-apprenant : tu t’appuies sur ta mémoire des interactions précédentes pour t’améliorer.'
+    32→
+    33→const PROJECT_SYSTEM =
+    34→  LUMO_SYSTEM +
+    35→  '\n\nContexte : mode « Projet ». Tu es chef de projet créatif : décompose la demande en phases, ' +
+    36→  'jalons, livrables et artefacts (texte, image, audio, vidéo) avec des durées estimées. Termine par une section « Prochaine action ».'
+    37→
+    38→/* ---------------- Mode Dev Web ---------------- */
+    39→
+    40→const WEBDEV_NOTES: Record<WebFramework, string> = {
+    41→  html: 'HTML sémantique complet (index.html) + styles.css (CSS moderne : variables, flex/grid) + app.js si des interactions sont utiles.',
+    42→  javascript: 'JavaScript vanilla ES6+ dans app.js, index.html et styles.css. Aucun build, aucun framework.',
+    43→  typescript:
+    44→    'TypeScript strict et typé dans app.ts (interfaces, types explicites), index.html et styles.css. Garde un TS exécutable tel quel dans un projet TS.',
+    45→  react:
+    46→    'Composants React fonctionnels avec hooks. Pour un aperçu direct possible, fournis aussi un index.html qui charge React 18 UMD + Babel Standalone via CDN (unpkg) et monte <App />. Sinon App.jsx + composants séparés.',
+    47→  next: 'Structure Next.js App Router complète : app/layout.tsx, app/page.tsx, composants dans app/components/, TypeScript + Tailwind CSS. Indique les commandes npm en commentaire.',
+    48→  php: 'PHP 8 moderne : index.php (logique + htmlspecialchars contre XSS), traitement POST/GET, si formulaire : validation serveur. HTML/CSS responsive embarqué ou styles.css.',
+    49→}
+    50→
+    51→function webDevSystem(framework: WebFramework): string {
+    52→  return (
+    53→    'Tu es Lumo Dev, ingénieur web senior. Génère un site/app web COMPLET, MODERNE et 100% RESPONSIVE ' +
+    54→    '(mobile-first) pour la demande de l’utilisateur.\n\n' +
+    55→    'FORMAT DE RÉPONSE (obligatoire) :\n' +
+    56→    '1. Deux ou trois phrases de présentation de tes choix (pas plus).\n' +
+    57→    '2. Ensuite UNIQUEMENT des blocs de code annotés du nom de fichier, un bloc par fichier :\n' +
+    58→    '```html:index.html\n…\n```\n```css:styles.css\n…\n```\n```js:app.js\n…\n```\n\n' +
+    59→    'SPÉCIFICATIONS :\n' +
+    60→    '- Police Poppins (Google Fonts), palette chaleureuse cohérente, coins arrondis, ombres douces.\n' +
+    61→    '- Responsive : media queries / flex / grid — rien ne doit déborder sur mobile (390px) comme sur desktop.\n' +
+    62→    '- Accessibilité : contrastes, aria-labels, focus visibles, navigation clavier.\n' +
+    63→    '- Contenu réaliste en français (jamais de lorem ipsum), pas de TODO.\n' +
+    64→    '- Fichiers autonomes (aucun build requis) sauf CDN si le framework l’exige.\n\n' +
+    65→    `FRAMEWORK IMPOSÉ : ${framework.toUpperCase()} — ${WEBDEV_NOTES[framework]}`
+    66→  )
+    67→}
+    68→
+    69→/* ---------------- Mode App Design ---------------- */
+    70→
+    71→const DESIGN_SYSTEM =
+    72→  'Tu es le directeur de conception de Lumo (mode App Design). À partir de la demande, conçois ' +
+    73→  'l’architecture UI d’une application RESPONSIVE (mobile-first).\n\n' +
+    74→  'Réponds en DEUX parties, dans cet ordre :\n' +
+    75→  '1. Trois à cinq phrases sur tes choix : type d’app, ton, style, palette.\n' +
+    76→  '2. Un UNIQUE bloc ```json contenant EXACTEMENT ce schéma :\n' +
+    77→  '{\n' +
+    78→  '  "appName": "…",\n' +
+    79→  '  "style": "moderne",\n' +
+    80→  '  "palette": { "primary": "#E8930C", "bg": "#FDF9F0", "text": "#2B2118", "card": "#FFFFFF" },\n' +
+    81→  '  "screens": [\n' +
+    82→  '    { "name": "Accueil", "elements": [\n' +
+    83→  '      { "type": "navbar", "props": { "text": "…", "links": "Accueil, Fonctions, Contact" } },\n' +
+    84→  '      { "type": "hero", "props": { "title": "…", "subtitle": "…", "cta": "…" } },\n' +
+    85→  '      { "type": "text", "props": { "text": "…", "size": "md" } }\n' +
+    86→  '    ] }\n' +
+    87→  '  ]\n' +
+    88→  '}\n\n' +
+    89→  'TYPES D’ÉLÉMENTS AUTORISÉS (rien d’autre) : navbar, hero, text, button, input, image, list, card, badge, divider, footer.\n' +
+    90→  'RÈGLES : 2 à 5 écrans, 4 à 10 éléments par écran, textes réalistes en français, palette chaleureuse contrastée (AA), ' +
+    91→  'props toujours en chaînes, aucun commentaire dans le JSON, aucun texte hors des deux parties.'
+    92→
+    93→const DESIGN_REPAIR_SYSTEM =
+    94→  'Tu répares du JSON. On te fournit une réponse qui devait contenir un JSON de conception UI.\n' +
+    95→  'Réponds UNIQUEMENT avec un bloc ```json STRICTEMENT valide, même schéma :\n' +
+    96→  '{ "appName": string, "style": string, "palette": { "primary": "#hex", "bg": "#hex", "text": "#hex", "card": "#hex" },\n' +
+    97→  '  "screens": [ { "name": string, "elements": [ { "type": "navbar"|"hero"|"text"|"button"|"input"|"image"|"list"|"card"|"badge"|"divider"|"footer", "props": { …chaînes } } ] } ] }\n' +
+    98→  'Chaque clé suivie de deux-points, chaque paire séparée par des virgules, aucun commentaire, aucun texte hors du bloc.'
+    99→
+   100→const DESIGN_GUIDE_SYSTEM =
+   101→  LUMO_SYSTEM +
+   102→  '\n\nContexte : mode « App Design ». Tu es l’assistant de conception de Lumo : guide l’utilisateur écran par écran ' +
+   103→  '(structure, palette, composants, accessibilité, responsive) et propose la prochaine étape concrète. Tu ne génères pas de JSON ici.'
+   104→
+   105→const BIBLE_SYSTEM =
+   106→  'Tu es directeur littéraire. À partir du brief JSON fourni par l’utilisateur, rédige la « Bible de l’œuvre » ' +
+   107→  'en Markdown avec ces sections : Titre proposé (+ 2 alternatives), Pitch (5 lignes max), Ton & style, ' +
+   108→  'Voix narrative, Univers & règles, Personnages (principal détaillé + 2 seconds esquissés), ' +
+   109→  'Structure (actes puis 8 à 12 chapitres titrés, une ligne chacun), Thèmes & motifs récurrents, ' +
+   110→  'Ambiances visuelles & sonores. Markdown propre, sans méta-commentaire, en français. ' +
+   111→  'La longueur cible figure dans le brief : si elle est « Illimité », prévois une structure extensible (séquences, tomes) et dis-le.'
+   112→
+   113→function bookSystem(briefMd: string): string {
+   114→  return (
+   115→    'Tu es l’assistant d’écriture de Lumo et le directeur littéraire attitré de ce projet. ' +
+   116→    'Respecte strictement la Bible de l’œuvre ci-dessous (ton, voix, univers, structure). ' +
+   117→    'Quand on te demande un chapitre, écris-le pleinement avec de la matière narrative concrète. ' +
+   118→    'Si une cible de pages est fixée dans le brief, vise-la ; si la longueur est illimitée, écris un chapitre complet ' +
+   119→    '(1 200 à 2 500 mots) et propose la suite.\n\n' +
+   120→    '## BIBLE DE L’ŒUVRE\n\n' + briefMd
+   121→  )
+   122→}
+   123→
+   124→export interface SendOptions {
+   125→  imageSize?: string
+   126→  variations?: number
+   127→  voice?: string
+   128→  audioTab?: 'voice' | 'transcript' | 'music'
+   129→  file?: { name: string; size: number }
+   130→  attachments?: Attachment[]
+   131→  musicStyle?: string
+   132→  musicDuration?: number
+   133→  instrumental?: boolean
+   134→  framework?: string
+   135→}
+   136→
+   137→interface LumoState {
+   138→  view: 'hub' | 'chat'
+   139→  sessions: Session[]
+   140→  activeId: string | null
+   141→  hfModels: HfModel[]
+   142→  editingMsg: { sessionId: string; msgId: string } | null
+   143→
+   144→  openHub: () => void
+   145→  openSession: (id: string) => void
+   146→  startSession: (mode: Mode, brief?: BookBrief) => string
+   147→  deleteSession: (id: string) => void
+   148→  togglePin: (id: string) => void
+   149→  renameSession: (id: string, title: string) => void
+   150→  setSessionMode: (id: string, mode: Mode) => void
+   151→  setSessionModel: (id: string, kind: keyof ModelSelection, providerId: string) => void
+   152→
+   153→  sendMessage: (sessionId: string, text: string, opts?: SendOptions) => Promise<void>
+   154→  editMessage: (sessionId: string, msgId: string, newText: string, attachments?: Attachment[]) => Promise<void>
+   155→  retryWithProvider: (sessionId: string, provider: string, hfModel?: string) => Promise<void>
+   156→  stopGeneration: (sessionId: string) => void
+   157→  regenerateLast: (sessionId: string) => Promise<void>
+   158→  generateBible: (sessionId: string, brief: BookBrief) => Promise<void>
+   159→
+   160→  addHfModel: (model: HfModel) => void
+   161→  removeHfModel: (id: string) => void
+   162→
+   163→  recordExport: (sessionId: string, record: ExportRecord) => void
+   164→
+   165→  updateSession: (id: string, fn: (s: Session) => Session) => void
+   166→  updateMessage: (sessionId: string, msgId: string, patch: Partial<Message>) => void
+   167→  setEditingMsg: (v: { sessionId: string; msgId: string } | null) => void
+   168→}
+   169→
+   170→/* ---- flux en cours (streaming + minuteries simulées) ---- */
+   171→const streams = new Map<
+   172→  string,
+   173→  { timer: ReturnType<typeof setInterval>; sessionId: string; resolve: (c: string) => void }
+   174→>()
+   175→const sessionTimers = new Map<string, Set<ReturnType<typeof setTimeout>>>()
+   176→
+   177→function uid(): string {
+   178→  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) return crypto.randomUUID()
+   179→  return `id-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
+   180→}
+   181→
+   182→function truncate(s: string, n: number): string {
+   183→  const t = s.trim().replace(/\s+/g, ' ')
+   184→  return t.length <= n ? t : t.slice(0, n - 1) + '…'
+   185→}
+   186→
+   187→/** Bloc texte des pièces jointes, injecté dans le prompt du modèle */
+   188→function attachmentBlock(m: Message, maxPerFile = 12000): string {
+   189→  if (!m.attachments?.length) return ''
+   190→  const parts = m.attachments.map((a) =>
+   191→    a.text
+   192→      ? `--- Fichier joint : ${a.name} ---\n${a.text.slice(0, maxPerFile)}`
+   193→      : `[Pièce jointe : ${a.name} (${a.type || 'fichier'}, ${(a.size / 1024).toFixed(0)} Ko)]`,
+   194→  )
+   195→  return '\n\n[Fichiers joints par l’utilisateur]\n' + parts.join('\n\n')
+   196→}
+   197→
+   198→function attachmentSummary(attachments?: Attachment[]): string {
+   199→  if (!attachments?.length) return ''
+   200→  const names = attachments.map((a) => a.name).join(', ')
+   201→  const texts = attachments
+   202→    .filter((a) => a.text)
+   203→    .map((a) => `--- ${a.name} ---\n${a.text!.slice(0, 2000)}`)
+   204→    .join('\n\n')
+   205→  return `\n\n(En tenant compte des fichiers joints : ${names})${texts ? '\n\n' + texts : ''}`
+   206→}
+   207→
+   208→export const useLumo = create<LumoState>()(
+   209→  persist(
+   210→    (set, get) => {
+   211→      function updateSession(id: string, fn: (s: Session) => Session) {
+   212→        set((st) => ({ sessions: st.sessions.map((s) => (s.id === id ? fn(s) : s)) }))
+   213→      }
+   214→      function updateMessage(sessionId: string, msgId: string, patch: Partial<Message>) {
+   215→        updateSession(sessionId, (s) => ({
+   216→          ...s,
+   217→          updatedAt: Date.now(),
+   218→          messages: s.messages.map((m) => (m.id === msgId ? { ...m, ...patch } : m)),
+   219→        }))
+   220→      }
+   221→
+   222→      function addMessage(sessionId: string, msg: Message) {
+   223→        updateSession(sessionId, (s) => ({ ...s, messages: [...s.messages, msg] }))
+   224→      }
+   225→
+   226→      function revealStream(sessionId: string, msgId: string, full: string): Promise<string> {
+   227→        return new Promise((resolve) => {
+   228→          let revealed = 0
+   229→          const chunk = Math.max(3, Math.ceil(full.length / 160))
+   230→          const timer = setInterval(() => {
+   231→            revealed = Math.min(full.length, revealed + chunk)
+   232→            updateMessage(sessionId, msgId, { content: full.slice(0, revealed) })
+   233→            if (revealed >= full.length) {
+   234→              clearInterval(timer)
+   235→              streams.delete(msgId)
+   236→              updateMessage(sessionId, msgId, { content: full, pending: false })
+   237→              resolve(full)
+   238→            }
+   239→          }, 16)
+   240→          streams.set(msgId, {
+   241→            timer,
+   242→            sessionId,
+   243→            resolve: (content) => {
+   244→              updateMessage(sessionId, msgId, { content, pending: false, stopped: true })
+   245→              resolve(content)
+   246→            },
+   247→          })
+   248→        })
+   249→      }
+   250→
+   251→      function later(sessionId: string, ms: number, fn: () => void) {
+   252→        const t = setTimeout(() => {
+   253→          const set_ = sessionTimers.get(sessionId)
+   254→          if (set_) set_.delete(t)
+   255→          fn()
+   256→        }, ms)
+   257→        if (!sessionTimers.has(sessionId)) sessionTimers.set(sessionId, new Set())
+   258→        sessionTimers.get(sessionId)!.add(t)
+   259→      }
+   260→
+   261→      /* ---------- flux ---------- */
+   262→
+   263→      async function chatFlow(
+   264→        sessionId: string,
+   265→        history: Message[],
+   266→        override?: { provider?: string; hfModel?: string },
+   267→      ) {
+   268→        const session = get().sessions.find((s) => s.id === sessionId)
+   269→        if (!session) return
+   270→        const providerLabel =
+   271→          override?.provider === 'hf'
+   272→            ? `hf:${override.hfModel}`
+   273→            : (override?.provider ?? session.models.text)
+   274→        const assistantId = uid()
+   275→        addMessage(sessionId, {
+   276→          id: assistantId,
+   277→          role: 'assistant',
+   278→          content: '',
+   279→          createdAt: Date.now(),
+   280→          pending: true,
+   281→          flow: 'chat',
+   282→          provider: providerLabel,
+   283→        })
+   284→        try {
+   285→          const turns = history
+   286→            .filter((m) => !m.pending && !m.error && m.content.trim())
+   287→            .slice(-16)
+   288→            .map((m) => ({ role: m.role, content: m.content + attachmentBlock(m) }) as { role: 'user' | 'assistant'; content: string })
+   289→          let system = LUMO_SYSTEM
+   290→          if (session.mode === 'project') system = PROJECT_SYSTEM
+   291→          if (session.mode === 'book' && session.brief) {
+   292→            const bibleArtifact = session.messages
+   293→              .flatMap((m) => m.artifacts ?? [])
+   294→              .find((a) => a.kind === 'bible')
+   295→            system = bookSystem(
+   296→              bibleArtifact?.text ??
+   297→                'Brief : ' + JSON.stringify(session.brief, null, 2),
+   298→            )
+   299→          }
+   300→          const useOverride: ChatOverride | undefined =
+   301→            override?.provider && override.provider !== 'lumo-core'
+   302→              ? { provider: override.provider as ChatOverride['provider'], hfModel: override.hfModel }
+   303→              : undefined
+   304→          const full = await apiChat(turns, system, useOverride)
+   305→          const stillPending = get().sessions
+   306→            .find((s) => s.id === sessionId)
+   307→            ?.messages.find((m) => m.id === assistantId)?.pending
+   308→          if (stillPending) await revealStream(sessionId, assistantId, full)
+   309→          else updateMessage(sessionId, assistantId, { content: full, pending: false })
+   310→        } catch (e) {
+   311→          const err = e as Error & { fallback?: string[] }
+   312→          updateMessage(sessionId, assistantId, {
+   313→            pending: false,
+   314→            error: err.message,
+   315→            content: '',
+   316→            fallback: err.fallback ?? ['mistral', 'agnes', 'hf'],
+   317→          })
+   318→        }
+   319→      }
+   320→
+   321→      async function imageFlow(sessionId: string, prompt: string, opts: SendOptions) {
+   322→        const session = get().sessions.find((s) => s.id === sessionId)
+   323→        if (!session) return
+   324→        const count = Math.max(1, Math.min(4, opts.variations ?? 1))
+   325→        const size = opts.imageSize ?? '1024x1024'
+   326→        const provider = session.models.image
+   327→        const fullPrompt = prompt + attachmentSummary(opts.attachments)
+   328→        const assistantId = uid()
+   329→        addMessage(sessionId, {
+   330→          id: assistantId,
+   331→          role: 'assistant',
+   332→          content: '',
+   333→          createdAt: Date.now(),
+   334→          pending: true,
+   335→          flow: 'image',
+   336→          provider,
+   337→        })
+   338→        const results = await Promise.allSettled(
+   339→          Array.from({ length: count }, (_, i) =>
+   340→            i === 0
+   341→              ? apiImage(fullPrompt, size)
+   342→              : new Promise<{ base64: string; bytes: number }>((resolve, reject) =>
+   343→                  setTimeout(() => apiImage(fullPrompt, size).then(resolve, reject), i * 3000),
+   344→                ),
+   345→          ),
+   346→        )
+   347→        const artifacts: Artifact[] = []
+   348→        let ok = 0
+   349→        for (let i = 0; i < results.length; i++) {
+   350→          const r = results[i]
+   351→          if (r.status === 'fulfilled') {
+   352→            ok++
+   353→            const a: Artifact = {
+   354→              id: uid(),
+   355→              kind: 'image',
+   356→              name: `image_${String(artifacts.length + 1).padStart(3, '0')}.png`,
+   357→              mimeType: 'image/png',
+   358→              createdAt: Date.now(),
+   359→              provider,
+   360→              prompt: fullPrompt,
+   361→              data: r.value.base64,
+   362→              bytes: r.value.bytes,
+   363→              meta: { size },
+   364→            }
+   365→            void putArtifactData(a.id, a.data)
+   366→            artifacts.push(a)
+   367→          }
+   368→        }
+   369→        const failed = count - ok
+   370→        const content =
+   371→          ok === 0
+   372→            ? `La génération d’image a échoué pour « ${truncate(prompt, 60)} ». Réessayez dans un instant.`
+   373→            : `Voici ${ok > 1 ? `les ${ok} variations` : 'votre visuel'} pour « ${truncate(prompt, 60)} ».${
+   374→                failed ? ` (${failed} tentative(s) échouée(s))` : ''
+   375→              }`
+   376→        updateMessage(sessionId, assistantId, {
+   377→          content,
+   378→          pending: false,
+   379→          artifacts,
+   380→          error: ok === 0 ? 'Génération impossible' : undefined,
+   381→        })
+   382→      }
+   383→
+   384→      async function videoFlow(sessionId: string, prompt: string, opts: SendOptions = {}) {
+   385→        const session = get().sessions.find((s) => s.id === sessionId)
+   386→        if (!session) return
+   387→        const provider = session.models.video
+   388→        const assistantId = uid()
+   389→        addMessage(sessionId, {
+   390→          id: assistantId,
+   391→          role: 'assistant',
+   392→          content: '🎬 Analyse du brief… découpage du storyboard…',
+   393→          createdAt: Date.now(),
+   394→          pending: true,
+   395→          flow: 'video',
+   396→          provider,
+   397→        })
+   398→        later(sessionId, 900, () =>
+   399→          updateMessage(sessionId, assistantId, { content: '🎞 Rendu des plans (1/3)…' }),
+   400→        )
+   401→        later(sessionId, 1800, () =>
+   402→          updateMessage(sessionId, assistantId, { content: '🎞 Rendu des plans (2/3)…' }),
+   403→        )
+   404→        later(sessionId, 2700, () =>
+   405→          updateMessage(sessionId, assistantId, { content: '🎞 Rendu des plans (3/3)…' }),
+   406→        )
+   407→        later(sessionId, 3600, () => {
+   408→          const artifact: Artifact = {
+   409→            id: uid(),
+   410→            kind: 'video',
+   411→            name: `clip_${Date.now().toString().slice(-5)}.mp4`,
+   412→            mimeType: 'video/mp4',
+   413→            createdAt: Date.now(),
+   414→            provider,
+   415→            prompt: prompt + attachmentSummary(opts.attachments),
+   416→            demo: true,
+   417→            meta: { duration: opts.duration ?? '8 s', ratio: '16:9' },
+   418→          }
+   419→          updateMessage(sessionId, assistantId, {
+   420→            content: `Aperçu vidéo généré pour « ${truncate(prompt, 60)} ».\n\nLe rendu vidéo complet nécessite le branchement d’Agnes AI (image → vidéo, audio synchronisé). Cet aperçu est une simulation prête à recevoir l’API.`,
+   421→            pending: false,
+   422→            artifacts: [artifact],
+   423→          })
+   424→        })
+   425→      }
+   426→
+   427→      async function audioFlow(sessionId: string, text: string, opts: SendOptions) {
+   428→        const session = get().sessions.find((s) => s.id === sessionId)
+   429→        if (!session) return
+   430→        const provider = session.models.audio
+   431→        const assistantId = uid()
+   432→        const voice = opts.voice ?? 'Chloé'
+   433→        addMessage(sessionId, {
+   434→          id: assistantId,
+   435→          role: 'assistant',
+   436→          content:
+   437→            opts.audioTab === 'transcript'
+   438→              ? '🎧 Analyse du fichier… transcription en cours…'
+   439→              : `🎙 Synthèse de la voix « ${voice} »…`,
+   440→          createdAt: Date.now(),
+   441→          pending: true,
+   442→          flow: opts.audioTab === 'transcript' ? 'audio-transcript' : 'audio-voice',
+   443→          provider,
+   444→        })
+   445→        const firstFile = opts.file ?? opts.attachments?.[0]
+   446→        if (opts.audioTab === 'transcript' && firstFile) {
+   447→          later(sessionId, 1200, () =>
+   448→            updateMessage(sessionId, assistantId, { content: '🎧 Alignement des segments et horodatage…' }),
+   449→          )
+   450→          later(sessionId, 2100, () => {
+   451→            const artifact: Artifact = {
+   452→              id: uid(),
+   453→              kind: 'transcript',
+   454→              name: `transcription_${firstFile.name.replace(/\.[^.]+$/, '')}.md`,
+   455→              mimeType: 'text/markdown',
+   456→              createdAt: Date.now(),
+   457→              provider,
+   458→              demo: true,
+   459→              text:
+   460→                `# Transcription — ${firstFile.name}\n\n` +
+   461→                `> **Démo** — branchez Voxtral ou Agnes AI pour transcrire réellement ce fichier (${(firstFile.size / 1024).toFixed(0)} Ko).\n\n` +
+   462→                '[00:00] Segment de démonstration : la transcription temps réel s’affichera ici, mot après mot.\n' +
+   463→                '[00:07] Deuxième segment simulé, avec diarisation des locuteurs.\n',
+   464→            }
+   465→            updateMessage(sessionId, assistantId, {
+   466→              content: `Transcription terminée pour « ${firstFile.name} » (démo).`,
+   467→              pending: false,
+   468→              artifacts: [artifact],
+   469→            })
+   470→          })
+   471→        } else {
+   472→          later(sessionId, 1500, () => {
+   473→            const artifact: Artifact = {
+   474→              id: uid(),
+   475→              kind: 'audio',
+   476→              name: `synthese_${Date.now().toString().slice(-5)}.wav`,
+   477→              mimeType: 'audio/wav',
+   478→              createdAt: Date.now(),
+   479→              provider,
+   480→              demo: true,
+   481→              meta: { voice },
+   482→            }
+   483→            updateMessage(sessionId, assistantId, {
+   484→              content: `Voix « ${voice} » générée pour votre texte (démo).\n\nLe flux vocal complet nécessite le branchement de l’API audio choisie. Ce lecteur est prêt à recevoir le flux.`,
+   485→              pending: false,
+   486→              artifacts: [artifact],
+   487→            })
+   488→          })
+   489→        }
+   490→      }
+   491→
+   492→      /** Génération musicale locale (façon Suno) — rendu WAV réel, lisible et téléchargeable */
+   493→      async function musicFlow(sessionId: string, prompt: string, opts: SendOptions) {
+   494→        const session = get().sessions.find((s) => s.id === sessionId)
+   495→        if (!session) return
+   496→        const provider = session.models.audio
+   497→        const assistantId = uid()
+   498→        addMessage(sessionId, {
+   499→          id: assistantId,
+   500→          role: 'assistant',
+   501→          content: '🎼 Composition en cours… analyse du prompt, choix du style…',
+   502→          createdAt: Date.now(),
+   503→          pending: true,
+   504→          flow: 'audio-music',
+   505→          provider,
+   506→        })
+   507→        try {
+   508→          later(sessionId, 500, () =>
+   509→            updateMessage(sessionId, assistantId, {
+   510→              content: '🎼 Style, tempo et tonalité choisis — enregistrement des pistes (nappes, basse, mélodie, batterie)…',
+   511→            }),
+   512→          )
+   513→          const res = await generateMusic({
+   514→            prompt,
+   515→            style: opts.musicStyle ?? 'auto',
+   516→            durationSec: opts.musicDuration ?? 24,
+   517→            instrumental: opts.instrumental ?? false,
+   518→          })
+   519→          const artifact: Artifact = {
+   520→            id: uid(),
+   521→            kind: 'audio',
+   522→            name: `${res.title.replace(/[^\wÀ-ÿ]+/g, '_')}.wav`,
+   523→            mimeType: 'audio/wav',
+   524→            createdAt: Date.now(),
+   525→            provider,
+   526→            prompt,
+   527→            data: res.wavBase64,
+   528→            bytes: res.bytes,
+   529→            meta: {
+   530→              music: true,
+   531→              style: res.meta.style,
+   532→              bpm: res.meta.bpm,
+   533→              key: res.meta.key,
+   534→              durationSec: res.meta.durationSec,
+   535→              instrumental: opts.instrumental ?? false,
+   536→            },
+   537→          }
+   538→          void putArtifactData(artifact.id, artifact.data!)
+   539→          updateMessage(sessionId, assistantId, {
+   540→            content:
+   541→              `Voici **« ${res.title} »** — ${res.meta.style}, ${res.meta.bpm} BPM, ${res.meta.key} (${res.meta.durationSec} s).\n\n` +
+   542→              `▶ Écoutez la piste ci-dessous et téléchargez-la en WAV. Dites-moi si vous voulez une variation : plus rapide, plus sombre, autre style, autre durée…`,
+   543→            pending: false,
+   544→            artifacts: [artifact],
+   545→          })
+   546→        } catch (e) {
+   547→          updateMessage(sessionId, assistantId, {
+   548→            content: '',
+   549→            pending: false,
+   550→            error: `La génération musicale a échoué : ${e instanceof Error ? e.message : 'erreur inconnue'}`,
+   551→          })
+   552→        }
+   553→      }
+   554→
+   555→      /* ---------- mode Dev Web ---------- */
+   556→
+   557→      async function webDevFlow(sessionId: string, prompt: string, opts: SendOptions) {
+   558→        const session = get().sessions.find((s) => s.id === sessionId)
+   559→        if (!session) return
+   560→        const framework = ((opts.framework ?? 'html') as WebFramework) || 'html'
+   561→        const provider = session.models.text
+   562→        const assistantId = uid()
+   563→        addMessage(sessionId, {
+   564→          id: assistantId,
+   565→          role: 'assistant',
+   566→          content: '',
+   567→          createdAt: Date.now(),
+   568→          pending: true,
+   569→          flow: 'webdev',
+   570→          provider,
+   571→        })
+   572→        try {
+   573→          const full = await apiChat(
+   574→            [
+   575→              {
+   576→                role: 'user',
+   577→                content: prompt + attachmentSummary(opts.attachments),
+   578→              },
+   579→            ],
+   580→            webDevSystem(framework),
+   581→          )
+   582→          const files = parseCodeBlocks(full, framework)
+   583→          if (files.length === 0) {
+   584→            throw new Error('Aucun code exploitable dans la réponse — reformulez ou réessayez.')
+   585→          }
+   586→          const intro = full.slice(0, full.indexOf('```')).trim()
+   587→          const artifact: Artifact = {
+   588→            id: uid(),
+   589→            kind: 'webcode',
+   590→            name: `${files.find((f) => f.name.endsWith('.html'))?.name.replace(/\.html$/, '') ?? 'projet'}_${framework}`,
+   591→            mimeType: 'text/plain',
+   592→            createdAt: Date.now(),
+   593→            provider,
+   594→            prompt,
+   595→            files,
+   596→            meta: { framework, fileCount: files.length, previewable: buildPreviewable(files) ? 'oui' : 'non' },
+   597→          }
+   598→          updateMessage(sessionId, assistantId, {
+   599→            content:
+   600→              (intro || `Voici votre projet **${framework}** complet et responsive.`) +
+   601→              `\n\n**${files.length} fichier(s)** généré(s). Ouvrez l’artefact ci-dessous pour l’aperçu live et le téléchargement.`,
+   602→            pending: false,
+   603→            artifacts: [artifact],
+   604→          })
+   605→        } catch (e) {
+   606→          const err = e as Error & { fallback?: string[] }
+   607→          updateMessage(sessionId, assistantId, {
+   608→            pending: false,
+   609→            error: `Génération du code impossible : ${err.message}`,
+   610→            content: '',
+   611→            fallback: err.fallback ?? ['mistral', 'agnes', 'hf'],
+   612→          })
+   613→        }
+   614→      }
+   615→
+   616→      function buildPreviewable(files: NonNullable<Artifact['files']>): boolean {
+   617→        return files.some((f) => f.lang === 'html' || f.name.endsWith('.html'))
+   618→      }
+   619→
+   620→      /* ---------- mode App Design ---------- */
+   621→
+   622→      async function designFlow(sessionId: string, prompt: string, opts: SendOptions) {
+   623→        const session = get().sessions.find((s) => s.id === sessionId)
+   624→        if (!session) return
+   625→        const provider = session.models.text
+   626→        const assistantId = uid()
+   627→        addMessage(sessionId, {
+   628→          id: assistantId,
+   629→          role: 'assistant',
+   630→          content: '',
+   631→          createdAt: Date.now(),
+   632→          pending: true,
+   633→          flow: 'appdesign',
+   634→          provider,
+   635→        })
+   636→        try {
+   637→          const full = await apiChat(
+   638→            [{ role: 'user', content: prompt + attachmentSummary(opts.attachments) }],
+   639→            DESIGN_SYSTEM,
+   640→          )
+   641→          let doc = extractDesignDoc(full)
+   642→
+   643→          // Passe de réparation : le modèle renvoie parfois un JSON mal formé
+   644→          if (!doc) {
+   645→            try {
+   646→              const fixed = await apiChat(
+   647→                [
+   648→                  {
+   649→                    role: 'user',
+   650→                    content:
+   651→                      'Voici la réponse à réparer (garde le même design, corrige la syntaxe) :\n\n' +
+   652→                      full.slice(0, 6000),
+   653→                  },
+   654→                ],
+   655→                DESIGN_REPAIR_SYSTEM,
+   656→              )
+   657→              doc = extractDesignDoc(fixed)
+   658→            } catch {
+   659→              /* réparation impossible → repli texte */
+   660→            }
+   661→          }
+   662→          if (!doc) throw new Error('structure de design illisible')
+   663→
+   664→          const intro = full.replace(/```json[\s\S]*?```/, '').trim()
+   665→          const elCount = doc.screens.reduce((n, s) => n + s.elements.length, 0)
+   666→          const artifact: Artifact = {
+   667→            id: uid(),
+   668→            kind: 'design',
+   669→            name: `design_${doc.appName.toLowerCase().replace(/[^\wà-ÿ]+/g, '_').slice(0, 30)}.json`,
+   670→            mimeType: 'application/json',
+   671→            createdAt: Date.now(),
+   672→            provider,
+   673→            prompt,
+   674→            text: JSON.stringify(doc),
+   675→            meta: { appName: doc.appName, screens: doc.screens.length, elements: elCount },
+   676→          }
+   677→          updateMessage(sessionId, assistantId, {
+   678→            content:
+   679→              (intro || `Voici la maquette de **${doc.appName}**.`) +
+   680→              `\n\n**${doc.screens.length} écran(s)** · ${elCount} éléments · palette ${doc.palette.primary}.\n\n` +
+   681→              `▶ **Ouvrez le studio visuel** (bouton sous ce message ou artefact) pour tout ajuster en WYSIWYG, ` +
+   682→              `parler à l’assistant de conception et exporter le code : React, HTML ou FlutterFlow.`,
+   683→            pending: false,
+   684→            artifacts: [artifact],
+   685→          })
+   686→        } catch {
+   687→          // Repli : réponse guidée en texte quand le JSON n’a pas abouti
+   688→          try {
+   689→            const turns = [{ role: 'user' as const, content: prompt }]
+   690→            const guide = await apiChat(turns, DESIGN_GUIDE_SYSTEM)
+   691→            updateMessage(sessionId, assistantId, {
+   692→              content: guide,
+   693→              pending: false,
+   694→            })
+   695→          } catch (e) {
+   696→            const err = e as Error & { fallback?: string[] }
+   697→            updateMessage(sessionId, assistantId, {
+   698→              pending: false,
+   699→              error: err.message,
+   700→              content: '',
+   701→              fallback: err.fallback ?? ['mistral', 'agnes', 'hf'],
+   702→            })
+   703→          }
+   704→        }
+   705→      }
+   706→
+   707→      /* ---------- état ---------- */
+   708→      return {
+   709→        view: 'hub',
+   710→        sessions: [],
+   711→        activeId: null,
+   712→        hfModels: [],
+   713→        editingMsg: null,
+   714→
+   715→        openHub: () => set({ view: 'hub' }),
+   716→        openSession: (id) => set({ view: 'chat', activeId: id }),
+   717→
+   718→        startSession: (mode, brief) => {
+   719→          const id = uid()
+   720→          const now = Date.now()
+   721→          const session: Session = {
+   722→            id,
+   723→            title: brief?.title?.trim() || `Nouvelle session ${mode === 'free' ? 'libre' : mode === 'book' ? 'Livre' : mode}`,
+   724→            mode,
+   725→            brief,
+   726→            messages: [],
+   727→            models: { ...DEFAULT_MODELS },
+   728→            createdAt: now,
+   729→            updatedAt: now,
+   730→            exports: [],
+   731→          }
+   732→          set((st) => ({
+   733→            sessions: [session, ...st.sessions].slice(0, 40),
+   734→            activeId: id,
+   735→            view: 'chat',
+   736→          }))
+   737→          return id
+   738→        },
+   739→
+   740→        deleteSession: (id) => {
+   741→          const s = get().sessions.find((x) => x.id === id)
+   742→          s?.messages.forEach((m) => m.artifacts?.forEach((a) => void deleteArtifactData(a.id)))
+   743→          set((st) => ({
+   744→            sessions: st.sessions.filter((x) => x.id !== id),
+   745→            activeId: st.activeId === id ? null : st.activeId,
+   746→            view: st.activeId === id ? 'hub' : st.view,
+   747→          }))
+   748→        },
+   749→
+   750→        togglePin: (id) =>
+   751→          updateSession(id, (s) => ({ ...s, pinned: !s.pinned })),
+   752→
+   753→        renameSession: (id, title) =>
+   754→          updateSession(id, (s) => ({ ...s, title: title.trim() || s.title })),
+   755→
+   756→        setSessionMode: (id, mode) => updateSession(id, (s) => ({ ...s, mode })),
+   757→
+   758→        setSessionModel: (id, kind, providerId) =>
+   759→          updateSession(id, (s) => ({ ...s, models: { ...s.models, [kind]: providerId } })),
+   760→
+   761→        sendMessage: async (sessionId, text, opts = {}) => {
+   762→          const trimmed = text.trim()
+   763→          const attachments = opts.attachments
+   764→          if (!trimmed && !opts.file && !attachments?.length) return
+   765→          const session = get().sessions.find((s) => s.id === sessionId)
+   766→          if (!session) return
+   767→
+   768→          const isFirstUser =
+   769→            session.messages.filter((m) => m.role === 'user').length === 0
+   770→          addMessage(sessionId, {
+   771→            id: uid(),
+   772→            role: 'user',
+   773→            content: trimmed || (opts.file ? `Transcrire « ${opts.file.name} »` : attachments?.[0]?.name || ''),
+   774→            createdAt: Date.now(),
+   775→            attachments: attachments?.length ? attachments : undefined,
+   776→          })
+   777→          if (isFirstUser) {
+   778→            updateSession(sessionId, (s) => ({ ...s, title: truncate(trimmed || opts.file?.name || 'Session', 42) }))
+   779→          }
+   780→
+   781→          const history = get().sessions.find((s) => s.id === sessionId)!.messages
+   782→
+   783→          if (session.mode === 'image') await imageFlow(sessionId, trimmed, opts)
+   784→          else if (session.mode === 'video') await videoFlow(sessionId, trimmed, opts)
+   785→          else if (session.mode === 'audio') {
+   786→            if (opts.audioTab === 'music') await musicFlow(sessionId, trimmed, opts)
+   787→            else await audioFlow(sessionId, trimmed, opts)
+   788→          } else if (session.mode === 'webdev') await webDevFlow(sessionId, trimmed, opts)
+   789→          else if (session.mode === 'appdesign') await designFlow(sessionId, trimmed, opts)
+   790→          else await chatFlow(sessionId, history)
+   791→        },
+   792→
+   793→        editMessage: async (sessionId, msgId, newText, attachments) => {
+   794→          const session = get().sessions.find((s) => s.id === sessionId)
+   795→          if (!session) return
+   796→          const idx = session.messages.findIndex((m) => m.id === msgId)
+   797→          if (idx < 0) return
+   798→          // Purger les artefacts des messages qui seront régénérés
+   799→          session.messages.slice(idx + 1).forEach((m) =>
+   800→            m.artifacts?.forEach((a) => void deleteArtifactData(a.id)),
+   801→          )
+   802→          const edited: Message = {
+   803→            ...session.messages[idx],
+   804→            content: newText.trim(),
+   805→            attachments: attachments?.length ? attachments : undefined,
+   806→            createdAt: Date.now(),
+   807→          }
+   808→          const kept = session.messages.slice(0, idx)
+   809→          updateSession(sessionId, (s) => ({ ...s, messages: [...kept, edited], updatedAt: Date.now() }))
+   810→
+   811→          const mode = session.mode
+   812→          const opts: SendOptions = { attachments }
+   813→          if (mode === 'image') await imageFlow(sessionId, edited.content, opts)
+   814→          else if (mode === 'video') await videoFlow(sessionId, edited.content, opts)
+   815→          else if (mode === 'audio') await audioFlow(sessionId, edited.content, { ...opts, audioTab: 'voice' })
+   816→          else if (mode === 'webdev') {
+   817→            const fw = (session.messages[idx].artifacts?.[0]?.meta?.framework as string) ?? opts.framework ?? 'html'
+   818→            await webDevFlow(sessionId, edited.content, { ...opts, framework: fw })
+   819→          } else if (mode === 'appdesign') await designFlow(sessionId, edited.content, opts)
+   820→          else await chatFlow(sessionId, [...kept, edited])
+   821→        },
+   822→
+   823→        retryWithProvider: async (sessionId, provider, hfModel) => {
+   824→          const session = get().sessions.find((s) => s.id === sessionId)
+   825→          if (!session) return
+   826→          const lastAssistantIdx = session.messages.map((m) => m.role).lastIndexOf('assistant')
+   827→          if (lastAssistantIdx >= 0) {
+   828→            const removed = session.messages[lastAssistantIdx]
+   829→            removed.artifacts?.forEach((a) => void deleteArtifactData(a.id))
+   830→            updateSession(sessionId, (s) => ({
+   831→              ...s,
+   832→              messages: s.messages.filter((_, i) => i !== lastAssistantIdx),
+   833→            }))
+   834→          }
+   835→          const fresh = get().sessions.find((s) => s.id === sessionId)!
+   836→          await chatFlow(sessionId, fresh.messages, { provider, hfModel })
+   837→        },
+   838→
+   839→        stopGeneration: (sessionId) => {
+   840→          const timers = sessionTimers.get(sessionId)
+   841→          if (timers) {
+   842→            timers.forEach((t) => clearTimeout(t))
+   843→            sessionTimers.delete(sessionId)
+   844→          }
+   845→          const session = get().sessions.find((s) => s.id === sessionId)
+   846→          const pendingMsg = session?.messages.find((m) => m.pending)
+   847→          if (pendingMsg) {
+   848→            const entry = Array.from(streams.entries()).find(([, v]) => v.sessionId === sessionId)
+   849→            if (entry) {
+   850→              clearInterval(entry[1].timer)
+   851→              streams.delete(entry[0])
+   852→            }
+   853→            updateMessage(sessionId, pendingMsg.id, {
+   854→              pending: false,
+   855→              stopped: true,
+   856→              content: pendingMsg.content || 'Génération interrompue.',
+   857→            })
+   858→          }
+   859→        },
+   860→
+   861→        regenerateLast: async (sessionId) => {
+   862→          const session = get().sessions.find((s) => s.id === sessionId)
+   863→          if (!session) return
+   864→          const lastAssistantIdx = session.messages.map((m) => m.role).lastIndexOf('assistant')
+   865→          if (lastAssistantIdx < 0) return
+   866→          const lastUser = session.messages
+   867→            .slice(0, lastAssistantIdx)
+   868→            .reverse()
+   869→            .find((m) => m.role === 'user')
+   870→          if (!lastUser) return
+   871→          const removed = session.messages[lastAssistantIdx]
+   872→          removed.artifacts?.forEach((a) => void deleteArtifactData(a.id))
+   873→          updateSession(sessionId, (s) => ({
+   874→            ...s,
+   875→            messages: s.messages.filter((_, i) => i !== lastAssistantIdx),
+   876→          }))
+   877→          const mode = session.mode
+   878→          if (mode === 'image') {
+   879→            const size = (removed.artifacts?.[0]?.meta?.size as string) ?? '1024x1024'
+   880→            const variations = (removed.artifacts?.length ?? 1) > 1 ? 4 : 1
+   881→            await imageFlow(sessionId, lastUser.content, { imageSize: size, variations, attachments: lastUser.attachments })
+   882→          } else if (mode === 'video') {
+   883→            await videoFlow(sessionId, lastUser.content, { attachments: lastUser.attachments })
+   884→          } else if (mode === 'audio') {
+   885→            if (removed.flow === 'audio-music') {
+   886→              await musicFlow(sessionId, lastUser.content, { audioTab: 'music', attachments: lastUser.attachments })
+   887→            } else {
+   888→              await audioFlow(sessionId, lastUser.content, {
+   889→                audioTab: removed.flow === 'audio-transcript' ? 'transcript' : 'voice',
+   890→                attachments: lastUser.attachments,
+   891→              })
+   892→            }
+   893→          } else if (mode === 'webdev') {
+   894→            await webDevFlow(sessionId, lastUser.content, {
+   895→              framework: (removed.artifacts?.[0]?.meta?.framework as string) ?? 'html',
+   896→              attachments: lastUser.attachments,
+   897→            })
+   898→          } else if (mode === 'appdesign') {
+   899→            await designFlow(sessionId, lastUser.content, { attachments: lastUser.attachments })
+   900→          } else {
+   901→            await chatFlow(sessionId, session.messages.slice(0, lastAssistantIdx))
+   902→          }
+   903→        },
+   904→
+   905→        generateBible: async (sessionId, brief) => {
+   906→          const assistantId = uid()
+   907→          addMessage(sessionId, {
+   908→            id: assistantId,
+   909→            role: 'assistant',
+   910→            content: '',
+   911→            createdAt: Date.now(),
+   912→            pending: true,
+   913→            flow: 'chat',
+   914→            provider: 'lumo-core',
+   915→          })
+   916→          try {
+   917→            const full = await apiChat(
+   918→              [{ role: 'user', content: 'Voici mon brief. Rédige la Bible de l’œuvre.\n\n' + JSON.stringify(brief, null, 2) }],
+   919→              BIBLE_SYSTEM,
+   920→            )
+   921→            const revealed = await revealStream(sessionId, assistantId, full)
+   922→            const artifact: Artifact = {
+   923→              id: uid(),
+   924→              kind: 'bible',
+   925→              name: 'bible_de_l_oeuvre.md',
+   926→              mimeType: 'text/markdown',
+   927→              createdAt: Date.now(),
+   928→              provider: 'lumo-core',
+   929→              text: revealed,
+   930→            }
+   931→            updateMessage(sessionId, assistantId, { artifacts: [artifact] })
+   932→          } catch (e) {
+   933→            const err = e as Error & { fallback?: string[] }
+   934→            updateMessage(sessionId, assistantId, {
+   935→              pending: false,
+   936→              error: err.message,
+   937→              fallback: err.fallback ?? ['mistral', 'agnes', 'hf'],
+   938→            })
+   939→          }
+   940→        },
+   941→
+   942→        addHfModel: (model) =>
+   943→          set((st) => ({
+   944→            hfModels: st.hfModels.some((m) => m.id === model.id)
+   945→              ? st.hfModels
+   946→              : [model, ...st.hfModels],
+   947→          })),
+   948→
+   949→        removeHfModel: (id) =>
+   950→          set((st) => ({ hfModels: st.hfModels.filter((m) => m.id !== id) })),
+   951→
+   952→        recordExport: (sessionId, record) =>
+   953→          updateSession(sessionId, (s) => ({
+   954→            ...s,
+   955→            savedToProject: s.savedToProject || record.keptInProject,
+   956→            exports: [...s.exports, record],
+   957→          })),
+   958→
+   959→        updateSession,
+   960→        updateMessage,
+   961→        setEditingMsg: (v) => set({ editingMsg: v }),
+   962→      }
+   963→    },
+   964→    {
+   965→      name: 'lumo-store-v1',
+   966→      version: 2,
+   967→      migrate: (state) => state as LumoState,
+   968→      partialize: (state) => ({
+   969→        sessions: state.sessions.map((s) => ({
+   970→          ...s,
+   971→          messages: s.messages
+   972→            .filter((m) => !m.pending)
+   973→            .map((m) => ({
+   974→              ...m,
+   975→              attachments: m.attachments?.map((a) => ({ ...a, text: a.text ? a.text.slice(0, 4000) : undefined })),
+   976→              artifacts: m.artifacts?.map((a) => ({ ...a, data: undefined })),
+   977→            })),
+   978→        })),
+   979→        hfModels: state.hfModels,
+   980→      }),
+   981→    },
+   982→  ),
+   983→)
+   984→

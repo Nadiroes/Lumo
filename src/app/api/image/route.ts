@@ -30,7 +30,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 /** Une tentative de génération — lève en cas d'échec */
 async function attempt(prompt: string, size: string): Promise<string> {
   const zai = await ZAI.create()
-  const response = await zai.images.generations.create({ prompt, size })
+  const response = await zai.images.generations.create({ prompt, size: size as '1024x1024' })
   const base64 = response.data?.[0]?.base64
   if (!base64) throw new Error('Réponse image vide.')
   return base64

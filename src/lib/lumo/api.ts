@@ -28,6 +28,69 @@ export async function apiChat(messages: ChatTurn[], system?: string, override?: 
   return String(json.content || '')
 }
 
+/**
+ * Chat en streaming : les deltas arrivent au fil de la génération du modèle.
+ * Repli automatique sur l'appel non-streamé si le flux échoue avant le premier token.
+ */
+export async function apiChatStream(
+  messages: ChatTurn[],
+  system: string | undefined,
+  onDelta: (full: string, delta: string) => void,
+  override?: ChatOverride,
+  signal?: AbortSignal,
+): Promise<string> {
+  let res: Response
+  try {
+    res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages, system, stream: true, ...(override ?? {}) }),
+      signal,
+    })
+  } catch (e) {
+    if (signal?.aborted) throw new Error('Génération interrompue.')
+    throw e
+  }
+  const ct = res.headers.get('content-type') ?? ''
+  if (!ct.includes('text/plain') || !res.body) {
+    // Réponse JSON (erreur ou repli serveur sans streaming)
+    const json = await res.json().catch(() => ({}))
+    if (!res.ok || !json.ok) {
+      const err = new Error(json.error || 'Le moteur Lumo est indisponible.') as Error & { fallback?: string[] }
+      if (Array.isArray(json.available)) err.fallback = json.available
+      else if (json.fallback) err.fallback = ['mistral', 'agnes', 'hf']
+      throw err
+    }
+    const content = String(json.content || '')
+    onDelta(content, content)
+    return content
+  }
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let full = ''
+  for (;;) {
+    let done = false
+    let value: Uint8Array | undefined
+    try {
+      ;({ done, value } = await reader.read())
+    } catch {
+      if (signal?.aborted) throw new Error('Génération interrompue.')
+      throw new Error('Flux interrompu.')
+    }
+    if (done) break
+    const text = decoder.decode(value, { stream: true })
+    if (text.includes('\u0000ERROR:')) {
+      const msg = text.split('\u0000ERROR:')[1] || 'Erreur moteur'
+      throw new Error(msg.trim())
+    }
+    full += text
+    onDelta(full, text)
+  }
+  if (!full.trim()) throw new Error('Réponse vide du moteur.')
+  return full
+}
+
 export async function apiImage(prompt: string, size: string): Promise<{ base64: string; bytes: number }> {
   const res = await fetch('/api/image', {
     method: 'POST',
@@ -44,6 +107,48 @@ export async function apiHfLookup(id: string): Promise<HfModel> {
   const json = await res.json()
   if (!res.ok || !json.ok || !json.model) throw new Error(json.error || 'Modèle introuvable.')
   return json.model as HfModel
+}
+
+/** URL de téléchargement direct d'un fichier HF (les dépôts privés demandent un token) */
+export function hfResolveUrl(id: string, file: string, kind?: string): string {
+  const base = kind === 'dataset' ? `https://huggingface.co/datasets/${id}` : `https://huggingface.co/${id}`
+  return `${base}/resolve/main/${file}`
+}
+
+/* ---------------- Voix (TTS réel) ---------------- */
+
+export async function apiTts(
+  text: string,
+  voice: string,
+  speed = 1,
+): Promise<{ base64: string; bytes: number }> {
+  const res = await fetch('/api/tts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, voice, speed }),
+  })
+  const json = await res.json()
+  if (!res.ok || !json.ok) throw new Error(json.error || 'La synthèse vocale a échoué.')
+  return { base64: String(json.base64), bytes: Number(json.bytes || 0) }
+}
+
+/* ---------------- Transcription (ASR réel) ---------------- */
+
+export interface AsrSegment {
+  start: number
+  end: number
+  text: string
+}
+
+export async function apiAsr(base64: string): Promise<{ text: string; segments: AsrSegment[] }> {
+  const res = await fetch('/api/asr', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ base64 }),
+  })
+  const json = await res.json()
+  if (!res.ok || !json.ok) throw new Error(json.error || 'La transcription a échoué.')
+  return { text: String(json.text || ''), segments: (json.segments ?? []) as AsrSegment[] }
 }
 
 /* ---------------- Clés API ---------------- */

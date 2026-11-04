@@ -1,0 +1,942 @@
+     1→'use client'
+     2→
+     3→/**
+     4→ * Studio App Design — éditeur WYSIWYG de Lumo :
+     5→ * écrans → éléments → propriétés, palette, assistant de conception à chaque
+     6→ * étape, et export de code : HTML, React, FlutterFlow (Dart + JSON).
+     7→ */
+     8→
+     9→import { useEffect, useMemo, useRef, useState } from 'react'
+    10→import {
+    11→  ArrowDown,
+    12→  ArrowUp,
+    13→  Check,
+    14→  ChevronRight,
+    15→  Code2,
+    16→  Copy,
+    17→  Download,
+    18→  LayoutDashboard,
+    19→  Monitor,
+    20→  Palette,
+    21→  Plus,
+    22→  SendHorizontal,
+    23→  Smartphone,
+    24→  Sparkles,
+    25→  SquarePen,
+    26→  Trash2,
+    27→  X,
+    28→} from 'lucide-react'
+    29→import { Button } from '@/components/ui/button'
+    30→import { Input } from '@/components/ui/input'
+    31→import {
+    32→  Dialog,
+    33→  DialogContent,
+    34→  DialogDescription,
+    35→  DialogHeader,
+    36→  DialogTitle,
+    37→} from '@/components/ui/dialog'
+    38→import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+    39→import { Textarea } from '@/components/ui/textarea'
+    40→import { useToast } from '@/hooks/use-toast'
+    41→import { apiChat } from '@/lib/lumo/api'
+    42→import {
+    43→  DEFAULT_PALETTE,
+    44→  EL_CATALOG,
+    45→  coerceDoc,
+    46→  elLabel,
+    47→  emptyDoc,
+    48→  generateFlutterFlow,
+    49→  generateHtml,
+    50→  generateReact,
+    51→  makeEl,
+    52→  uid,
+    53→  type DesignDoc,
+    54→  type DesignEl,
+    55→  type DesignScreen,
+    56→  type ElType,
+    57→} from '@/lib/lumo/codegen'
+    58→import { downloadText } from '@/lib/lumo/export'
+    59→import { useLumo } from '@/lib/lumo/store'
+    60→import type { Artifact } from '@/lib/lumo/types'
+    61→
+    62→/* ------------------------------------------------------------------ */
+    63→/* Config des propriétés par type d’élément                            */
+    64→/* ------------------------------------------------------------------ */
+    65→
+    66→interface FieldDef {
+    67→  key: string
+    68→  label: string
+    69→  multiline?: boolean
+    70→  options?: string[]
+    71→}
+    72→
+    73→const PROPERTY_FIELDS: Record<ElType, FieldDef[]> = {
+    74→  navbar: [
+    75→    { key: 'text', label: 'Nom de la marque' },
+    76→    { key: 'links', label: 'Liens (séparés par des virgules)' },
+    77→  ],
+    78→  hero: [
+    79→    { key: 'title', label: 'Titre' },
+    80→    { key: 'subtitle', label: 'Sous-titre', multiline: true },
+    81→    { key: 'cta', label: 'Texte du bouton' },
+    82→  ],
+    83→  text: [
+    84→    { key: 'text', label: 'Contenu', multiline: true },
+    85→    { key: 'size', label: 'Taille', options: ['sm', 'md', 'lg'] },
+    86→  ],
+    87→  button: [
+    88→    { key: 'text', label: 'Libellé' },
+    89→    { key: 'variant', label: 'Variante', options: ['primary', 'outline'] },
+    90→  ],
+    91→  input: [
+    92→    { key: 'label', label: 'Étiquette' },
+    93→    { key: 'placeholder', label: 'Texte indicatif' },
+    94→  ],
+    95→  image: [{ key: 'alt', label: 'Description de l’image' }],
+    96→  list: [{ key: 'items', label: 'Points (un par ligne)', multiline: true }],
+    97→  card: [
+    98→    { key: 'title', label: 'Titre de la carte' },
+    99→    { key: 'text', label: 'Contenu', multiline: true },
+   100→  ],
+   101→  badge: [{ key: 'text', label: 'Texte de l’étiquette' }],
+   102→  divider: [],
+   103→  footer: [{ key: 'text', label: 'Texte du pied de page' }],
+   104→}
+   105→
+   106→/* ------------------------------------------------------------------ */
+   107→/* Carte dans le fil de conversation                                   */
+   108→/* ------------------------------------------------------------------ */
+   109→
+   110→export function DesignCard({ a, onOpen }: { a: Artifact; onOpen: () => void }) {
+   111→  const screens = String(a.meta?.screens ?? '?')
+   112→  const elements = String(a.meta?.elements ?? '?')
+   113→  const appName = String(a.meta?.appName ?? 'maquette')
+   114→  return (
+   115→    <button
+   116→      onClick={onOpen}
+   117→      className="flex w-full items-center gap-3 rounded-xl border bg-card p-3 text-left transition-colors hover:border-primary/40 hover:bg-accent"
+   118→      aria-label={`Ouvrir le studio visuel de ${appName}`}
+   119→    >
+   120→      <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+   121→        <LayoutDashboard className="h-4.5 w-4.5" aria-hidden="true" />
+   122→      </span>
+   123→      <span className="min-w-0 flex-1">
+   124→        <span className="block truncate text-sm font-medium">{appName}</span>
+   125→        <span className="text-[11px] text-muted-foreground">
+   126→          Maquette WYSIWYG · {screens} écran(s) · {elements} éléments — cliquez pour éditer et exporter le code
+   127→        </span>
+   128→      </span>
+   129→      <SquarePen className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+   130→    </button>
+   131→  )
+   132→}
+   133→
+   134→/* ------------------------------------------------------------------ */
+   135→/* Rendu WYSIWYG d’un élément                                          */
+   136→/* ------------------------------------------------------------------ */
+   137→
+   138→function ElView({ el, palette, selected, onSelect }: { el: DesignEl; palette: DesignDoc['palette']; selected: boolean; onSelect: () => void }) {
+   139→  const p = el.props
+   140→  const ring = selected ? 'outline-2 outline-offset-2 outline-primary' : 'hover:outline-2 hover:outline-offset-2 hover:outline-primary/40'
+   141→  const common = `cursor-pointer transition-all ${ring}`
+   142→  switch (el.type) {
+   143→    case 'navbar':
+   144→      return (
+   145→        <header onClick={onSelect} className={`flex flex-wrap items-center justify-between gap-2 rounded-2xl bg-white p-3 shadow-sm ${common}`} role="presentation">
+   146→          <span className="font-bold" style={{ color: palette.primary }}>{p.text || 'Mon app'}</span>
+   147→          <span className="flex flex-wrap gap-3 text-xs opacity-75">
+   148→            {(p.links ?? '').split(/[,\n]/).map((l) => l.trim()).filter(Boolean).map((l, i) => <span key={i}>{l}</span>)}
+   149→          </span>
+   150→        </header>
+   151→      )
+   152→    case 'hero':
+   153→      return (
+   154→        <section onClick={onSelect} className={`flex flex-col items-center gap-2 rounded-2xl bg-white p-6 text-center shadow-sm sm:p-9 ${common}`} role="presentation">
+   155→          <h3 className="text-xl font-bold sm:text-2xl" style={{ color: palette.text }}>{p.title}</h3>
+   156→          <p className="max-w-md text-xs opacity-70 sm:text-sm">{p.subtitle}</p>
+   157→          <span className="rounded-full px-5 py-2 text-xs font-semibold text-white" style={{ background: palette.primary }}>{p.cta}</span>
+   158→        </section>
+   159→      )
+   160→    case 'text':
+   161→      return (
+   162→        <p
+   163→          onClick={onSelect}
+   164→          className={`px-1 opacity-90 ${common} ${p.size === 'lg' ? 'text-base font-medium sm:text-lg' : p.size === 'sm' ? 'text-[11px]' : 'text-xs sm:text-sm'}`}
+   165→          role="presentation"
+   166→        >
+   167→          {p.text}
+   168→        </p>
+   169→      )
+   170→    case 'button':
+   171→      return (
+   172→        <p className="px-1" role="presentation">
+   173→          <button
+   174→            onClick={(e) => {
+   175→              e.stopPropagation()
+   176→              onSelect()
+   177→            }}
+   178→            className={`rounded-full px-4 py-2 text-xs font-semibold transition-colors sm:text-sm ${common} ${
+   179→              p.variant === 'outline' ? 'border-2 bg-transparent' : 'text-white'
+   180→            }`}
+   181→            style={p.variant === 'outline' ? { borderColor: palette.primary, color: palette.primary } : { background: palette.primary }}
+   182→          >
+   183→            {p.text}
+   184→          </button>
+   185→        </p>
+   186→      )
+   187→    case 'input':
+   188→      return (
+   189→        <label onClick={onSelect} className={`flex cursor-pointer flex-col gap-1 rounded-xl bg-white/60 px-1 py-1 text-[11px] ${common}`} role="presentation">
+   190→          <span className="opacity-70">{p.label}</span>
+   191→          <span className="rounded-lg border border-black/15 bg-white px-3 py-2 text-muted-foreground">{p.placeholder}</span>
+   192→        </label>
+   193→      )
+   194→    case 'image':
+   195→      return (
+   196→        <div
+   197→          onClick={onSelect}
+   198→          className={`grid min-h-24 place-items-center rounded-2xl text-xs opacity-80 sm:min-h-32 ${common}`}
+   199→          style={{ background: `color-mix(in srgb, ${palette.primary} 16%, white)` }}
+   200→          role="presentation"
+   201→        >
+   202→          🖼 {p.alt || 'Image'}
+   203→        </div>
+   204→      )
+   205→    case 'list':
+   206→      return (
+   207→        <ul onClick={onSelect} className={`list-disc space-y-1 rounded-2xl bg-white p-4 pl-8 text-xs shadow-sm sm:text-sm ${common}`} role="presentation">
+   208→          {(p.items ?? '').split(/\n/).map((i) => i.trim()).filter(Boolean).map((i, k) => <li key={k}>{i}</li>)}
+   209→        </ul>
+   210→      )
+   211→    case 'card':
+   212→      return (
+   213→        <div onClick={onSelect} className={`rounded-2xl bg-white p-4 shadow-sm ${common}`} role="presentation">
+   214→          <p className="mb-1 text-sm font-semibold" style={{ color: palette.primary }}>{p.title}</p>
+   215→          <p className="text-xs opacity-75">{p.text}</p>
+   216→        </div>
+   217→      )
+   218→    case 'badge':
+   219→      return (
+   220→        <p className="px-1" role="presentation">
+   221→          <span onClick={onSelect} className={`inline-block cursor-pointer rounded-full px-3 py-1 text-[10px] font-semibold sm:text-xs ${common}`} style={{ background: `color-mix(in srgb, ${palette.primary} 18%, white)`, color: palette.primary }}>
+   222→            {p.text}
+   223→          </span>
+   224→        </p>
+   225→      )
+   226→    case 'divider':
+   227→      return <hr onClick={onSelect} className={`cursor-pointer border-black/10 ${common}`} role="presentation" />
+   228→    case 'footer':
+   229→      return (
+   230→        <p onClick={onSelect} className={`cursor-pointer pt-2 text-center text-[11px] opacity-60 ${common}`} role="presentation">
+   231→          {p.text}
+   232→        </p>
+   233→      )
+   234→    default:
+   235→      return null
+   236→  }
+   237→}
+   238→
+   239→/* ------------------------------------------------------------------ */
+   240→/* Panneau Écrans + palette                                            */
+   241→/* ------------------------------------------------------------------ */
+   242→
+   243→function ScreensPanel({
+   244→  doc,
+   245→  setDoc,
+   246→  activeScreenId,
+   247→  setActiveScreenId,
+   248→}: {
+   249→  doc: DesignDoc
+   250→  setDoc: (fn: (d: DesignDoc) => DesignDoc) => void
+   251→  activeScreenId: string
+   252→  setActiveScreenId: (id: string) => void
+   253→}) {
+   254→  const { toast } = useToast()
+   255→  function addScreen() {
+   256→    const s: DesignScreen = { id: uid(), name: `Écran ${doc.screens.length + 1}`, elements: [makeEl('text')] }
+   257→    setDoc((d) => ({ ...d, screens: [...d.screens, s] }))
+   258→    setActiveScreenId(s.id)
+   259→  }
+   260→  return (
+   261→    <div className="flex flex-col gap-3">
+   262→      <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Écrans ({doc.screens.length})</p>
+   263→      <ul className="space-y-1">
+   264→        {doc.screens.map((s) => (
+   265→          <li key={s.id} className="group flex items-center gap-1">
+   266→            <button
+   267→              onClick={() => setActiveScreenId(s.id)}
+   268→              className={`min-w-0 flex-1 truncate rounded-lg px-2.5 py-1.5 text-left text-xs font-medium transition-colors ${
+   269→                s.id === activeScreenId ? 'bg-primary/10 text-primary' : 'hover:bg-accent'
+   270→              }`}
+   271→              aria-current={s.id === activeScreenId}
+   272→            >
+   273→              {s.name}
+   274→              <span className="ml-1 text-[10px] text-muted-foreground">({s.elements.length})</span>
+   275→            </button>
+   276→            <button
+   277→              onClick={() => {
+   278→                if (doc.screens.length <= 1) {
+   279→                  toast({ title: 'Au moins un écran est requis', variant: 'destructive' })
+   280→                  return
+   281→                }
+   282→                setDoc((d) => ({ ...d, screens: d.screens.filter((x) => x.id !== s.id) }))
+   283→              }}
+   284→              className="rounded p-1 text-muted-foreground opacity-0 hover:text-destructive group-hover:opacity-100"
+   285→              aria-label={`Supprimer l’écran ${s.name}`}
+   286→            >
+   287→              <Trash2 className="h-3 w-3" />
+   288→            </button>
+   289→          </li>
+   290→        ))}
+   291→      </ul>
+   292→      <Button size="sm" variant="outline" className="gap-1" onClick={addScreen}>
+   293→        <Plus className="h-3.5 w-3.5" /> Ajouter un écran
+   294→      </Button>
+   295→
+   296→      <p className="mt-2 flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+   297→        <Palette className="h-3 w-3" /> Palette
+   298→      </p>
+   299→      {(
+   300→        [
+   301→          ['primary', 'Principale'],
+   302→          ['bg', 'Fond'],
+   303→          ['text', 'Texte'],
+   304→          ['card', 'Cartes'],
+   305→        ] as const
+   306→      ).map(([k, label]) => (
+   307→        <label key={k} className="flex items-center justify-between gap-2 text-xs">
+   308→          <span>{label}</span>
+   309→          <input
+   310→            type="color"
+   311→            value={doc.palette[k]}
+   312→            onChange={(e) => setDoc((d) => ({ ...d, palette: { ...d.palette, [k]: e.target.value } }))}
+   313→            className="h-7 w-10 cursor-pointer rounded border bg-transparent"
+   314→            aria-label={`Couleur ${label}`}
+   315→          />
+   316→        </label>
+   317→      ))}
+   318→      <label className="flex items-center justify-between gap-2 text-xs">
+   319→        <span>App</span>
+   320→        <Input
+   321→          value={doc.appName}
+   322→          onChange={(e) => setDoc((d) => ({ ...d, appName: e.target.value.slice(0, 60) }))}
+   323→          className="h-7 w-36 text-xs"
+   324→          aria-label="Nom de l’application"
+   325→        />
+   326→      </label>
+   327→    </div>
+   328→  )
+   329→}
+   330→
+   331→/* ------------------------------------------------------------------ */
+   332→/* Panneau Propriétés de l’élément sélectionné                         */
+   333→/* ------------------------------------------------------------------ */
+   334→
+   335→function PropsPanel({
+   336→  doc,
+   337→  setDoc,
+   338→  activeScreenId,
+   339→  selected,
+   340→  setSelected,
+   341→}: {
+   342→  doc: DesignDoc
+   343→  setDoc: (fn: (d: DesignDoc) => DesignDoc) => void
+   344→  activeScreenId: string
+   345→  selected: DesignEl | null
+   346→  setSelected: (id: string | null) => void
+   347→}) {
+   348→  const screen = doc.screens.find((s) => s.id === activeScreenId)
+   349→  function patchProp(key: string, value: string) {
+   350→    if (!selected || !screen) return
+   351→    setDoc((d) => ({
+   352→      ...d,
+   353→      screens: d.screens.map((s) =>
+   354→        s.id === screen.id
+   355→          ? {
+   356→              ...s,
+   357→              elements: s.elements.map((e) => (e.id === selected.id ? { ...e, props: { ...e.props, [key]: value } } : e)),
+   358→            }
+   359→          : s,
+   360→      ),
+   361→    }))
+   362→  }
+   363→  function move(dir: -1 | 1) {
+   364→    if (!selected || !screen) return
+   365→    const idx = screen.elements.findIndex((e) => e.id === selected.id)
+   366→    const to = idx + dir
+   367→    if (to < 0 || to >= screen.elements.length) return
+   368→    const els = [...screen.elements]
+   369→    ;[els[idx], els[to]] = [els[to], els[idx]]
+   370→    setDoc((d) => ({
+   371→      ...d,
+   372→      screens: d.screens.map((s) => (s.id === screen.id ? { ...s, elements: els } : s)),
+   373→    }))
+   374→  }
+   375→  function duplicate() {
+   376→    if (!selected || !screen) return
+   377→    setDoc((d) => ({
+   378→      ...d,
+   379→      screens: d.screens.map((s) =>
+   380→        s.id === screen.id ? { ...s, elements: [...s.elements, { ...selected, id: uid() }] } : s,
+   381→      ),
+   382→    }))
+   383→  }
+   384→  function remove() {
+   385→    if (!selected || !screen) return
+   386→    setDoc((d) => ({
+   387→      ...d,
+   388→      screens: d.screens.map((s) => (s.id === screen.id ? { ...s, elements: s.elements.filter((e) => e.id !== selected.id) } : s)),
+   389→    }))
+   390→    setSelected(null)
+   391→  }
+   392→
+   393→  if (!selected) {
+   394→    return (
+   395→      <p className="rounded-xl border border-dashed p-4 text-center text-xs leading-relaxed text-muted-foreground">
+   396→        Cliquez un élément de la maquette pour l’éditer, ou ajoutez-en un depuis le catalogue sous l’aperçu.
+   397→      </p>
+   398→    )
+   399→  }
+   400→
+   401→  return (
+   402→    <div className="space-y-3">
+   403→      <div className="flex items-center justify-between">
+   404→        <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+   405→          {elLabel(selected.type)}
+   406→        </p>
+   407→        <button onClick={() => setSelected(null)} className="text-muted-foreground hover:text-foreground" aria-label="Désélectionner">
+   408→          <X className="h-3.5 w-3.5" />
+   409→        </button>
+   410→      </div>
+   411→      {PROPERTY_FIELDS[selected.type].map((f) =>
+   412→        f.options ? (
+   413→          <label key={f.key} className="flex items-center justify-between gap-2 text-xs">
+   414→            <span className="shrink-0">{f.label}</span>
+   415→            <select
+   416→              value={selected.props[f.key] ?? f.options[0]}
+   417→              onChange={(e) => patchProp(f.key, e.target.value)}
+   418→              className="h-8 w-36 rounded-md border bg-background px-2 text-xs"
+   419→              aria-label={f.label}
+   420→            >
+   421→              {f.options.map((o) => (
+   422→                <option key={o} value={o}>{o}</option>
+   423→              ))}
+   424→            </select>
+   425→          </label>
+   426→        ) : f.multiline ? (
+   427→          <label key={f.key} className="block space-y-1 text-xs">
+   428→            <span>{f.label}</span>
+   429→            <Textarea
+   430→              value={selected.props[f.key] ?? ''}
+   431→              onChange={(e) => patchProp(f.key, e.target.value)}
+   432→              className="min-h-16 text-xs"
+   433→              aria-label={f.label}
+   434→            />
+   435→          </label>
+   436→        ) : (
+   437→          <label key={f.key} className="block space-y-1 text-xs">
+   438→            <span>{f.label}</span>
+   439→            <Input
+   440→              value={selected.props[f.key] ?? ''}
+   441→              onChange={(e) => patchProp(f.key, e.target.value)}
+   442→              className="h-8 text-xs"
+   443→              aria-label={f.label}
+   444→            />
+   445→          </label>
+   446→        ),
+   447→      )}
+   448→      {PROPERTY_FIELDS[selected.type].length === 0 && (
+   449→        <p className="text-xs text-muted-foreground">Cet élément n’a pas de propriété.</p>
+   450→      )}
+   451→      <div className="flex flex-wrap gap-1.5 border-t pt-2.5">
+   452→        <Button size="sm" variant="outline" className="h-7 gap-1 text-[11px]" onClick={() => move(-1)} aria-label="Monter l’élément">
+   453→          <ArrowUp className="h-3 w-3" /> Monter
+   454→        </Button>
+   455→        <Button size="sm" variant="outline" className="h-7 gap-1 text-[11px]" onClick={() => move(1)} aria-label="Descendre l’élément">
+   456→          <ArrowDown className="h-3 w-3" /> Descendre
+   457→        </Button>
+   458→        <Button size="sm" variant="outline" className="h-7 gap-1 text-[11px]" onClick={duplicate} aria-label="Dupliquer l’élément">
+   459→          <Plus className="h-3 w-3" /> Dupliquer
+   460→        </Button>
+   461→        <Button size="sm" variant="outline" className="h-7 gap-1 text-[11px] text-destructive" onClick={remove} aria-label="Supprimer l’élément">
+   462→          <Trash2 className="h-3 w-3" /> Supprimer
+   463→        </Button>
+   464→      </div>
+   465→    </div>
+   466→  )
+   467→}
+   468→
+   469→/* ------------------------------------------------------------------ */
+   470→/* Guide pas à pas (assistant à chacun des pas)                        */
+   471→/* ------------------------------------------------------------------ */
+   472→
+   473→function nextStep(doc: DesignDoc): { title: string; hint: string } {
+   474→  const avgEls = doc.screens.reduce((n, s) => n + s.elements.length, 0) / Math.max(1, doc.screens.length)
+   475→  if (doc.screens.length < 2)
+   476→    return { title: 'Structurez l’arborescence', hint: 'Ajoutez un second écran (ex. : Détail, Profil, Contact) pour dessiner la navigation.' }
+   477→  if (avgEls < 4)
+   478→    return { title: 'Enrichissez les écrans', hint: 'Chaque écran gagne à avoir 4 à 10 éléments : héro, texte, liste, carte, bouton d’action.' }
+   479→  if (doc.palette.primary === DEFAULT_PALETTE.primary)
+   480→    return { title: 'Personnalisez la palette', hint: 'Choisissez une couleur principale et un fond qui racontent votre marque (contraste AA).' }
+   481→  return { title: 'Exportez le code', hint: 'Votre maquette est prête : onglet Code → choisissez HTML, React ou FlutterFlow.' }
+   482→}
+   483→
+   484→function StepsGuide({ doc }: { doc: DesignDoc }) {
+   485→  const checks = [
+   486→    { label: 'Nom & identité définis', ok: doc.appName.trim().length > 2 && doc.appName !== 'Mon application' },
+   487→    { label: 'Au moins 2 écrans', ok: doc.screens.length >= 2 },
+   488→    { label: 'Écrans garnis (≥ 4 éléments en moyenne)', ok: doc.screens.reduce((n, s) => n + s.elements.length, 0) / Math.max(1, doc.screens.length) >= 4 },
+   489→    { label: 'Palette personnalisée', ok: doc.palette.primary !== DEFAULT_PALETTE.primary },
+   490→  ]
+   491→  const step = nextStep(doc)
+   492→  return (
+   493→    <div className="space-y-2">
+   494→      <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Progression</p>
+   495→      {checks.map((c) => (
+   496→        <p key={c.label} className={`flex items-start gap-1.5 text-xs ${c.ok ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground'}`}>
+   497→          <span className={`mt-0.5 inline-flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full border ${c.ok ? 'border-emerald-500 bg-emerald-500 text-white' : 'border-muted-foreground/40'}`} aria-hidden="true">
+   498→            {c.ok && <Check className="h-2.5 w-2.5" />}
+   499→          </span>
+   500→          {c.label}
+   501→        </p>
+   502→      ))}
+   503→      <div className="rounded-xl border border-primary/30 bg-primary/5 p-2.5">
+   504→        <p className="text-xs font-semibold text-primary">Prochain pas : {step.title}</p>
+   505→        <p className="mt-0.5 text-[11px] leading-snug text-muted-foreground">{step.hint}</p>
+   506→      </div>
+   507→    </div>
+   508→  )
+   509→}
+   510→
+   511→/* ------------------------------------------------------------------ */
+   512→/* Panneau Assistant (chat de conception)                              */
+   513→/* ------------------------------------------------------------------ */
+   514→
+   515→const QUICK_PROMPTS = [
+   516→  'Propose une palette chaleureuse',
+   517→  'Ajoute un écran de profil',
+   518→  'Améliore l’écran d’accueil',
+   519→  'Rends la navigation plus claire',
+   520→]
+   521→
+   522→function AssistantPanel({ doc, setDoc }: { doc: DesignDoc; setDoc: (fn: (d: DesignDoc) => DesignDoc) => void }) {
+   523→  const [input, setInput] = useState('')
+   524→  const [log, setLog] = useState<{ role: 'user' | 'assistant'; content: string }[]>([])
+   525→  const [busy, setBusy] = useState(false)
+   526→  const { toast } = useToast()
+   527→  const logRef = useRef<HTMLDivElement>(null)
+   528→
+   529→  useEffect(() => {
+   530→    logRef.current?.scrollTo({ top: logRef.current.scrollHeight })
+   531→  }, [log])
+   532→
+   533→  async function ask(q: string) {
+   534→    const question = q.trim()
+   535→    if (!question || busy) return
+   536→    setBusy(true)
+   537→    setInput('')
+   538→    setLog((l) => [...l, { role: 'user', content: question }])
+   539→    try {
+   540→      const system =
+   541→        'Tu es l’assistant de conception WYSIWYG de Lumo. Voici le design actuel (JSON) :\n' +
+   542→        JSON.stringify(doc) +
+   543→        '\n\nL’utilisateur demande : « ' + question + ' ».\n' +
+   544→        'Modifie le design en conséquence et réponds en DEUX parties :\n' +
+   545→        '1. Une ou deux phrases sur ce que tu as changé.\n' +
+   546→        '2. Un UNIQUE bloc ```json avec le design COMPLET mis à jour — même schéma, types autorisés : navbar, hero, text, button, input, image, list, card, badge, divider, footer. Rien d’autre.'
+   547→      const reply = await apiChat([{ role: 'user', content: question }], system)
+   548→      const m = reply.match(/```json\s*([\s\S]*?)```/) ?? reply.match(/\{[\s\S]*\}/)
+   549→      let applied = false
+   550→      if (m) {
+   551→        try {
+   552→          const parsed = coerceDoc(JSON.parse(m[0].replace(/^```json\s*|\s*```$/g, '')))
+   553→          if (parsed) {
+   554→            setDoc(() => parsed)
+   555→            applied = true
+   556→          }
+   557→        } catch {
+   558→          /* JSON invalide */
+   559→        }
+   560→      }
+   561→      const text = reply.replace(/```json[\s\S]*?```/, '').trim()
+   562→      setLog((l) => [...l, { role: 'assistant', content: text + (applied ? '\n\n✅ Maquette mise à jour dans le studio.' : '') }])
+   563→      toast({ title: applied ? 'Conception appliquée' : 'Suggestion reçue', className: applied ? 'border-emerald-500 bg-emerald-50 text-emerald-900 dark:bg-emerald-950 dark:text-emerald-100' : undefined })
+   564→    } catch (e) {
+   565→      setLog((l) => [...l, { role: 'assistant', content: `Désolé, l’assistant est indisponible : ${e instanceof Error ? e.message : 'erreur'}. Réessayez ou ajustez manuellement.` }])
+   566→    } finally {
+   567→      setBusy(false)
+   568→    }
+   569→  }
+   570→
+   571→  return (
+   572→    <div className="flex min-h-0 flex-1 flex-col gap-2">
+   573→      <StepsGuide doc={doc} />
+   574→      <div ref={logRef} className="min-h-24 flex-1 space-y-2 overflow-y-auto rounded-xl border bg-secondary/40 p-2.5 scrollbar-thin" aria-label="Conversation avec l’assistant de conception" aria-live="polite">
+   575→        {log.length === 0 && (
+   576→          <p className="text-[11px] leading-relaxed text-muted-foreground">
+   577→            Demandez une modification : l’assistant restructure la maquette à chaque étape. Ex. : « ajoute un écran de
+   578→            connexion avec un champ e-mail ».
+   579→          </p>
+   580→        )}
+   581→        {log.map((l, i) => (
+   582→          <p key={i} className={`whitespace-pre-wrap rounded-lg px-2 py-1.5 text-[11px] leading-relaxed ${l.role === 'user' ? 'ml-6 bg-primary/10 text-foreground' : 'mr-2 bg-background'}`}>
+   583→            <span className="mb-0.5 block font-semibold">{l.role === 'user' ? 'Vous' : 'Lumo · assistant design'}</span>
+   584→            {l.content}
+   585→          </p>
+   586→        ))}
+   587→        {busy && <p className="px-2 text-[11px] text-primary">L’assistant réfléchit…</p>}
+   588→      </div>
+   589→      <div className="flex flex-wrap gap-1">
+   590→        {QUICK_PROMPTS.map((q) => (
+   591→          <button
+   592→            key={q}
+   593→            onClick={() => void ask(q)}
+   594→            disabled={busy}
+   595→            className="rounded-full border bg-background px-2 py-0.5 text-[10px] text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground disabled:opacity-50"
+   596→          >
+   597→            {q}
+   598→          </button>
+   599→        ))}
+   600→      </div>
+   601→      <div className="flex items-end gap-1.5">
+   602→        <Textarea
+   603→          value={input}
+   604→          onChange={(e) => setInput(e.target.value)}
+   605→          onKeyDown={(e) => {
+   606→            if (e.key === 'Enter' && !e.shiftKey) {
+   607→              e.preventDefault()
+   608→              void ask(input)
+   609→            }
+   610→          }}
+   611→          placeholder="Demandez à l’assistant de conception…"
+   612→          aria-label="Message à l’assistant de conception"
+   613→          rows={2}
+   614→          className="min-h-9 flex-1 resize-none text-xs"
+   615→        />
+   616→        <Button size="icon" className="h-9 w-9 shrink-0" onClick={() => void ask(input)} disabled={busy || !input.trim()} aria-label="Envoyer à l’assistant">
+   617→          <SendHorizontal className="h-4 w-4" />
+   618→        </Button>
+   619→      </div>
+   620→    </div>
+   621→  )
+   622→}
+   623→
+   624→/* ------------------------------------------------------------------ */
+   625→/* Panneau Code (export HTML / React / FlutterFlow)                    */
+   626→/* ------------------------------------------------------------------ */
+   627→
+   628→function CodePanel({ doc }: { doc: DesignDoc }) {
+   629→  const [framework, setFramework] = useState<'html' | 'react' | 'flutterflow'>('html')
+   630→  const [files, setFiles] = useState<{ name: string; content: string }[] | null>(null)
+   631→  const [active, setActive] = useState(0)
+   632→  const [copied, setCopied] = useState(false)
+   633→  const { toast } = useToast()
+   634→
+   635→  function generate() {
+   636→    const out =
+   637→      framework === 'html'
+   638→        ? [generateHtml(doc)]
+   639→        : framework === 'react'
+   640→          ? [generateReact(doc)]
+   641→          : generateFlutterFlow(doc)
+   642→    setFiles(out)
+   643→    setActive(0)
+   644→    toast({ title: `Code ${framework} généré`, description: `${out.length} fichier(s)` })
+   645→  }
+   646→
+   647→  return (
+   648→    <div className="flex min-h-0 flex-1 flex-col gap-2.5">
+   649→      <div className="flex flex-wrap items-center gap-2">
+   650→        <select
+   651→          value={framework}
+   652→          onChange={(e) => setFramework(e.target.value as 'html' | 'react' | 'flutterflow')}
+   653→          className="h-9 rounded-md border bg-background px-2.5 text-xs"
+   654→          aria-label="Framework d’export"
+   655→        >
+   656→          <option value="html">HTML + CSS (responsive)</option>
+   657→          <option value="react">React (Tailwind)</option>
+   658→          <option value="flutterflow">FlutterFlow (Flutter/Dart)</option>
+   659→        </select>
+   660→        <Button size="sm" className="gap-1.5" onClick={generate}>
+   661→          <Sparkles className="h-3.5 w-3.5" /> Générer le code
+   662→        </Button>
+   663→      </div>
+   664→      {framework === 'flutterflow' && (
+   665→        <p className="rounded-lg bg-secondary/60 px-2.5 py-1.5 text-[11px] leading-snug text-muted-foreground">
+   666→          Format FlutterFlow : <strong>main.dart</strong> (écrans en StatelessWidget) +{' '}
+   667→          <strong>flutterflow_design.json</strong> à importer dans FlutterFlow (Custom Code / structure des pages).
+   668→        </p>
+   669→      )}
+   670→      {files ? (
+   671→        <>
+   672→          <div className="flex gap-1.5 overflow-x-auto scrollbar-thin" role="tablist" aria-label="Fichiers générés">
+   673→            {files.map((f, i) => (
+   674→              <button
+   675→                key={f.name}
+   676→                role="tab"
+   677→                aria-selected={i === active}
+   678→                onClick={() => setActive(i)}
+   679→                className={`shrink-0 rounded-lg px-2.5 py-1 text-[11px] font-medium ${
+   680→                  i === active ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:bg-accent'
+   681→                }`}
+   682→              >
+   683→                {f.name}
+   684→              </button>
+   685→            ))}
+   686→          </div>
+   687→          <pre className="min-h-32 flex-1 overflow-auto rounded-xl border bg-secondary/40 p-3 text-[11px] leading-relaxed scrollbar-thin">
+   688→            <code>{files[active]?.content}</code>
+   689→          </pre>
+   690→          <div className="flex flex-wrap justify-end gap-1.5">
+   691→            <Button
+   692→              size="sm"
+   693→              variant="outline"
+   694→              onClick={() => {
+   695→                void navigator.clipboard.writeText(files[active]?.content ?? '')
+   696→                setCopied(true)
+   697→                setTimeout(() => setCopied(false), 1500)
+   698→              }}
+   699→            >
+   700→              {copied ? <Check className="h-3.5 w-3.5 text-emerald-600" /> : <Copy className="h-3.5 w-3.5" />} Copier
+   701→            </Button>
+   702→            <Button
+   703→              size="sm"
+   704→              variant="outline"
+   705→              onClick={() => {
+   706→                for (const f of files) downloadText(f.content, f.name)
+   707→                toast({ title: 'Fichiers téléchargés', description: `${files.length} fichier(s) ${framework}` })
+   708→              }}
+   709→            >
+   710→              <Download className="h-3.5 w-3.5" /> Télécharger
+   711→            </Button>
+   712→          </div>
+   713→        </>
+   714→      ) : (
+   715→        <div className="grid min-h-32 flex-1 place-items-center rounded-xl border border-dashed text-center text-xs text-muted-foreground">
+   716→          Choisissez un framework puis générez le code de la maquette — responsive inclus.
+   717→        </div>
+   718→      )}
+   719→    </div>
+   720→  )
+   721→}
+   722→
+   723→/* ------------------------------------------------------------------ */
+   724→/* Visionneuse / studio complet                                        */
+   725→/* ------------------------------------------------------------------ */
+   726→
+   727→export function DesignStudioDialog({
+   728→  artifact,
+   729→  open,
+   730→  onOpenChange,
+   731→}: {
+   732→  artifact: Artifact | null
+   733→  open: boolean
+   734→  onOpenChange: (v: boolean) => void
+   735→}) {
+   736→  const { toast } = useToast()
+   737→  const sessions = useLumo((s) => s.sessions)
+   738→  const updateMessage = useLumo((s) => s.updateMessage)
+   739→  const [doc, setDocState] = useState<DesignDoc>(() => emptyDoc())
+   740→  const [activeScreenId, setActiveScreenId] = useState(doc.screens[0]?.id ?? '')
+   741→  const [selectedId, setSelectedId] = useState<string | null>(null)
+   742→  const [viewport, setViewport] = useState<'desktop' | 'mobile'>('desktop')
+   743→  const [loadedKey, setLoadedKey] = useState<string | null>(null)
+   744→
+   745→  /* Chargement d’un artefact — ajustement de état pendant le rendu (pattern React officiel) */
+   746→  const loadKey = open && artifact ? artifact.id : null
+   747→  if (loadKey && loadKey !== loadedKey) {
+   748→    let next: DesignDoc | null = null
+   749→    if (artifact?.text) {
+   750→      try {
+   751→        next = coerceDoc(JSON.parse(artifact.text))
+   752→      } catch {
+   753→        next = null
+   754→      }
+   755→    }
+   756→    setDocState(next ?? emptyDoc())
+   757→    setActiveScreenId(next?.screens[0]?.id ?? '')
+   758→    setSelectedId(null)
+   759→    setLoadedKey(loadKey)
+   760→  }
+   761→
+   762→  const setDoc = (fn: (d: DesignDoc) => DesignDoc) => setDocState((d) => fn(d))
+   763→  const activeScreen = doc.screens.find((s) => s.id === activeScreenId) ?? doc.screens[0]
+   764→  const selected = activeScreen?.elements.find((e) => e.id === selectedId) ?? null
+   765→
+   766→  function addElement(type: ElType) {
+   767→    if (!activeScreen) return
+   768→    const el = makeEl(type)
+   769→    setDoc((d) => ({
+   770→      ...d,
+   771→      screens: d.screens.map((s) => (s.id === activeScreen.id ? { ...s, elements: [...s.elements, el] } : s)),
+   772→    }))
+   773→    setSelectedId(el.id)
+   774→  }
+   775→
+   776→  function renameScreen(name: string) {
+   777→    if (!activeScreen) return
+   778→    setDoc((d) => ({ ...d, screens: d.screens.map((s) => (s.id === activeScreen.id ? { ...s, name: name.slice(0, 40) } : s)) }))
+   779→  }
+   780→
+   781→  function saveToArtifact() {
+   782→    if (!artifact) return
+   783→    for (const sess of sessions) {
+   784→      const msg = sess.messages.find((m) => m.artifacts?.some((a) => a.id === artifact.id))
+   785→      if (msg) {
+   786→        updateMessage(sess.id, msg.id, {
+   787→          artifacts: msg.artifacts?.map((a) =>
+   788→            a.id === artifact.id
+   789→              ? {
+   790→                  ...a,
+   791→                  text: JSON.stringify(doc),
+   792→                  meta: { ...a.meta, appName: doc.appName, screens: doc.screens.length, elements: doc.screens.reduce((n, s) => n + s.elements.length, 0) },
+   793→                }
+   794→              : a,
+   795→          ),
+   796→        })
+   797→        toast({ title: 'Maquette enregistrée', description: 'Les modifications sont conservées dans la session.' })
+   798→        return
+   799→      }
+   800→    }
+   801→    toast({ title: 'Enregistrement local', description: 'Maquette conservée jusqu’à la fermeture du studio.' })
+   802→  }
+   803→
+   804→  const canvas = activeScreen && (
+   805→    <div className="flex min-h-0 flex-1 flex-col">
+   806→      <div className="flex flex-wrap items-center justify-between gap-2 px-1 pb-2">
+   807→        <div className="flex min-w-0 items-center gap-1.5">
+   808→          <Input
+   809→            value={activeScreen.name}
+   810→            onChange={(e) => renameScreen(e.target.value)}
+   811→            className="h-8 w-40 text-xs font-semibold sm:w-52"
+   812→            aria-label="Nom de l’écran"
+   813→          />
+   814→          <span className="text-[10px] text-muted-foreground">{activeScreen.elements.length} éléments</span>
+   815→        </div>
+   816→        <div className="flex rounded-lg border bg-background p-0.5" aria-label="Taille de la maquette">
+   817→          <button onClick={() => setViewport('mobile')} aria-pressed={viewport === 'mobile'} aria-label="Maquette mobile 390 px" className={`rounded-md p-1.5 ${viewport === 'mobile' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground'}`}>
+   818→            <Smartphone className="h-3.5 w-3.5" />
+   819→          </button>
+   820→          <button onClick={() => setViewport('desktop')} aria-pressed={viewport === 'desktop'} aria-label="Maquette bureau" className={`rounded-md p-1.5 ${viewport === 'desktop' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground'}`}>
+   821→            <Monitor className="h-3.5 w-3.5" />
+   822→          </button>
+   823→        </div>
+   824→      </div>
+   825→      <div className="min-h-0 flex-1 overflow-y-auto rounded-2xl border bg-secondary/50 p-3 scrollbar-thin">
+   826→        <div
+   827→          className={`mx-auto flex min-h-full flex-col gap-3 rounded-3xl border p-3 shadow-sm transition-all ${
+   828→            viewport === 'mobile' ? 'w-full max-w-[390px]' : 'w-full'
+   829→          }`}
+   830→          style={{ background: doc.palette.bg, color: doc.palette.text }}
+   831→        >
+   832→          {activeScreen.elements.length === 0 && (
+   833→            <p className="py-10 text-center text-xs text-muted-foreground">Écran vide — ajoutez un élément ci-dessous.</p>
+   834→          )}
+   835→          {activeScreen.elements.map((el) => (
+   836→            <ElView key={el.id} el={el} palette={doc.palette} selected={el.id === selectedId} onSelect={() => setSelectedId(el.id)} />
+   837→          ))}
+   838→        </div>
+   839→      </div>
+   840→      {/* Catalogue d’éléments */}
+   841→      <div className="mt-2 flex gap-1.5 overflow-x-auto pb-1 scrollbar-thin" aria-label="Ajouter un élément">
+   842→        {EL_CATALOG.map((c) => (
+   843→          <button
+   844→            key={c.type}
+   845→            onClick={() => addElement(c.type)}
+   846→            className="inline-flex shrink-0 items-center gap-1 rounded-full border bg-background px-2.5 py-1 text-[11px] text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
+   847→            aria-label={`Ajouter : ${c.label}`}
+   848→          >
+   849→            <Plus className="h-3 w-3" aria-hidden="true" />
+   850→            {c.label}
+   851→          </button>
+   852→        ))}
+   853→      </div>
+   854→    </div>
+   855→  )
+   856→
+   857→  return (
+   858→    <Dialog open={open} onOpenChange={onOpenChange}>
+   859→      <DialogContent className="flex h-[94dvh] w-[min(97vw,1400px)] max-w-none! flex-col gap-0 overflow-hidden p-0 sm:h-[92dvh]">
+   860→        <DialogHeader className="border-b px-4 py-3 sm:px-5">
+   861→          <DialogTitle className="flex items-center gap-2 font-display text-base">
+   862→            <LayoutDashboard className="h-4.5 w-4.5 text-primary" aria-hidden="true" />
+   863→            Studio visuel — {doc.appName}
+   864→          </DialogTitle>
+   865→          <DialogDescription>
+   866→            WYSIWYG responsive · assistant à chaque étape · export HTML, React ou FlutterFlow
+   867→          </DialogDescription>
+   868→        </DialogHeader>
+   869→
+   870→        {/* Bureau : 3 colonnes */}
+   871→        <div className="hidden min-h-0 flex-1 gap-0 lg:grid lg:grid-cols-[230px_minmax(0,1fr)_320px]">
+   872→          <aside className="min-h-0 overflow-y-auto border-r p-3 scrollbar-thin">
+   873→            <ScreensPanel doc={doc} setDoc={setDoc} activeScreenId={activeScreen?.id ?? ''} setActiveScreenId={(id) => { setActiveScreenId(id); setSelectedId(null) }} />
+   874→            <div className="mt-4 border-t pt-3">
+   875→              <StepsGuide doc={doc} />
+   876→            </div>
+   877→          </aside>
+   878→          <section className="flex min-h-0 flex-col p-3">{canvas}</section>
+   879→          <aside className="flex min-h-0 flex-col gap-3 border-l p-3">
+   880→            <Tabs defaultValue="edit" className="flex min-h-0 flex-1 flex-col">
+   881→              <TabsList className="w-full">
+   882→                <TabsTrigger value="edit" className="flex-1 gap-1 text-xs"><SquarePen className="h-3 w-3" /> Éditer</TabsTrigger>
+   883→                <TabsTrigger value="assistant" className="flex-1 gap-1 text-xs"><Sparkles className="h-3 w-3" /> Assistant</TabsTrigger>
+   884→                <TabsTrigger value="code" className="flex-1 gap-1 text-xs"><Code2 className="h-3 w-3" /> Code</TabsTrigger>
+   885→              </TabsList>
+   886→              <TabsContent value="edit" className="min-h-0 flex-1 overflow-y-auto scrollbar-thin">
+   887→                <PropsPanel doc={doc} setDoc={setDoc} activeScreenId={activeScreen?.id ?? ''} selected={selected} setSelected={setSelectedId} />
+   888→              </TabsContent>
+   889→              <TabsContent value="assistant" className="flex min-h-0 flex-1 flex-col">
+   890→                <AssistantPanel doc={doc} setDoc={setDoc} />
+   891→              </TabsContent>
+   892→              <TabsContent value="code" className="flex min-h-0 flex-1 flex-col">
+   893→                <CodePanel doc={doc} />
+   894→              </TabsContent>
+   895→            </Tabs>
+   896→          </aside>
+   897→        </div>
+   898→
+   899→        {/* Mobile / tablette : onglets empilés */}
+   900→        <div className="flex min-h-0 flex-1 flex-col lg:hidden">
+   901→          <Tabs defaultValue="canvas" className="flex min-h-0 flex-1 flex-col px-3 pb-2">
+   902→            <TabsList className="mt-1 w-full justify-start overflow-x-auto">
+   903→              <TabsTrigger value="canvas" className="gap-1 text-xs"><LayoutDashboard className="h-3 w-3" /> Maquette</TabsTrigger>
+   904→              <TabsTrigger value="screens" className="gap-1 text-xs"><ChevronRight className="h-3 w-3" /> Écrans</TabsTrigger>
+   905→              <TabsTrigger value="edit" className="gap-1 text-xs"><SquarePen className="h-3 w-3" /> Éditer</TabsTrigger>
+   906→              <TabsTrigger value="assistant" className="gap-1 text-xs"><Sparkles className="h-3 w-3" /> Assistant</TabsTrigger>
+   907→              <TabsTrigger value="code" className="gap-1 text-xs"><Code2 className="h-3 w-3" /> Code</TabsTrigger>
+   908→            </TabsList>
+   909→            <TabsContent value="canvas" className="flex min-h-0 flex-1 flex-col">{canvas}</TabsContent>
+   910→            <TabsContent value="screens" className="min-h-0 flex-1 overflow-y-auto scrollbar-thin">
+   911→              <ScreensPanel doc={doc} setDoc={setDoc} activeScreenId={activeScreen?.id ?? ''} setActiveScreenId={(id) => { setActiveScreenId(id); setSelectedId(null) }} />
+   912→            </TabsContent>
+   913→            <TabsContent value="edit" className="min-h-0 flex-1 overflow-y-auto scrollbar-thin">
+   914→              <PropsPanel doc={doc} setDoc={setDoc} activeScreenId={activeScreen?.id ?? ''} selected={selected} setSelected={setSelectedId} />
+   915→            </TabsContent>
+   916→            <TabsContent value="assistant" className="flex min-h-0 flex-1 flex-col">
+   917→              <AssistantPanel doc={doc} setDoc={setDoc} />
+   918→            </TabsContent>
+   919→            <TabsContent value="code" className="flex min-h-0 flex-1 flex-col">
+   920→              <CodePanel doc={doc} />
+   921→            </TabsContent>
+   922→          </Tabs>
+   923→        </div>
+   924→
+   925→        <div className="flex items-center justify-between gap-2 border-t px-4 py-2.5">
+   926→          <p className="hidden text-[11px] text-muted-foreground sm:block">
+   927→            Tout est responsive : vérifiez la maquette en vue mobile 390 px avant l’export.
+   928→          </p>
+   929→          <div className="flex w-full gap-2 sm:w-auto">
+   930→            <Button size="sm" variant="outline" className="flex-1 gap-1.5 sm:flex-none" onClick={saveToArtifact}>
+   931→              <Download className="h-3.5 w-3.5" /> Enregistrer la maquette
+   932→            </Button>
+   933→            <Button size="sm" variant="secondary" className="flex-1 sm:hidden" onClick={() => onOpenChange(false)}>
+   934→              Fermer
+   935→            </Button>
+   936→          </div>
+   937→        </div>
+   938→      </DialogContent>
+   939→    </Dialog>
+   940→  )
+   941→}
+   942→

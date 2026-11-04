@@ -147,10 +147,33 @@ export function InputBar({
   async function onFileTranscript(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0]
     if (!f) return
-    await useLumo.getState().sendMessage(session.id, '', {
-      audioTab: 'transcript',
-      file: { name: f.name, size: f.size },
-    })
+    // Le fichier audio part en base64 vers /api/asr (plafond ~9 Mo)
+    if (f.size > 9_000_000) {
+      toast({
+        title: 'Fichier trop lourd',
+        description: 'Maximum ≈ 9 Mo pour la transcription. Convertissez-le en MP3 ou coupez-le.',
+        variant: 'destructive',
+      })
+      e.target.value = ''
+      return
+    }
+    try {
+      const buf = await f.arrayBuffer()
+      const bytes = new Uint8Array(buf)
+      let bin = ''
+      const CHUNK = 0x8000
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK))
+      }
+      const b64 = btoa(bin)
+      await useLumo.getState().sendMessage(session.id, '', {
+        audioTab: 'transcript',
+        file: { name: f.name, size: f.size },
+        fileBase64: b64,
+      })
+    } catch {
+      toast({ title: 'Lecture du fichier impossible', variant: 'destructive' })
+    }
     e.target.value = ''
   }
 
@@ -170,7 +193,7 @@ export function InputBar({
             </Button>
           </div>
           <p className="mt-2 text-center text-[11px] text-muted-foreground">
-            Démo locale — brancher Voxtral ou Agnes AI pour la transcription réelle.
+            Transcription réelle et horodatée — maximum ≈ 9 Mo (MP3, WAV, M4A…).
           </p>
         </div>
       </div>
@@ -389,7 +412,7 @@ function Composer({
 
         {attachmentChips}
 
-        <div className="flex items-end gap-2 rounded-2xl border bg-card p-2 shadow-sm focus-within:border-primary/60">
+        <div className="flex flex-wrap items-end gap-2 rounded-2xl border bg-card p-2 shadow-sm focus-within:border-primary/60">
           <Textarea
             ref={taRef}
             value={text}
@@ -401,10 +424,10 @@ function Composer({
             placeholder={placeholder}
             aria-label={isEditing ? 'Modifier votre message' : 'Message pour Lumo'}
             rows={1}
-            className="max-h-40 min-h-10 flex-1 resize-none border-0 bg-transparent px-2 py-2 focus-visible:ring-0"
+            className="max-h-40 min-h-10 w-full flex-1 resize-none border-0 bg-transparent px-2 py-2 focus-visible:ring-0"
           />
 
-          <div className="flex shrink-0 items-center gap-1.5">
+          <div className="flex max-w-full flex-wrap items-center gap-1.5">
             {attachButton}
             {isWebdev && (
               <Select value={framework} onValueChange={(v) => setFramework(v as WebFramework)}>

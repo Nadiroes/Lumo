@@ -55,20 +55,45 @@ export const DEFAULT_MODELS: ModelSelection = {
   audio: 'mistral-voxtral',
 }
 
-/** Traduit une tâche Hugging Face en capacités Lumo */
-export function hfTaskToCaps(task: string): Capability[] {
-  const t = (task || '').toLowerCase()
-  if (t.includes('text-to-image') || t.includes('inpaint') || t.includes('img2img')) return ['image']
-  if (t.includes('text-to-video') || t.includes('image-to-video')) return ['video']
+/** Traduit une tâche Hugging Face en capacités Lumo (une même Famille peut servir plusieurs capacités) */
+export function hfTaskToCaps(task: string, modelId = ''): Capability[] {
+  const t = `${task} ${modelId}`.toLowerCase()
+  const caps: Capability[] = []
+  if (
+    t.includes('text-to-image') ||
+    t.includes('inpaint') ||
+    t.includes('img2img') ||
+    t.includes('image-to-image')
+  )
+    caps.push('image')
+  if (t.includes('text-to-video') || t.includes('image-to-video') || t.includes('video')) caps.push('video')
   if (
     t.includes('speech') ||
     t.includes('audio') ||
     t.includes('tts') ||
     t.includes('asr') ||
-    t.includes('voice')
+    t.includes('voice') ||
+    t.includes('music')
   )
-    return ['audio']
-  return ['text']
+    caps.push('audio')
+  // Familles textuelles (et modèles « tout-en-un »)
+  const isTextual =
+    t.includes('text-generation') ||
+    t.includes('conversational') ||
+    t.includes('text2text') ||
+    t.includes('question-answering') ||
+    t.includes('qwen') ||
+    t.includes('llama') ||
+    t.includes('mistral') ||
+    t.includes('glm') ||
+    t.includes('gemma') ||
+    t.includes('phi') ||
+    t.includes('deepseek') ||
+    t.includes('omni')
+  if (isTextual || caps.length === 0) caps.unshift('text')
+  // Modèles vision-langage : texte + image
+  if (/-vl|-vision|vision|vlm|omni/.test(t) && !caps.includes('image')) caps.push('image')
+  return [...new Set(caps)]
 }
 
 /** Heuristique de tâche quand l’API HF est injoignable */
@@ -82,12 +107,18 @@ export function inferHfTask(modelId: string): string {
 }
 
 export function hfToProvider(m: HfModel): ProviderInfo {
+  const caps = hfTaskToCaps(m.task, m.id)
+  const fileLabel = m.file ? ` · ${m.file.split('/').pop()}` : ''
+  const sizeLabel = m.sizeBytes
+    ? ` · ${m.sizeBytes >= 1_073_741_824 ? `${(m.sizeBytes / 1_073_741_824).toFixed(1)} Go` : `${Math.round(m.sizeBytes / 1_048_576)} Mo`}`
+    : ''
+  const kindLabel = m.kind === 'dataset' ? 'Jeu de données HF' : 'Modèle HF'
   return {
-    id: `hf:${m.id}`,
-    name: m.id.split('/').pop() || m.id,
+    id: `hf:${m.id}${m.file ? `::${m.file}` : ''}`,
+    name: (m.id.split('/').pop() || m.id) + fileLabel,
     vendor: m.id.split('/')[0] || 'Hugging Face',
-    caps: hfTaskToCaps(m.task),
-    description: `Modèle HF · ${m.task}${m.downloads ? ` · ${m.downloads.toLocaleString('fr-FR')} téléchargements` : ''}`,
+    caps: m.kind === 'dataset' ? [] : caps,
+    description: `${kindLabel} · ${m.task}${m.downloads ? ` · ${m.downloads.toLocaleString('fr-FR')} téléchargements` : ''}${sizeLabel}`,
     kind: 'hf',
   }
 }

@@ -2,8 +2,8 @@
 
 /** Rendu des artefacts : images réelles, lecteurs démo, cartes fichiers */
 
-import { useEffect, useState } from 'react'
-import { AudioLines, Download, Eye, FileText, Play, Sparkles } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { AudioLines, Download, Eye, FileText, Pause, Play, Sparkles } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -157,24 +157,134 @@ export function AudioCard({ a }: { a: Artifact }) {
   )
 }
 
-/* ---------------- Vidéo (démo) ---------------- */
+/* ---------------- Vidéo : lecteur animé (storyboard Ken Burns) ---------------- */
+
+interface VideoPayload {
+  frames: { mime: string; base64: string }[]
+  duration: number
+  ratio: string
+}
+
+/** Séquence animée de secours quand aucun plan n'a pu être généré */
+function FallbackAnimation() {
+  return (
+    <div className="video-fallback absolute inset-0" aria-hidden="true">
+      <span className="video-fallback-ring" />
+      <span className="video-fallback-ring video-fallback-ring-2" />
+    </div>
+  )
+}
 
 export function VideoCard({ a }: { a: Artifact }) {
+  const raw = useArtifactData(a)
+  const payload = useMemo<VideoPayload | null>(() => {
+    if (!raw) return null
+    try {
+      const p = JSON.parse(raw) as VideoPayload
+      if (Array.isArray(p.frames)) return p
+    } catch {
+      /* données absentes ou corrompues */
+    }
+    return null
+  }, [raw])
+
+  const frames = payload?.frames ?? []
+  const durationSec = payload?.duration || Number(String(a.meta?.duration ?? '8').replace(/\D/g, '')) || 8
+  const ratio = payload?.ratio || String(a.meta?.ratio ?? '16:9')
+
+  const [playing, setPlaying] = useState(false)
+  const [progress, setProgress] = useState(0) // 0..1
+  const rafRef = useRef<number | null>(null)
+  const lastRef = useRef<number>(0)
+
+  useEffect(() => {
+    if (!playing || frames.length === 0) return
+    lastRef.current = performance.now()
+    const loop = (t: number) => {
+      const dt = (t - lastRef.current) / 1000
+      lastRef.current = t
+      setProgress((p) => {
+        const next = p + dt / durationSec
+        if (next >= 1) return 0
+        return next
+      })
+      rafRef.current = requestAnimationFrame(loop)
+    }
+    rafRef.current = requestAnimationFrame(loop)
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current)
+    }
+  }, [playing, frames.length, durationSec])
+
+  // Plan courant entièrement dérivé de la progression (aucun état redondant)
+  const idx = frames.length > 1 ? Math.min(frames.length - 1, Math.floor(progress * frames.length)) : 0
+
+  const hasFrames = frames.length > 0
+  const pct = Math.round(progress * 100)
+
   return (
     <div className="overflow-hidden rounded-xl border">
-      <div className="relative flex aspect-video items-center justify-center bg-[radial-gradient(ellipse_at_top_left,color-mix(in_oklab,var(--primary)_30%,transparent),transparent_55%),radial-gradient(ellipse_at_bottom_right,color-mix(in_oklab,var(--chart-2)_30%,transparent),transparent_55%)] bg-secondary">
-        <span className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg">
-          <Play className="ml-0.5 h-5 w-5" aria-hidden="true" />
-        </span>
-        <span className="absolute bottom-2 left-2 rounded-md bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">
-          {a.meta?.duration ?? '8 s'} · {a.meta?.ratio ?? '16:9'}
-        </span>
+      <div className="relative aspect-video overflow-hidden bg-secondary">
+        {/* Plans : fondu enchaîné + effet Ken Burns */}
+        {hasFrames
+          ? frames.map((f, i) => (
+              <img
+                key={i}
+                src={`data:${f.mime};base64,${f.base64}`}
+                alt={`Plan ${i + 1}`}
+                className={`absolute inset-0 h-full w-full object-cover transition-opacity duration-700 ${
+                  playing && i === idx ? 'kenburns opacity-100' : i === idx ? 'opacity-100' : 'opacity-0'
+                }`}
+                aria-hidden={i !== idx}
+              />
+            ))
+          : <FallbackAnimation />}
+
+        {/* Bouton lecture central */}
+        {!playing && (
+          <button
+            onClick={() => setPlaying(true)}
+            className="absolute inset-0 z-10 flex items-center justify-center bg-black/25 transition-colors hover:bg-black/15"
+            aria-label="Lire l'aperçu animé"
+          >
+            <span className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg">
+              <Play className="ml-0.5 h-5 w-5" aria-hidden="true" />
+            </span>
+          </button>
+        )}
+
+        {/* Barre de contrôle */}
+        <div className="absolute inset-x-0 bottom-0 z-10 flex items-center gap-2 bg-gradient-to-t from-black/70 to-transparent px-2.5 pb-2 pt-6">
+          <button
+            onClick={() => setPlaying((v) => !v)}
+            className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-white/90 text-black hover:bg-white"
+            aria-label={playing ? 'Pause' : 'Lecture'}
+          >
+            {playing ? (
+              <Pause className="h-3.5 w-3.5" aria-hidden="true" />
+            ) : (
+              <Play className="ml-0.5 h-3.5 w-3.5" aria-hidden="true" />
+            )}
+          </button>
+          <div
+            className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-white/30"
+            role="progressbar"
+            aria-valuenow={pct}
+            aria-valuemin={0}
+            aria-valuemax={100}
+          >
+            <div className="h-full rounded-full bg-primary transition-[width] duration-150" style={{ width: `${pct}%` }} />
+          </div>
+          <span className="shrink-0 rounded-md bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">
+            {ratio} · {durationSec} s
+          </span>
+        </div>
       </div>
       <div className="flex items-center gap-2 p-2.5">
         <p className="flex-1 truncate text-xs font-medium">{a.name}</p>
-        <p className="flex items-center gap-1 text-[10px] text-muted-foreground">
+        <p className="flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground">
           <Sparkles className="h-3 w-3" aria-hidden="true" />
-          aperçu démo — rendu Agnes AI à brancher
+          {hasFrames ? 'aperçu animé — plans générés' : 'aperçu animé — plans stylisés'}
         </p>
       </div>
     </div>
@@ -245,6 +355,25 @@ export function ArtifactViewDialog({
         {artifact.kind === 'image' && src && (
           <img src={src} alt={artifact.prompt || artifact.name} className="max-h-[55vh] w-full rounded-xl object-contain" />
         )}
+        {artifact.kind === 'video' && src?.startsWith('{') && (() => {
+          try {
+            const p = JSON.parse(src) as VideoPayload
+            return p.frames?.length ? (
+              <div className="grid grid-cols-3 gap-1.5">
+                {p.frames.map((f, i) => (
+                  <img
+                    key={i}
+                    src={`data:${f.mime};base64,${f.base64}`}
+                    alt={`Plan ${i + 1}`}
+                    className="aspect-video w-full rounded-lg border object-cover"
+                  />
+                ))}
+              </div>
+            ) : null
+          } catch {
+            return null
+          }
+        })()}
         {artifact.text !== undefined && (
           <pre className="max-h-[55vh] overflow-auto whitespace-pre-wrap rounded-xl border bg-secondary/50 p-4 text-xs leading-relaxed scrollbar-thin">
             {artifact.text}

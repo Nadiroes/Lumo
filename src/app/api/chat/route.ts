@@ -120,6 +120,59 @@ async function touchMemories() {
 
 /* ---------------- Handler ---------------- */
 
+/**
+ * Version streamée de Lumo Core : renvoie un flux texte brut (deltas).
+ * Si le streaming échoue avant le premier token, repli automatique sur l’appel complet.
+ */
+function lumoCoreStream(fullSystem: string, history: Turn[]): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder()
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      let emitted = false
+      const push = (s: string) => {
+        emitted = true
+        controller.enqueue(encoder.encode(s))
+      }
+      try {
+        const zai = await ZAI.create()
+        const completion = await zai.chat.completions.create({
+          messages: [{ role: 'assistant', content: fullSystem }, ...history],
+          thinking: { type: 'disabled' },
+          stream: true,
+        })
+        for await (const chunk of completion) {
+          const delta =
+            (chunk as { choices?: { delta?: { content?: string } }[] }).choices?.[0]?.delta?.content ?? ''
+          if (delta) push(delta)
+        }
+        if (!emitted) throw new Error('Réponse vide du moteur.')
+      } catch {
+        if (!emitted) {
+          // Repli : appel complet sans streaming
+          try {
+            const zai = await ZAI.create()
+            const completion = await zai.chat.completions.create({
+              messages: [{ role: 'assistant', content: fullSystem }, ...history],
+              thinking: { type: 'disabled' },
+            })
+            const content = completion.choices[0]?.message?.content ?? ''
+            if (!content.trim()) throw new Error('Réponse vide du moteur.')
+            push(content)
+          } catch (e) {
+            push(
+              `\u0000ERROR:Lumo Core est indisponible (${e instanceof Error ? e.message.slice(0, 140) : 'erreur moteur'}).`,
+            )
+          }
+        } else {
+          push('\u0000ERROR:Le flux a été interrompu en cours de génération.')
+        }
+      } finally {
+        controller.close()
+      }
+    },
+  })
+}
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
@@ -128,6 +181,7 @@ export async function POST(req: NextRequest) {
       typeof body.system === 'string' && body.system.trim() ? body.system : undefined
     const provider: string = typeof body.provider === 'string' ? body.provider : 'lumo-core'
     const hfModel: string | undefined = typeof body.hfModel === 'string' && body.hfModel.trim() ? body.hfModel.trim() : undefined
+    const wantStream: boolean = body.stream === true
 
     if (!messages.length) {
       return NextResponse.json({ ok: false, error: 'Messages requis.' }, { status: 400 })
@@ -198,6 +252,15 @@ export async function POST(req: NextRequest) {
 
     /* ---- Lumo Core (moteur intégré) ---- */
     try {
+      if (wantStream) {
+        return new Response(lumoCoreStream(fullSystem, history), {
+          headers: {
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Cache-Control': 'no-cache, no-transform',
+            'X-Accel-Buffering': 'no',
+          },
+        })
+      }
       const zai = await ZAI.create()
       const completion = await zai.chat.completions.create({
         messages: [{ role: 'assistant', content: fullSystem }, ...history],
