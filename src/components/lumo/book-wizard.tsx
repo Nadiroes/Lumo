@@ -187,7 +187,7 @@ export function BookWizard({
           ))}
         </ol>
 
-        <div className="max-h-[46vh] space-y-4 overflow-y-auto pr-1 scrollbar-thin">
+        <div className="max-h-[50vh] space-y-4 overflow-y-auto pr-1 scrollbar-thin sm:max-h-[46vh]">
           {step === 0 && (
             <>
               <div>

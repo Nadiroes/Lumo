@@ -29,21 +29,38 @@ function fmtSize(n?: number): string {
   return `${n} o`
 }
 
-/** Charge les données binaires depuis IndexedDB si absentes de l’état */
+/** Charge les données binaires depuis IndexedDB si absentes de l’état.
+ *  La donnée est écrite de façon asynchrone juste après la création de l’artefact :
+ *  on relit donc plusieurs fois (poll court) pour éviter l’écran « statique » au premier rendu. */
 export function useArtifactData(a: Artifact): string | undefined {
-  const [data, setData] = useState<string | undefined>(a.data)
+  const [stored, setStored] = useState<string | undefined>(undefined)
   useEffect(() => {
+    if (a.data) return // donnée déjà en mémoire : rien à lire
     let alive = true
-    if (!a.data) {
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let tries = 0
+    const read = () => {
       void getArtifactData(a.id).then((d) => {
-        if (alive && d) setData(d)
+        if (!alive) return
+        if (d) {
+          setStored(d)
+          return
+        }
+        // L'écriture IndexedDB peut se terminer après ce rendu : on réessaie ~5 s
+        if (tries < 12) {
+          tries += 1
+          timer = setTimeout(read, 400)
+        }
       })
     }
+    read()
     return () => {
       alive = false
+      if (timer) clearTimeout(timer)
     }
   }, [a.id, a.data])
-  return data
+  // Priorité à la donnée en mémoire (rendu instantané), sinon la donnée stockée
+  return a.data ?? stored
 }
 
 /* ---------------- Image ---------------- */

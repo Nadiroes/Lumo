@@ -105,13 +105,13 @@ export function ExportDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="max-h-[92dvh] overflow-y-auto sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle className="flex items-center gap-2 font-display">
-            <FileArchive className="h-5 w-5 text-primary" aria-hidden="true" />
-            Exporter « {session.title} »
+          <DialogTitle className="flex min-w-0 flex-wrap items-center gap-2 font-display">
+            <FileArchive className="h-5 w-5 shrink-0 text-primary" aria-hidden="true" />
+            <span className="min-w-0 break-words">Exporter « {session.title} »</span>
           </DialogTitle>
-          <DialogDescription>
+          <DialogDescription className="break-words">
             Version suivante : <strong>{version}</strong>
             {session.exports.length > 0 && ` (précédente : ${session.exports[session.exports.length - 1].version})`}
             {' — '}chaque export crée une archive autonome, jamais d’écrasement.
@@ -120,7 +120,7 @@ export function ExportDialog({
 
         <div className="space-y-4">
           {/* Résumé du contenu */}
-          <div className="grid grid-cols-3 gap-2 text-center">
+          <div className="grid min-w-0 grid-cols-3 gap-2 text-center">
             {[
               { n: stats.messages, l: 'messages' },
               { n: stats.artifacts.length, l: 'artefacts' },
@@ -131,9 +131,9 @@ export function ExportDialog({
                 l: 'contenu',
               },
             ].map(({ n, l }) => (
-              <div key={l} className="rounded-xl border bg-secondary/40 p-2.5">
-                <p className="font-display text-lg font-semibold">{n}</p>
-                <p className="text-[11px] text-muted-foreground">{l}</p>
+              <div key={l} className="min-w-0 rounded-xl border bg-secondary/40 p-2.5">
+                <p className="truncate font-display text-base font-semibold sm:text-lg">{n}</p>
+                <p className="truncate text-[11px] text-muted-foreground">{l}</p>
               </div>
             ))}
           </div>

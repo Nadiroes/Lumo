@@ -84,7 +84,7 @@ function artifactIcon(a: Artifact) {
 /* Sidebar : historique                                                */
 /* ------------------------------------------------------------------ */
 
-function SessionList({ activeId }: { activeId: string | null }) {
+function SessionList({ activeId, onNavigate }: { activeId: string | null; onNavigate?: () => void }) {
   const sessions = useLumo((s) => s.sessions)
   const openSession = useLumo((s) => s.openSession)
   const startSessionLocal = useLumo((s) => s.startSession)
@@ -123,7 +123,10 @@ function SessionList({ activeId }: { activeId: string | null }) {
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-2 p-3">
       <Button
-        onClick={() => startSessionLocal('text')}
+        onClick={() => {
+          startSessionLocal('text')
+          onNavigate?.()
+        }}
         className="w-full justify-start gap-2"
       >
         <MessageSquarePlus className="h-4 w-4" aria-hidden="true" /> Nouveau chat
@@ -152,7 +155,10 @@ function SessionList({ activeId }: { activeId: string | null }) {
               {g.items.map((s) => (
                 <li key={s.id} className="group relative">
                   <button
-                    onClick={() => openSession(s.id)}
+                    onClick={() => {
+                      openSession(s.id)
+                      onNavigate?.()
+                    }}
                     className={`flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-sm transition-colors ${
                       s.id === activeId ? 'bg-accent font-medium' : 'hover:bg-accent/60'
                     }`}
@@ -323,7 +329,7 @@ export function ChatWindow({ onStartBook }: { onStartBook: () => void }) {
                   <LumoWordmark compact />
                 </SheetTitle>
               </SheetHeader>
-              <SessionList activeId={session.id} />
+              <SessionList activeId={session.id} onNavigate={() => setMobileNav(false)} />
             </SheetContent>
           </Sheet>
 
@@ -476,9 +482,22 @@ export function ChatWindow({ onStartBook }: { onStartBook: () => void }) {
             <SheetHeader className="border-b px-4 py-3">
               <SheetTitle className="font-display text-base">Artefacts</SheetTitle>
             </SheetHeader>
-            <ArtifactPanelContent session={session} onOpen={setViewing} />
+            <ArtifactPanelContent
+              session={session}
+              onOpen={(a) => {
+                setViewing(a)
+                setShowPanel(false)
+              }}
+            />
             <div className="border-t p-3">
-              <Button variant="outline" className="w-full gap-1.5" onClick={() => setExportOpen(true)}>
+              <Button
+                variant="outline"
+                className="w-full gap-1.5"
+                onClick={() => {
+                  setExportOpen(true)
+                  setShowPanel(false)
+                }}
+              >
                 <Download className="h-4 w-4" /> Exporter la session (.zip)
               </Button>
             </div>

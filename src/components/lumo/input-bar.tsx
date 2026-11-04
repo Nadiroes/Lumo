@@ -424,7 +424,7 @@ function Composer({
             placeholder={placeholder}
             aria-label={isEditing ? 'Modifier votre message' : 'Message pour Lumo'}
             rows={1}
-            className="max-h-40 min-h-10 w-full flex-1 resize-none border-0 bg-transparent px-2 py-2 focus-visible:ring-0"
+            className="max-h-40 min-h-10 w-full min-w-44 flex-1 resize-none border-0 bg-transparent px-2 py-2 focus-visible:ring-0"
           />
 
           <div className="flex max-w-full flex-wrap items-center gap-1.5">

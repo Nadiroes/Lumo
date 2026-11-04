@@ -38,6 +38,7 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useToast } from '@/hooks/use-toast'
 import { apiHfLookup, hfResolveUrl } from '@/lib/lumo/api'
 import {
+  allProviders,
   BUILTIN_PROVIDERS,
   hfTaskToCaps,
   providersFor,
@@ -379,11 +380,21 @@ export function ModelPicker({ session }: { session: Session }) {
   const [hubOpen, setHubOpen] = useState(false)
   const sessionCap = MODE_INFO[session.mode].capability
   const [tab, setTab] = useState<Capability>(sessionCap)
+  // Si le mode de session change, la capacity affichée suit (pattern React « ajust state during render »)
+  const [lastCap, setLastCap] = useState(sessionCap)
+  if (lastCap !== sessionCap) {
+    setLastCap(sessionCap)
+    setTab(sessionCap)
+  }
 
   const current = useMemo(() => session.models[tab], [session.models, tab])
   const options = useMemo(() => providersFor(hfModels, tab), [hfModels, tab])
   const activeProvider = options.find((p) => p.id === current)
   const usedCount = CAPS.filter((c) => !!session.models[c as keyof ModelSelection]).length
+  const loadedModels = CAPS.map((c) => ({
+    cap: c,
+    provider: allProviders(hfModels).find((p) => p.id === session.models[c as keyof ModelSelection]),
+  })).filter((x): x is { cap: Capability; provider: ProviderInfo } => !!x.provider)
 
   return (
     <>
@@ -393,7 +404,7 @@ export function ModelPicker({ session }: { session: Session }) {
             variant="outline"
             size="sm"
             className="h-8 max-w-44 gap-1.5 text-xs"
-            aria-label={`Modèle ${CAP_LABEL[sessionCap]} : ${activeProvider?.name ?? 'aucun'}. Changer de modèle.`}
+            aria-label={`Modèle ${CAP_LABEL[tab]} : ${activeProvider?.name ?? 'aucun'}. Changer de modèle.`}
           >
             <Cuboid className="h-3.5 w-3.5 text-primary" aria-hidden="true" />
             <span className="truncate">{activeProvider?.name ?? 'Modèle'}</span>
@@ -406,6 +417,17 @@ export function ModelPicker({ session }: { session: Session }) {
             <p className="text-[11px] leading-snug text-muted-foreground">
               {usedCount} capacité(s) dotée(s) d’un modèle — usage groupé activé.
             </p>
+            {loadedModels.length > 1 && (
+              <ul className="mt-1.5 space-y-0.5">
+                {loadedModels.map(({ cap, provider }) => (
+                  <li key={cap} className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                    <Check className="h-2.5 w-2.5 shrink-0 text-emerald-500" aria-hidden="true" />
+                    <span className="font-medium text-foreground/80">{CAP_LABEL[cap]}</span>
+                    <span className="min-w-0 truncate">→ {provider.name}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
           <Tabs value={tab} onValueChange={(v) => setTab(v as Capability)} className="w-full">
             <div className="px-2 pt-2">

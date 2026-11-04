@@ -395,6 +395,7 @@ export const useLumo = create<LumoState>()(
 
         const artifacts: Artifact[] = []
         let failed = 0
+        let lastErrorDetail = ''
         for (let i = 0; i < count; i++) {
           try {
             const r = await apiImage(fullPrompt, size)
@@ -420,8 +421,9 @@ export const useLumo = create<LumoState>()(
                 content: status(artifacts.length),
               })
             }
-          } catch {
+          } catch (e) {
             failed++
+            lastErrorDetail = e instanceof Error ? e.message.slice(0, 160) : ''
           }
         }
         clearInterval(tick)
@@ -430,9 +432,11 @@ export const useLumo = create<LumoState>()(
         const sec = Math.round((Date.now() - started) / 1000)
         const content =
           ok === 0
-            ? `La génération d’image a échoué pour « ${truncate(prompt, 60)} » (${sec} s d’attente).\n\nLe service image est peut-être momentanément saturé — utilisez le bouton **Réessayer** ci-dessous.`
+            ? `La génération d’image a échoué pour « ${truncate(prompt, 60)} » (${sec} s d’attente).${
+                lastErrorDetail ? `\n\nDétail du moteur : *${lastErrorDetail}*` : ''
+              }\n\nLe service image est peut-être momentanément saturé — utilisez le bouton **Réessayer** ci-dessous.`
             : `Voici ${ok > 1 ? `les ${ok} variations` : 'votre visuel'} pour « ${truncate(prompt, 60)} » (${sec} s).${
-                failed ? `\n\n⚠ ${failed} variation(s) n’ont pas abouti.` : ''
+                failed ? `\n\n⚠ ${failed} variation(s) n’ont pas abouti.${lastErrorDetail ? ` Détail : ${lastErrorDetail}` : ''}` : ''
               }`
         updateMessage(sessionId, assistantId, {
           content,
@@ -514,9 +518,12 @@ export const useLumo = create<LumoState>()(
           demo: frames.length === 0,
           meta: { duration, ratio: '16:9', frameCount: frames.length },
         }
-        // Stockage des frames dans IndexedDB (comme les données binaires)
+        // Stockage des frames dans IndexedDB — AWAIT obligatoire : sinon le lecteur
+        // lit IndexedDB avant la fin de l’écriture et n’affiche qu’une image statique.
         const payload = JSON.stringify({ frames, duration: durSec, ratio: '16:9' })
-        void putArtifactData(artifact.id, payload)
+        await putArtifactData(artifact.id, payload)
+        // Donnée aussi en mémoire : lecture instantanée au premier rendu (persist l’exclut déjà)
+        const playable: Artifact = { ...artifact, data: payload }
 
         updateMessage(sessionId, assistantId, {
           content:
@@ -526,7 +533,7 @@ export const useLumo = create<LumoState>()(
               : 'Les plans n’ont pas pu être générés : l’aperçu utilise un rendu animé stylisé. Appuyez sur ▶ pour lire.'}\n\n` +
             `Pour un rendu vidéo complet (mp4), branchez une API vidéo (Agnes AI) — la structure est prête à la recevoir.`,
           pending: false,
-          artifacts: [artifact],
+          artifacts: [playable],
         })
       }
 
@@ -561,17 +568,28 @@ export const useLumo = create<LumoState>()(
             })
             return
           }
+          // Progression en direct : le fichier part, puis horloge d’attente (l’ASR prend 10 à 60 s)
           later(sessionId, 400, () => {
             const m = get().sessions.find((s) => s.id === sessionId)?.messages.find((x) => x.id === assistantId)
             if (m?.pending) {
               updateMessage(sessionId, assistantId, { content: '🎧 Envoi du fichier au moteur de reconnaissance…' })
             }
           })
+          const asrTick = setInterval(() => {
+            const m = get().sessions.find((s) => s.id === sessionId)?.messages.find((x) => x.id === assistantId)
+            if (m?.pending) {
+              const sec = Math.round((Date.now() - m.createdAt) / 1000)
+              updateMessage(sessionId, assistantId, {
+                content: `🎧 Analyse de « ${name} » en cours… ⏱ ${sec} s\n\n*Transcription d’un fichier audio : habituellement 10 à 60 secondes.*`,
+              })
+            }
+          }, 1000)
           try {
             const ac = new AbortController()
             aborts.set(sessionId, ac)
             const { text: raw, segments } = await apiAsr(base64)
             aborts.delete(sessionId)
+            clearInterval(asrTick)
             const md =
               `# Transcription — ${name}\n\n` +
               segments
@@ -599,6 +617,7 @@ export const useLumo = create<LumoState>()(
             })
           } catch (e) {
             aborts.delete(sessionId)
+            clearInterval(asrTick)
             updateMessage(sessionId, assistantId, {
               pending: false,
               content: '',
@@ -653,7 +672,7 @@ export const useLumo = create<LumoState>()(
             bytes,
             meta: { voice, tts: true },
           }
-          void putArtifactData(artifact.id, base64)
+          await putArtifactData(artifact.id, base64)
           updateMessage(sessionId, assistantId, {
             content:
               `🔊 Voix « ${voice} » générée (${(bytes / 1024).toFixed(0)} Ko).\n\n` +
@@ -729,7 +748,7 @@ export const useLumo = create<LumoState>()(
               instrumental: opts.instrumental ?? false,
             },
           }
-          void putArtifactData(artifact.id, artifact.data!)
+          await putArtifactData(artifact.id, artifact.data!)
           updateMessage(sessionId, assistantId, {
             content:
               `Voici **« ${res.title} »** — ${res.meta.style}, ${res.meta.bpm} BPM, ${res.meta.key} (${res.meta.durationSec} s).\n\n` +
