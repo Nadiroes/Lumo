@@ -30,3 +30,29 @@ model Post {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
+
+/// Clé API utilisateur (une par fournisseur) — stockée localement, jamais renvoyée en clair au client
+model ApiKey {
+  id            String   @id @default(cuid())
+  provider      String   @unique // mistral | agnes | openai | openrouter | groq | huggingface | custom
+  maskedKey     String // sk-…abcd
+  secret        String // clé complète, stockée uniquement en local (SQLite)
+  baseUrl       String? // endpoint personnalisé (compatible OpenAI)
+  status        String   @default("valid") // valid | invalid
+  lastCheckedAt DateTime @default(now())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+/// Mémoire auto-apprentissage des agents Lumo (préférences, feedbacks, faits)
+model AgentMemory {
+  id         String   @id @default(cuid())
+  kind       String // fact | preference | feedback
+  key        String   @unique // clé de déduplication
+  content    String
+  weight     Float    @default(1)
+  hits       Int      @default(0)
+  lastUsedAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}

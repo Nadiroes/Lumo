@@ -22,7 +22,16 @@ export interface Artifact {
   meta?: Record<string, string | number | boolean>
 }
 
-export type MessageFlow = 'chat' | 'image' | 'video' | 'audio-voice' | 'audio-transcript'
+export type MessageFlow = 'chat' | 'image' | 'video' | 'audio-voice' | 'audio-transcript' | 'audio-music'
+
+/** Pièce jointe d’un message (texte lisible, ou simple référence) */
+export interface Attachment {
+  name: string
+  size: number
+  type: string
+  /** Contenu texte extrait (fichiers texte) — inclus dans le prompt */
+  text?: string
+}
 
 export interface Message {
   id: string
@@ -35,6 +44,9 @@ export interface Message {
   stopped?: boolean
   error?: string
   flow?: MessageFlow
+  attachments?: Attachment[]
+  /** Alternatives proposées quand le modèle est indisponible */
+  fallback?: string[]
 }
 
 export interface BookBrief {
@@ -120,8 +132,8 @@ export const MODE_INFO: Record<Mode, ModeInfo> = {
   },
   audio: {
     label: 'Audio',
-    tagline: 'Voix, transcription, synchronisation',
-    description: 'Synthèse vocale et transcription de fichiers audio.',
+    tagline: 'Voix, musique, transcription',
+    description: 'Synthèse vocale, génération de musique (façon Suno) et transcription de fichiers audio.',
     capability: 'audio',
   },
   book: {

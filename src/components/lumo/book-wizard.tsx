@@ -45,7 +45,12 @@ const TONES = [
 ]
 const POVS = ['Première personne', 'Troisième personne limitée', 'Omniscient']
 const TENSES = ['Présent', 'Passé']
-const LENGTHS = ['Nouvelle (~5 000 mots)', 'Roman court (~25 000 mots)', 'Roman (~90 000 mots)']
+const LENGTHS = [
+  'Nouvelle (~5 000 mots)',
+  'Roman court (~25 000 mots)',
+  'Roman (~90 000 mots)',
+  'Illimité — l’œuvre fixe sa propre taille',
+]
 const STRUCTURES = ['Trois actes', 'Voyage du héros', 'Voyage de l’héroïne', 'Kishōtenketsu', 'Libre']
 
 const STEPS = ['Fondations', 'Ton & narration', 'Univers', 'Structure']
@@ -100,6 +105,7 @@ export function BookWizard({
 }) {
   const [step, setStep] = useState(0)
   const [creating, setCreating] = useState(false)
+  const [pages, setPages] = useState('')
   const [brief, setBrief] = useState<BookBrief>({
     title: '',
     genre: '',
@@ -129,11 +135,13 @@ export function BookWizard({
   async function create() {
     if (creating) return
     setCreating(true)
+    const targetPages = pages.trim() ? `~${pages.trim()} pages` : brief.length
     try {
-      await onFinish({ ...brief, title: brief.title?.trim() || undefined })
+      await onFinish({ ...brief, title: brief.title?.trim() || undefined, length: targetPages })
     } finally {
       setCreating(false)
       setStep(0)
+      setPages('')
     }
   }
 
@@ -296,6 +304,24 @@ export function BookWizard({
                 <div className="mt-1.5">
                   <ChipGroup options={LENGTHS} value={[brief.length]} onChange={(v) => set('length', v[0] ?? LENGTHS[1])} />
                 </div>
+                <div className="mt-2">
+                  <Label htmlFor="bw-pages" className="text-xs text-muted-foreground">
+                    Ou fixez vous-même la cible (optionnel) — nombre de pages
+                  </Label>
+                  <div className="mt-1 flex items-center gap-2">
+                    <Input
+                      id="bw-pages"
+                      value={pages}
+                      onChange={(e) => setPages(e.target.value.replace(/[^0-9]/g, ''))}
+                      placeholder="ex. : 180"
+                      inputMode="numeric"
+                      className="h-9 w-32"
+                    />
+                    <span className="text-xs text-muted-foreground">
+                      {pages ? `La Bible visera ~${pages} pages` : 'Laissez vide pour utiliser la longueur choisie ci-dessus'}
+                    </span>
+                  </div>
+                </div>
               </div>
               <div>
                 <Label>Structure narrative</Label>
@@ -307,6 +333,10 @@ export function BookWizard({
                 À la validation, Lumo génère la <strong className="text-foreground">Bible de l’œuvre</strong> —
                 titre, pitch, voix narrative, personnages, structure en chapitres. Elle sera attachée à la
                 conversation comme contexte permanent et incluse dans vos exports .zip.
+                <br />
+                <strong className="text-foreground">Pages illimitées :</strong> si vous choisissez « Illimité »,
+                la structure s’étend librement (séquences, tomes) — et à chaque étape d’écriture, Lumo vous
+                proposera une cible de pages que vous pourrez ajuster ou laisser libre.
               </div>
             </>
           )}

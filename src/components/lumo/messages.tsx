@@ -1,14 +1,37 @@
 'use client'
 
-/** Fil de conversation : bulles, streaming, artefacts, actions */
+/** Fil de conversation : bulles, streaming, artefacts, actions, fallback modèles */
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { Copy, RefreshCw, ThumbsDown, ThumbsUp } from 'lucide-react'
+import {
+  AlertTriangle,
+  ArrowUpFromLine,
+  Copy,
+  Import,
+  KeyRound,
+  Music,
+  PencilLine,
+  RefreshCw,
+  ThumbsDown,
+  ThumbsUp,
+} from 'lucide-react'
 import { format } from 'date-fns'
 import { fr } from 'date-fns/locale'
 import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
 import { useToast } from '@/hooks/use-toast'
+import {
+  apiFeedback,
+  apiListKeys,
+} from '@/lib/lumo/api'
 import { ArtifactViewDialog, AudioCard, ImageTile, TextFileCard, VideoCard } from '@/components/lumo/artifacts'
 import { LumoMark } from '@/components/lumo/logo'
 import { useLumo } from '@/lib/lumo/store'
@@ -34,7 +57,9 @@ const SUGGESTIONS: Record<string, string[]> = {
   ],
   audio: [
     'Lis ce paragraphe avec la voix Chloé',
+    'Compose une musique lo-fi chaleureuse au piano, ambiance pluie',
     'Fais une voix grave et lente pour une bande-annonce',
+    'Une boucle électro énergique pour une séance de sport',
   ],
   book: [
     'Écris le chapitre 1 en respectant la Bible',
@@ -100,6 +125,237 @@ function ArtifactGrid({
   )
 }
 
+/* ---------------------------------------------------------------- */
+/* Carte de secours quand le modèle est indisponible                 */
+/* ---------------------------------------------------------------- */
+
+const FALLBACK_OPTIONS: Record<string, { label: string; description: string; provider: string }> = {
+  mistral: {
+    label: 'Basculer sur Mistral',
+    description: 'Mistral Large — raisonnement, rédaction, code',
+    provider: 'mistral',
+  },
+  agnes: {
+    label: 'Basculer sur Agnes AI',
+    description: 'Agnes 2.5 Flash — multimodal rapide',
+    provider: 'agnes',
+  },
+  hf: {
+    label: 'Importer un modèle Hugging Face',
+    description: 'GPT/LLaMA/Mistral HF — .safetensors, .gguf, config .json',
+    provider: 'hf',
+  },
+}
+
+function HfFallbackDialog({
+  open,
+  onOpenChange,
+  onUse,
+}: {
+  open: boolean
+  onOpenChange: (v: boolean) => void
+  onUse: (modelId: string) => void
+}) {
+  const [modelId, setModelId] = useState('')
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle className="font-display">Modèle Hugging Face</DialogTitle>
+          <DialogDescription>
+            Indiquez l’identifiant du modèle à utiliser via l’API Hugging Face (token requis dans
+            Paramètres → Clés API).
+          </DialogDescription>
+        </DialogHeader>
+        <Input
+          value={modelId}
+          onChange={(e) => setModelId(e.target.value)}
+          placeholder="ex. : meta-llama/Llama-3.2-3B-Instruct"
+          aria-label="Identifiant du modèle Hugging Face"
+        />
+        <p className="text-xs leading-relaxed text-muted-foreground">
+          Formats pris en charge via le Hub : <strong>.safetensors</strong>, <strong>.gguf</strong>,{' '}
+          <strong>config .json</strong>. Pour exécuter un <em>.gguf</em> en local (llama.cpp, LM Studio),
+          enregistrez un « Endpoint personnalisé » dans les paramètres : Lumo lui transmettra la conversation.
+        </p>
+        <Button
+          disabled={!modelId.trim()}
+          onClick={() => {
+            onUse(modelId.trim())
+            onOpenChange(false)
+          }}
+          className="gap-1.5"
+        >
+          <Import className="h-4 w-4" /> Utiliser ce modèle
+        </Button>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function FallbackCard({
+  session,
+  m,
+}: {
+  session: Session
+  m: Message
+}) {
+  const retryWithProvider = useLumo((s) => s.retryWithProvider)
+  const { toast } = useToast()
+  const [hfOpen, setHfOpen] = useState(false)
+  const [busy, setBusy] = useState<string | null>(null)
+
+  async function ensureKey(provider: 'mistral' | 'agnes' | 'huggingface', label: string): Promise<boolean> {
+    try {
+      const keys = await apiListKeys()
+      const row = keys.find((k) => k.provider === provider && k.status === 'valid')
+      if (row) return true
+      toast({
+        title: `Aucune clé ${label} valide`,
+        description: 'Ajoutez-la dans Paramètres → Clés API, puis réessayez.',
+        variant: 'destructive',
+      })
+      return false
+    } catch {
+      toast({ title: 'Impossible de vérifier les clés', variant: 'destructive' })
+      return false
+    }
+  }
+
+  async function handle(kind: string) {
+    const opt = FALLBACK_OPTIONS[kind]
+    if (!opt || busy) return
+    setBusy(kind)
+    try {
+      if (kind === 'hf') {
+        setHfOpen(true)
+        return
+      }
+      const label = kind === 'mistral' ? 'Mistral' : 'Agnes AI'
+      if (!(await ensureKey(kind as 'mistral' | 'agnes', label))) return
+      toast({ title: `Nouvelle tentative avec ${label}…` })
+      await retryWithProvider(session.id, opt.provider)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  return (
+    <div className="mt-2 rounded-xl border border-amber-500/40 bg-amber-500/5 p-3">
+      <p className="flex items-center gap-1.5 text-xs font-semibold text-amber-700 dark:text-amber-400">
+        <AlertTriangle className="h-3.5 w-3.5" /> Modèle indisponible — proposez-moi une alternative :
+      </p>
+      <div className="mt-2 grid gap-1.5 sm:grid-cols-3">
+        {Object.entries(FALLBACK_OPTIONS).map(([kind, opt]) => (
+          <Button
+            key={kind}
+            variant="outline"
+            size="sm"
+            className="h-auto flex-col items-start gap-0.5 px-2.5 py-2 text-left"
+            disabled={busy === kind}
+            onClick={() => void handle(kind)}
+          >
+            <span className="flex items-center gap-1 text-xs font-medium">
+              {kind === 'hf' ? <Import className="h-3 w-3" /> : <ArrowUpFromLine className="h-3 w-3" />}
+              {opt.label.replace('Basculer sur ', '')}
+            </span>
+            <span className="text-[10px] font-normal leading-snug text-muted-foreground">{opt.description}</span>
+          </Button>
+        ))}
+      </div>
+      <p className="mt-1.5 flex items-center gap-1 text-[10px] text-muted-foreground">
+        <KeyRound className="h-3 w-3" /> Les clés API se gèrent dans Paramètres → Clés API.
+      </p>
+      <HfFallbackDialog
+        open={hfOpen}
+        onOpenChange={setHfOpen}
+        onUse={async (modelId) => {
+          if (!(await ensureKey('huggingface', 'Hugging Face'))) return
+          toast({ title: `Tentative avec ${modelId}…` })
+          await retryWithProvider(session.id, 'hf', modelId)
+        }}
+      />
+    </div>
+  )
+}
+
+/* ---------------------------------------------------------------- */
+/* Bulle utilisateur : édition + copie                               */
+/* ---------------------------------------------------------------- */
+
+function UserMessage({
+  session,
+  m,
+  isEditing,
+}: {
+  session: Session
+  m: Message
+  isEditing: boolean
+}) {
+  const setEditingMsg = useLumo((s) => s.setEditingMsg)
+  const generating = session.messages.some((x) => x.pending)
+  const { toast } = useToast()
+
+  return (
+    <article className={`group flex justify-end ${isEditing ? 'opacity-70' : ''}`} aria-label="Votre message">
+      <div className="max-w-[85%] sm:max-w-[70%]">
+        <div
+          className={`rounded-2xl rounded-br-md bg-primary px-4 py-2.5 text-sm leading-relaxed text-primary-foreground shadow-sm ${
+            isEditing ? 'ring-2 ring-amber-500 ring-offset-2 ring-offset-background' : ''
+          }`}
+        >
+          {m.content}
+          {m.attachments && m.attachments.length > 0 && (
+            <span className="mt-1.5 flex flex-wrap gap-1">
+              {m.attachments.map((a, i) => (
+                <span
+                  key={i}
+                  className="inline-flex items-center gap-1 rounded-full bg-black/15 px-2 py-0.5 text-[10px]"
+                >
+                  📎 {a.name}
+                </span>
+              ))}
+            </span>
+          )}
+        </div>
+        <div className="mt-1 flex items-center justify-end gap-1 pr-1">
+          <span className="text-[11px] text-muted-foreground">
+            {format(new Date(m.createdAt), "HH'mm", { locale: fr })}
+          </span>
+          <span className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 gap-1 px-1.5 text-[11px] text-muted-foreground"
+              disabled={generating}
+              onClick={() => setEditingMsg({ sessionId: session.id, msgId: m.id })}
+              aria-label="Modifier ce message et régénérer"
+            >
+              <PencilLine className="h-3 w-3" /> Modifier
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 gap-1 px-1.5 text-[11px] text-muted-foreground"
+              onClick={() => {
+                void navigator.clipboard.writeText(m.content)
+                toast({ title: 'Message copié' })
+              }}
+              aria-label="Copier ce message"
+            >
+              <Copy className="h-3 w-3" /> Copier
+            </Button>
+          </span>
+        </div>
+      </div>
+    </article>
+  )
+}
+
+/* ---------------------------------------------------------------- */
+/* Réponse de Lumo                                                   */
+/* ---------------------------------------------------------------- */
+
 function AssistantMessage({
   session,
   m,
@@ -113,7 +369,29 @@ function AssistantMessage({
 }) {
   const { toast } = useToast()
   const regenerateLast = useLumo((s) => s.regenerateLast)
+  const [vote, setVote] = useState<'up' | 'down' | null>(null)
   const streaming = m.pending && m.flow === 'chat'
+
+  async function feedback(verdict: 'up' | 'down') {
+    setVote(verdict)
+    const prevUser = [...session.messages]
+      .slice(0, session.messages.findIndex((x) => x.id === m.id))
+      .reverse()
+      .find((x) => x.role === 'user')
+    try {
+      const r = await apiFeedback(verdict, prevUser?.content ?? '', m.content)
+      toast({
+        title: verdict === 'up' ? 'Merci pour votre retour !' : 'Retour noté',
+        description: r.message,
+        className:
+          verdict === 'up'
+            ? 'border-emerald-500 bg-emerald-50 text-emerald-900 dark:bg-emerald-950 dark:text-emerald-100'
+            : undefined,
+      })
+    } catch {
+      toast({ title: 'Retour non enregistré', variant: 'destructive' })
+    }
+  }
 
   return (
     <article className="group flex gap-2.5 sm:gap-3" aria-label="Réponse de Lumo">
@@ -149,6 +427,7 @@ function AssistantMessage({
               {m.error}
             </p>
           )}
+          {m.error && m.fallback && m.fallback.length > 0 && <FallbackCard session={session} m={m} />}
         </div>
 
         {!m.pending && (
@@ -180,18 +459,20 @@ function AssistantMessage({
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 px-2 text-muted-foreground"
+              className={`h-7 px-2 ${vote === 'up' ? 'text-emerald-600' : 'text-muted-foreground'}`}
               aria-label="Réponse utile"
-              onClick={() => toast({ title: 'Merci pour votre retour !' })}
+              disabled={!!vote}
+              onClick={() => void feedback('up')}
             >
               <ThumbsUp className="h-3 w-3" />
             </Button>
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 px-2 text-muted-foreground"
+              className={`h-7 px-2 ${vote === 'down' ? 'text-destructive' : 'text-muted-foreground'}`}
               aria-label="Réponse inutile"
-              onClick={() => toast({ title: 'Retour noté', description: 'Lumo apprendra de cela.' })}
+              disabled={!!vote}
+              onClick={() => void feedback('down')}
             >
               <ThumbsDown className="h-3 w-3" />
             </Button>
@@ -202,12 +483,17 @@ function AssistantMessage({
   )
 }
 
+/* ---------------------------------------------------------------- */
+/* Fil complet                                                       */
+/* ---------------------------------------------------------------- */
+
 export function ChatMessages({ session }: { session: Session }) {
   const messages = session.messages
   const scrollRef = useRef<HTMLDivElement>(null)
   const nearBottomRef = useRef(true)
   const [viewing, setViewing] = useState<Artifact | null>(null)
   const sendMessage = useLumo((s) => s.sendMessage)
+  const editingMsg = useLumo((s) => s.editingMsg)
 
   const contentLength = useMemo(
     () => messages.reduce((n, m) => n + m.content.length, 0),
@@ -261,21 +547,23 @@ export function ChatMessages({ session }: { session: Session }) {
                   </button>
                 ))}
               </div>
+              {session.mode === 'audio' && (
+                <p className="mt-4 flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <Music className="h-3.5 w-3.5 text-primary" /> Onglet « Musique » de la barre de saisie :
+                  génération type Suno, 100 % locale.
+                </p>
+              )}
             </div>
           ) : (
             <div className="space-y-6">
               {messages.map((m) =>
                 m.role === 'user' ? (
-                  <article key={m.id} className="flex justify-end" aria-label="Votre message">
-                    <div className="max-w-[85%] sm:max-w-[70%]">
-                      <div className="rounded-2xl rounded-br-md bg-primary px-4 py-2.5 text-sm leading-relaxed text-primary-foreground shadow-sm">
-                        {m.content}
-                      </div>
-                      <p className="mt-1 pr-1 text-right text-[11px] text-muted-foreground">
-                        {format(new Date(m.createdAt), "HH'mm", { locale: fr })}
-                      </p>
-                    </div>
-                  </article>
+                  <UserMessage
+                    key={m.id}
+                    session={session}
+                    m={m}
+                    isEditing={editingMsg?.sessionId === session.id && editingMsg.msgId === m.id}
+                  />
                 ) : (
                   <AssistantMessage
                     key={m.id}

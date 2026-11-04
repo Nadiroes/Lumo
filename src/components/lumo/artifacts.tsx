@@ -85,10 +85,54 @@ export function ImageTile({ a }: { a: Artifact }) {
   )
 }
 
-/* ---------------- Audio (démo) ---------------- */
+/* ---------------- Audio (démo ou musique générée) ---------------- */
 
 export function AudioCard({ a }: { a: Artifact }) {
+  const data = useArtifactData(a)
+  const src = artifactDataUrl(a, data)
+  const isMusic = !!a.meta?.music
   const voice = a.meta?.voice ? String(a.meta.voice) : 'voix'
+  const style = a.meta?.style ? String(a.meta.style) : ''
+  const bpm = a.meta?.bpm ? String(a.meta.bpm) : ''
+  const keyName = a.meta?.key ? String(a.meta.key) : ''
+  const durationSec = a.meta?.durationSec ? Number(a.meta.durationSec) : 0
+  const { toast } = useToast()
+
+  if (src) {
+    return (
+      <div className="rounded-xl border bg-card p-3">
+        <div className="mb-2 flex items-center gap-2.5">
+          <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
+            <AudioLines className="h-4.5 w-4.5" aria-hidden="true" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-xs font-medium">{a.name.replace(/\.wav$/, '')}</p>
+            <p className="truncate text-[10px] text-muted-foreground">
+              {isMusic
+                ? `piste générée · ${[style, bpm ? `${bpm} BPM` : '', keyName, durationSec ? `${durationSec} s` : ''].filter(Boolean).join(' · ')}`
+                : `audio · ${a.provider}`}
+            </p>
+          </div>
+          <Button
+            size="sm"
+            variant="secondary"
+            className="h-7 gap-1 text-[11px]"
+            onClick={() => {
+              const link = document.createElement('a')
+              link.href = src
+              link.download = a.name
+              link.click()
+              toast({ title: 'Audio téléchargé', description: a.name })
+            }}
+          >
+            <Download className="h-3 w-3" /> WAV
+          </Button>
+        </div>
+        <audio controls src={src} className="h-9 w-full" preload="metadata" aria-label={`Lecture de ${a.name}`} />
+      </div>
+    )
+  }
+
   return (
     <div className="flex items-center gap-3 rounded-xl border bg-card p-3">
       <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
