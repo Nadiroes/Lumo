@@ -11,11 +11,13 @@ import { fr } from 'date-fns/locale'
 import {
   AudioLines,
   Clapperboard,
+  Code2,
   Cuboid,
   Download,
   FileText,
   Home,
   Image as ImageIcon,
+  LayoutDashboard,
   Menu,
   MessageSquarePlus,
   PanelRightOpen,
@@ -37,6 +39,7 @@ import { Input } from '@/components/ui/input'
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet'
 import { useToast } from '@/hooks/use-toast'
 import { ArtifactViewDialog } from '@/components/lumo/artifacts'
+import { DesignStudioDialog } from '@/components/lumo/app-studio'
 import { ExportDialog } from '@/components/lumo/export-dialog'
 import { InputBar } from '@/components/lumo/input-bar'
 import { LumoWordmark } from '@/components/lumo/logo'
@@ -44,10 +47,21 @@ import { ChatMessages } from '@/components/lumo/messages'
 import { ModeIcon } from '@/components/lumo/mode-icon'
 import { ModelHubDialog, ModelPicker } from '@/components/lumo/model-picker'
 import { SettingsDialog } from '@/components/lumo/settings-dialog'
+import { CodePreviewDialog } from '@/components/lumo/web-preview'
 import { useLumo } from '@/lib/lumo/store'
 import { MODE_INFO, type Artifact, type Mode, type Session } from '@/lib/lumo/types'
 
-const ALL_MODES: Mode[] = ['text', 'image', 'video', 'audio', 'book', 'project', 'free']
+const ALL_MODES: Mode[] = [
+  'text',
+  'image',
+  'video',
+  'audio',
+  'webdev',
+  'appdesign',
+  'book',
+  'project',
+  'free',
+]
 
 function artifactIcon(a: Artifact) {
   switch (a.kind) {
@@ -57,6 +71,10 @@ function artifactIcon(a: Artifact) {
       return <AudioLines className="h-4 w-4" aria-hidden="true" />
     case 'video':
       return <Clapperboard className="h-4 w-4" aria-hidden="true" />
+    case 'webcode':
+      return <Code2 className="h-4 w-4" aria-hidden="true" />
+    case 'design':
+      return <LayoutDashboard className="h-4 w-4" aria-hidden="true" />
     default:
       return <FileText className="h-4 w-4" aria-hidden="true" />
   }
@@ -259,6 +277,8 @@ export function ChatWindow({ onStartBook }: { onStartBook: () => void }) {
   const [showPanel, setShowPanel] = useState(false)
   const [mobileNav, setMobileNav] = useState(false)
   const [viewing, setViewing] = useState<Artifact | null>(null)
+  const isWebcodeView = viewing?.kind === 'webcode'
+  const isDesignView = viewing?.kind === 'design'
 
   if (!session) {
     return (
@@ -467,7 +487,13 @@ export function ChatWindow({ onStartBook }: { onStartBook: () => void }) {
       )}
 
       <ExportDialog session={session} open={exportOpen} onOpenChange={setExportOpen} />
-      <ArtifactViewDialog artifact={viewing} open={!!viewing} onOpenChange={(v) => !v && setViewing(null)} />
+      <CodePreviewDialog artifact={viewing} open={!!viewing && isWebcodeView} onOpenChange={(v) => !v && setViewing(null)} />
+      <DesignStudioDialog artifact={viewing} open={!!viewing && isDesignView} onOpenChange={(v) => !v && setViewing(null)} />
+      <ArtifactViewDialog
+        artifact={viewing}
+        open={!!viewing && !isWebcodeView && !isDesignView}
+        onOpenChange={(v) => !v && setViewing(null)}
+      />
     </div>
   )
 }

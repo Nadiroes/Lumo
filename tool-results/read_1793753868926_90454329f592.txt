@@ -1,0 +1,749 @@
+     1→     1→/** Store central Lumo — orchestration des sessions et des flux de génération */
+     2→     2→
+     3→     3→'use client'
+     4→     4→
+     5→     5→import { create } from 'zustand'
+     6→     6→import { persist } from 'zustand/middleware'
+     7→     7→import { apiChat, apiImage, type ChatOverride } from './api'
+     8→     8→import { deleteArtifactData, putArtifactData } from './artifact-store'
+     9→     9→import { generateMusic } from './music'
+    10→    10→import { DEFAULT_MODELS } from './providers'
+    11→    11→import type {
+    12→    12→  Artifact,
+    13→    13→  Attachment,
+    14→    14→  BookBrief,
+    15→    15→  ExportRecord,
+    16→    16→  HfModel,
+    17→    17→  Message,
+    18→    18→  Mode,
+    19→    19→  ModelSelection,
+    20→    20→  Session,
+    21→    21→} from './types'
+    22→    22→
+    23→    23→const LUMO_SYSTEM =
+    24→    24→  'Tu es Lumo, un agent conversationnel chaleureux, lumineux et efficace. ' +
+    25→    25→  'Réponds dans la langue de l’utilisateur (français par défaut). ' +
+    26→    26→  'Structure tes réponses en Markdown lisible : titres courts, listes, gras sur les points clés. ' +
+    27→    27→  'Sois concret et utile, jamais verbeux. Termine par une suggestion d’action quand c’est pertinent. ' +
+    28→    28→  'Tu es intégré à Lumo, un studio de création multimodal avec export .zip versionné. ' +
+    29→    29→  'Tu es un agent auto-apprenant : tu t’appuies sur ta mémoire des interactions précédentes pour t’améliorer.'
+    30→    30→
+    31→    31→const PROJECT_SYSTEM =
+    32→    32→  LUMO_SYSTEM +
+    33→    33→  '\n\nContexte : mode « Projet ». Tu es chef de projet créatif : décompose la demande en phases, ' +
+    34→    34→  'jalons, livrables et artefacts (texte, image, audio, vidéo) avec des durées estimées. Termine par une section « Prochaine action ».'
+    35→    35→
+    36→    36→const BIBLE_SYSTEM =
+    37→    37→  'Tu es directeur littéraire. À partir du brief JSON fourni par l’utilisateur, rédige la « Bible de l’œuvre » ' +
+    38→    38→  'en Markdown avec ces sections : Titre proposé (+ 2 alternatives), Pitch (5 lignes max), Ton & style, ' +
+    39→    39→  'Voix narrative, Univers & règles, Personnages (principal détaillé + 2 seconds esquissés), ' +
+    40→    40→  'Structure (actes puis 8 à 12 chapitres titrés, une ligne chacun), Thèmes & motifs récurrents, ' +
+    41→    41→  'Ambiances visuelles & sonores. Markdown propre, sans méta-commentaire, en français. ' +
+    42→    42→  'La longueur cible figure dans le brief : si elle est « Illimité », prévois une structure extensible (séquences, tomes) et dis-le.'
+    43→    43→
+    44→    44→function bookSystem(briefMd: string): string {
+    45→    45→  return (
+    46→    46→    'Tu es l’assistant d’écriture de Lumo et le directeur littéraire attitré de ce projet. ' +
+    47→    47→    'Respecte strictement la Bible de l’œuvre ci-dessous (ton, voix, univers, structure). ' +
+    48→    48→    'Quand on te demande un chapitre, écris-le pleinement avec de la matière narrative concrète. ' +
+    49→    49→    'Si une cible de pages est fixée dans le brief, vise-la ; si la longueur est illimitée, écris un chapitre complet ' +
+    50→    50→    '(1 200 à 2 500 mots) et propose la suite.\n\n' +
+    51→    51→    '## BIBLE DE L’ŒUVRE\n\n' + briefMd
+    52→    52→  )
+    53→    53→}
+    54→    54→
+    55→    55→export interface SendOptions {
+    56→    56→  imageSize?: string
+    57→    57→  variations?: number
+    58→    58→  voice?: string
+    59→    59→  audioTab?: 'voice' | 'transcript' | 'music'
+    60→    60→  file?: { name: string; size: number }
+    61→    61→  attachments?: Attachment[]
+    62→    62→  musicStyle?: string
+    63→    63→  musicDuration?: number
+    64→    64→  instrumental?: boolean
+    65→    65→}
+    66→    66→
+    67→    67→interface LumoState {
+    68→    68→  view: 'hub' | 'chat'
+    69→    69→  sessions: Session[]
+    70→    70→  activeId: string | null
+    71→    71→  hfModels: HfModel[]
+    72→    72→  editingMsg: { sessionId: string; msgId: string } | null
+    73→    73→
+    74→    74→  openHub: () => void
+    75→    75→  openSession: (id: string) => void
+    76→    76→  startSession: (mode: Mode, brief?: BookBrief) => string
+    77→    77→  deleteSession: (id: string) => void
+    78→    78→  togglePin: (id: string) => void
+    79→    79→  renameSession: (id: string, title: string) => void
+    80→    80→  setSessionMode: (id: string, mode: Mode) => void
+    81→    81→  setSessionModel: (id: string, kind: keyof ModelSelection, providerId: string) => void
+    82→    82→
+    83→    83→  sendMessage: (sessionId: string, text: string, opts?: SendOptions) => Promise<void>
+    84→    84→  editMessage: (sessionId: string, msgId: string, newText: string, attachments?: Attachment[]) => Promise<void>
+    85→    85→  retryWithProvider: (sessionId: string, provider: string, hfModel?: string) => Promise<void>
+    86→    86→  stopGeneration: (sessionId: string) => void
+    87→    87→  regenerateLast: (sessionId: string) => Promise<void>
+    88→    88→  generateBible: (sessionId: string, brief: BookBrief) => Promise<void>
+    89→    89→
+    90→    90→  addHfModel: (model: HfModel) => void
+    91→    91→  removeHfModel: (id: string) => void
+    92→    92→
+    93→    93→  recordExport: (sessionId: string, record: ExportRecord) => void
+    94→    94→
+    95→    95→  updateSession: (id: string, fn: (s: Session) => Session) => void
+    96→    96→  updateMessage: (sessionId: string, msgId: string, patch: Partial<Message>) => void
+    97→    97→  setEditingMsg: (v: { sessionId: string; msgId: string } | null) => void
+    98→    98→}
+    99→    99→
+   100→   100→/* ---- flux en cours (streaming + minuteries simulées) ---- */
+   101→   101→const streams = new Map<
+   102→   102→  string,
+   103→   103→  { timer: ReturnType<typeof setInterval>; sessionId: string; resolve: (c: string) => void }
+   104→   104→>()
+   105→   105→const sessionTimers = new Map<string, Set<ReturnType<typeof setTimeout>>>()
+   106→   106→
+   107→   107→function uid(): string {
+   108→   108→  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) return crypto.randomUUID()
+   109→   109→  return `id-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
+   110→   110→}
+   111→   111→
+   112→   112→function truncate(s: string, n: number): string {
+   113→   113→  const t = s.trim().replace(/\s+/g, ' ')
+   114→   114→  return t.length <= n ? t : t.slice(0, n - 1) + '…'
+   115→   115→}
+   116→   116→
+   117→   117→/** Bloc texte des pièces jointes, injecté dans le prompt du modèle */
+   118→   118→function attachmentBlock(m: Message, maxPerFile = 12000): string {
+   119→   119→  if (!m.attachments?.length) return ''
+   120→   120→  const parts = m.attachments.map((a) =>
+   121→   121→    a.text
+   122→   122→      ? `--- Fichier joint : ${a.name} ---\n${a.text.slice(0, maxPerFile)}`
+   123→   123→      : `[Pièce jointe : ${a.name} (${a.type || 'fichier'}, ${(a.size / 1024).toFixed(0)} Ko)]`,
+   124→   124→  )
+   125→   125→  return '\n\n[Fichiers joints par l’utilisateur]\n' + parts.join('\n\n')
+   126→   126→}
+   127→   127→
+   128→   128→function attachmentSummary(attachments?: Attachment[]): string {
+   129→   129→  if (!attachments?.length) return ''
+   130→   130→  const names = attachments.map((a) => a.name).join(', ')
+   131→   131→  const texts = attachments
+   132→   132→    .filter((a) => a.text)
+   133→   133→    .map((a) => `--- ${a.name} ---\n${a.text!.slice(0, 2000)}`)
+   134→   134→    .join('\n\n')
+   135→   135→  return `\n\n(En tenant compte des fichiers joints : ${names})${texts ? '\n\n' + texts : ''}`
+   136→   136→}
+   137→   137→
+   138→   138→export const useLumo = create<LumoState>()(
+   139→   139→  persist(
+   140→   140→    (set, get) => {
+   141→   141→      function updateSession(id: string, fn: (s: Session) => Session) {
+   142→   142→        set((st) => ({ sessions: st.sessions.map((s) => (s.id === id ? fn(s) : s)) }))
+   143→   143→      }
+   144→   144→      function updateMessage(sessionId: string, msgId: string, patch: Partial<Message>) {
+   145→   145→        updateSession(sessionId, (s) => ({
+   146→   146→          ...s,
+   147→   147→          updatedAt: Date.now(),
+   148→   148→          messages: s.messages.map((m) => (m.id === msgId ? { ...m, ...patch } : m)),
+   149→   149→        }))
+   150→   150→      }
+   151→   151→
+   152→   152→      function addMessage(sessionId: string, msg: Message) {
+   153→   153→        updateSession(sessionId, (s) => ({ ...s, messages: [...s.messages, msg] }))
+   154→   154→      }
+   155→   155→
+   156→   156→      function revealStream(sessionId: string, msgId: string, full: string): Promise<string> {
+   157→   157→        return new Promise((resolve) => {
+   158→   158→          let revealed = 0
+   159→   159→          const chunk = Math.max(3, Math.ceil(full.length / 160))
+   160→   160→          const timer = setInterval(() => {
+   161→   161→            revealed = Math.min(full.length, revealed + chunk)
+   162→   162→            updateMessage(sessionId, msgId, { content: full.slice(0, revealed) })
+   163→   163→            if (revealed >= full.length) {
+   164→   164→              clearInterval(timer)
+   165→   165→              streams.delete(msgId)
+   166→   166→              updateMessage(sessionId, msgId, { content: full, pending: false })
+   167→   167→              resolve(full)
+   168→   168→            }
+   169→   169→          }, 16)
+   170→   170→          streams.set(msgId, {
+   171→   171→            timer,
+   172→   172→            sessionId,
+   173→   173→            resolve: (content) => {
+   174→   174→              updateMessage(sessionId, msgId, { content, pending: false, stopped: true })
+   175→   175→              resolve(content)
+   176→   176→            },
+   177→   177→          })
+   178→   178→        })
+   179→   179→      }
+   180→   180→
+   181→   181→      function later(sessionId: string, ms: number, fn: () => void) {
+   182→   182→        const t = setTimeout(() => {
+   183→   183→          const set_ = sessionTimers.get(sessionId)
+   184→   184→          if (set_) set_.delete(t)
+   185→   185→          fn()
+   186→   186→        }, ms)
+   187→   187→        if (!sessionTimers.has(sessionId)) sessionTimers.set(sessionId, new Set())
+   188→   188→        sessionTimers.get(sessionId)!.add(t)
+   189→   189→      }
+   190→   190→
+   191→   191→      /* ---------- flux ---------- */
+   192→   192→
+   193→   193→      async function chatFlow(
+   194→   194→        sessionId: string,
+   195→   195→        history: Message[],
+   196→   196→        override?: { provider?: string; hfModel?: string },
+   197→   197→      ) {
+   198→   198→        const session = get().sessions.find((s) => s.id === sessionId)
+   199→   199→        if (!session) return
+   200→   200→        const providerLabel =
+   201→   201→          override?.provider === 'hf'
+   202→   202→            ? `hf:${override.hfModel}`
+   203→   203→            : (override?.provider ?? session.models.text)
+   204→   204→        const assistantId = uid()
+   205→   205→        addMessage(sessionId, {
+   206→   206→          id: assistantId,
+   207→   207→          role: 'assistant',
+   208→   208→          content: '',
+   209→   209→          createdAt: Date.now(),
+   210→   210→          pending: true,
+   211→   211→          flow: 'chat',
+   212→   212→          provider: providerLabel,
+   213→   213→        })
+   214→   214→        try {
+   215→   215→          const turns = history
+   216→   216→            .filter((m) => !m.pending && !m.error && m.content.trim())
+   217→   217→            .slice(-16)
+   218→   218→            .map((m) => ({ role: m.role, content: m.content + attachmentBlock(m) }) as { role: 'user' | 'assistant'; content: string })
+   219→   219→          let system = LUMO_SYSTEM
+   220→   220→          if (session.mode === 'project') system = PROJECT_SYSTEM
+   221→   221→          if (session.mode === 'book' && session.brief) {
+   222→   222→            const bibleArtifact = session.messages
+   223→   223→              .flatMap((m) => m.artifacts ?? [])
+   224→   224→              .find((a) => a.kind === 'bible')
+   225→   225→            system = bookSystem(
+   226→   226→              bibleArtifact?.text ??
+   227→   227→                'Brief : ' + JSON.stringify(session.brief, null, 2),
+   228→   228→            )
+   229→   229→          }
+   230→   230→          const useOverride: ChatOverride | undefined =
+   231→   231→            override?.provider && override.provider !== 'lumo-core'
+   232→   232→              ? { provider: override.provider as ChatOverride['provider'], hfModel: override.hfModel }
+   233→   233→              : undefined
+   234→   234→          const full = await apiChat(turns, system, useOverride)
+   235→   235→          const stillPending = get().sessions
+   236→   236→            .find((s) => s.id === sessionId)
+   237→   237→            ?.messages.find((m) => m.id === assistantId)?.pending
+   238→   238→          if (stillPending) await revealStream(sessionId, assistantId, full)
+   239→   239→          else updateMessage(sessionId, assistantId, { content: full, pending: false })
+   240→   240→        } catch (e) {
+   241→   241→          const err = e as Error & { fallback?: string[] }
+   242→   242→          updateMessage(sessionId, assistantId, {
+   243→   243→            pending: false,
+   244→   244→            error: err.message,
+   245→   245→            content: '',
+   246→   246→            fallback: err.fallback ?? ['mistral', 'agnes', 'hf'],
+   247→   247→          })
+   248→   248→        }
+   249→   249→      }
+   250→   250→
+   251→   251→      async function imageFlow(sessionId: string, prompt: string, opts: SendOptions) {
+   252→   252→        const session = get().sessions.find((s) => s.id === sessionId)
+   253→   253→        if (!session) return
+   254→   254→        const count = Math.max(1, Math.min(4, opts.variations ?? 1))
+   255→   255→        const size = opts.imageSize ?? '1024x1024'
+   256→   256→        const provider = session.models.image
+   257→   257→        const fullPrompt = prompt + attachmentSummary(opts.attachments)
+   258→   258→        const assistantId = uid()
+   259→   259→        addMessage(sessionId, {
+   260→   260→          id: assistantId,
+   261→   261→          role: 'assistant',
+   262→   262→          content: '',
+   263→   263→          createdAt: Date.now(),
+   264→   264→          pending: true,
+   265→   265→          flow: 'image',
+   266→   266→          provider,
+   267→   267→        })
+   268→   268→        const results = await Promise.allSettled(
+   269→   269→          Array.from({ length: count }, (_, i) =>
+   270→   270→            i === 0
+   271→   271→              ? apiImage(fullPrompt, size)
+   272→   272→              : new Promise<{ base64: string; bytes: number }>((resolve, reject) =>
+   273→   273→                  setTimeout(() => apiImage(fullPrompt, size).then(resolve, reject), i * 3000),
+   274→   274→                ),
+   275→   275→          ),
+   276→   276→        )
+   277→   277→        const artifacts: Artifact[] = []
+   278→   278→        let ok = 0
+   279→   279→        for (let i = 0; i < results.length; i++) {
+   280→   280→          const r = results[i]
+   281→   281→          if (r.status === 'fulfilled') {
+   282→   282→            ok++
+   283→   283→            const a: Artifact = {
+   284→   284→              id: uid(),
+   285→   285→              kind: 'image',
+   286→   286→              name: `image_${String(artifacts.length + 1).padStart(3, '0')}.png`,
+   287→   287→              mimeType: 'image/png',
+   288→   288→              createdAt: Date.now(),
+   289→   289→              provider,
+   290→   290→              prompt: fullPrompt,
+   291→   291→              data: r.value.base64,
+   292→   292→              bytes: r.value.bytes,
+   293→   293→              meta: { size },
+   294→   294→            }
+   295→   295→            void putArtifactData(a.id, a.data)
+   296→   296→            artifacts.push(a)
+   297→   297→          }
+   298→   298→        }
+   299→   299→        const failed = count - ok
+   300→   300→        const content =
+   301→   301→          ok === 0
+   302→   302→            ? `La génération d’image a échoué pour « ${truncate(prompt, 60)} ». Réessayez dans un instant.`
+   303→   303→            : `Voici ${ok > 1 ? `les ${ok} variations` : 'votre visuel'} pour « ${truncate(prompt, 60)} ».${
+   304→   304→                failed ? ` (${failed} tentative(s) échouée(s))` : ''
+   305→   305→              }`
+   306→   306→        updateMessage(sessionId, assistantId, {
+   307→   307→          content,
+   308→   308→          pending: false,
+   309→   309→          artifacts,
+   310→   310→          error: ok === 0 ? 'Génération impossible' : undefined,
+   311→   311→        })
+   312→   312→      }
+   313→   313→
+   314→   314→      async function videoFlow(sessionId: string, prompt: string, opts: SendOptions = {}) {
+   315→   315→        const session = get().sessions.find((s) => s.id === sessionId)
+   316→   316→        if (!session) return
+   317→   317→        const provider = session.models.video
+   318→   318→        const assistantId = uid()
+   319→   319→        addMessage(sessionId, {
+   320→   320→          id: assistantId,
+   321→   321→          role: 'assistant',
+   322→   322→          content: '🎬 Analyse du brief… découpage du storyboard…',
+   323→   323→          createdAt: Date.now(),
+   324→   324→          pending: true,
+   325→   325→          flow: 'video',
+   326→   326→          provider,
+   327→   327→        })
+   328→   328→        later(sessionId, 900, () =>
+   329→   329→          updateMessage(sessionId, assistantId, { content: '🎞 Rendu des plans (1/3)…' }),
+   330→   330→        )
+   331→   331→        later(sessionId, 1800, () =>
+   332→   332→          updateMessage(sessionId, assistantId, { content: '🎞 Rendu des plans (2/3)…' }),
+   333→   333→        )
+   334→   334→        later(sessionId, 2700, () =>
+   335→   335→          updateMessage(sessionId, assistantId, { content: '🎞 Rendu des plans (3/3)…' }),
+   336→   336→        )
+   337→   337→        later(sessionId, 3600, () => {
+   338→   338→          const artifact: Artifact = {
+   339→   339→            id: uid(),
+   340→   340→            kind: 'video',
+   341→   341→            name: `clip_${Date.now().toString().slice(-5)}.mp4`,
+   342→   342→            mimeType: 'video/mp4',
+   343→   343→            createdAt: Date.now(),
+   344→   344→            provider,
+   345→   345→            prompt: prompt + attachmentSummary(opts.attachments),
+   346→   346→            demo: true,
+   347→   347→            meta: { duration: opts.duration ?? '8 s', ratio: '16:9' },
+   348→   348→          }
+   349→   349→          updateMessage(sessionId, assistantId, {
+   350→   350→            content: `Aperçu vidéo généré pour « ${truncate(prompt, 60)} ».\n\nLe rendu vidéo complet nécessite le branchement d’Agnes AI (image → vidéo, audio synchronisé). Cet aperçu est une simulation prête à recevoir l’API.`,
+   351→   351→            pending: false,
+   352→   352→            artifacts: [artifact],
+   353→   353→          })
+   354→   354→        })
+   355→   355→      }
+   356→   356→
+   357→   357→      async function audioFlow(sessionId: string, text: string, opts: SendOptions) {
+   358→   358→        const session = get().sessions.find((s) => s.id === sessionId)
+   359→   359→        if (!session) return
+   360→   360→        const provider = session.models.audio
+   361→   361→        const assistantId = uid()
+   362→   362→        const voice = opts.voice ?? 'Chloé'
+   363→   363→        addMessage(sessionId, {
+   364→   364→          id: assistantId,
+   365→   365→          role: 'assistant',
+   366→   366→          content:
+   367→   367→            opts.audioTab === 'transcript'
+   368→   368→              ? '🎧 Analyse du fichier… transcription en cours…'
+   369→   369→              : `🎙 Synthèse de la voix « ${voice} »…`,
+   370→   370→          createdAt: Date.now(),
+   371→   371→          pending: true,
+   372→   372→          flow: opts.audioTab === 'transcript' ? 'audio-transcript' : 'audio-voice',
+   373→   373→          provider,
+   374→   374→        })
+   375→   375→        const firstFile = opts.file ?? opts.attachments?.[0]
+   376→   376→        if (opts.audioTab === 'transcript' && firstFile) {
+   377→   377→          later(sessionId, 1200, () =>
+   378→   378→            updateMessage(sessionId, assistantId, { content: '🎧 Alignement des segments et horodatage…' }),
+   379→   379→          )
+   380→   380→          later(sessionId, 2100, () => {
+   381→   381→            const artifact: Artifact = {
+   382→   382→              id: uid(),
+   383→   383→              kind: 'transcript',
+   384→   384→              name: `transcription_${firstFile.name.replace(/\.[^.]+$/, '')}.md`,
+   385→   385→              mimeType: 'text/markdown',
+   386→   386→              createdAt: Date.now(),
+   387→   387→              provider,
+   388→   388→              demo: true,
+   389→   389→              text:
+   390→   390→                `# Transcription — ${firstFile.name}\n\n` +
+   391→   391→                `> **Démo** — branchez Voxtral ou Agnes AI pour transcrire réellement ce fichier (${(firstFile.size / 1024).toFixed(0)} Ko).\n\n` +
+   392→   392→                '[00:00] Segment de démonstration : la transcription temps réel s’affichera ici, mot après mot.\n' +
+   393→   393→                '[00:07] Deuxième segment simulé, avec diarisation des locuteurs.\n',
+   394→   394→            }
+   395→   395→            updateMessage(sessionId, assistantId, {
+   396→   396→              content: `Transcription terminée pour « ${firstFile.name} » (démo).`,
+   397→   397→              pending: false,
+   398→   398→              artifacts: [artifact],
+   399→   399→            })
+   400→   400→          })
+   401→   401→        } else {
+   402→   402→          later(sessionId, 1500, () => {
+   403→   403→            const artifact: Artifact = {
+   404→   404→              id: uid(),
+   405→   405→              kind: 'audio',
+   406→   406→              name: `synthese_${Date.now().toString().slice(-5)}.wav`,
+   407→   407→              mimeType: 'audio/wav',
+   408→   408→              createdAt: Date.now(),
+   409→   409→              provider,
+   410→   410→              demo: true,
+   411→   411→              meta: { voice },
+   412→   412→            }
+   413→   413→            updateMessage(sessionId, assistantId, {
+   414→   414→              content: `Voix « ${voice} » générée pour votre texte (démo).\n\nLe flux vocal complet nécessite le branchement de l’API audio choisie. Ce lecteur est prêt à recevoir le flux.`,
+   415→   415→              pending: false,
+   416→   416→              artifacts: [artifact],
+   417→   417→            })
+   418→   418→          })
+   419→   419→        }
+   420→   420→      }
+   421→   421→
+   422→   422→      /** Génération musicale locale (façon Suno) — rendu WAV réel, lisible et téléchargeable */
+   423→   423→      async function musicFlow(sessionId: string, prompt: string, opts: SendOptions) {
+   424→   424→        const session = get().sessions.find((s) => s.id === sessionId)
+   425→   425→        if (!session) return
+   426→   426→        const provider = session.models.audio
+   427→   427→        const assistantId = uid()
+   428→   428→        addMessage(sessionId, {
+   429→   429→          id: assistantId,
+   430→   430→          role: 'assistant',
+   431→   431→          content: '🎼 Composition en cours… analyse du prompt, choix du style…',
+   432→   432→          createdAt: Date.now(),
+   433→   433→          pending: true,
+   434→   434→          flow: 'audio-music',
+   435→   435→          provider,
+   436→   436→        })
+   437→   437→        try {
+   438→   438→          later(sessionId, 500, () =>
+   439→   439→            updateMessage(sessionId, assistantId, {
+   440→   440→              content: '🎼 Style, tempo et tonalité choisis — enregistrement des pistes (nappes, basse, mélodie, batterie)…',
+   441→   441→            }),
+   442→   442→          )
+   443→   443→          const res = await generateMusic({
+   444→   444→            prompt,
+   445→   445→            style: opts.musicStyle ?? 'auto',
+   446→   446→            durationSec: opts.musicDuration ?? 24,
+   447→   447→            instrumental: opts.instrumental ?? false,
+   448→   448→          })
+   449→   449→          const artifact: Artifact = {
+   450→   450→            id: uid(),
+   451→   451→            kind: 'audio',
+   452→   452→            name: `${res.title.replace(/[^\wÀ-ÿ]+/g, '_')}.wav`,
+   453→   453→            mimeType: 'audio/wav',
+   454→   454→            createdAt: Date.now(),
+   455→   455→            provider,
+   456→   456→            prompt,
+   457→   457→            data: res.wavBase64,
+   458→   458→            bytes: res.bytes,
+   459→   459→            meta: {
+   460→   460→              music: true,
+   461→   461→              style: res.meta.style,
+   462→   462→              bpm: res.meta.bpm,
+   463→   463→              key: res.meta.key,
+   464→   464→              durationSec: res.meta.durationSec,
+   465→   465→              instrumental: opts.instrumental ?? false,
+   466→   466→            },
+   467→   467→          }
+   468→   468→          void putArtifactData(artifact.id, artifact.data!)
+   469→   469→          updateMessage(sessionId, assistantId, {
+   470→   470→            content:
+   471→   471→              `Voici **« ${res.title} »** — ${res.meta.style}, ${res.meta.bpm} BPM, ${res.meta.key} (${res.meta.durationSec} s).\n\n` +
+   472→   472→              `▶ Écoutez la piste ci-dessous et téléchargez-la en WAV. Dites-moi si vous voulez une variation : plus rapide, plus sombre, autre style, autre durée…`,
+   473→   473→            pending: false,
+   474→   474→            artifacts: [artifact],
+   475→   475→          })
+   476→   476→        } catch (e) {
+   477→   477→          updateMessage(sessionId, assistantId, {
+   478→   478→            content: '',
+   479→   479→            pending: false,
+   480→   480→            error: `La génération musicale a échoué : ${e instanceof Error ? e.message : 'erreur inconnue'}`,
+   481→   481→          })
+   482→   482→        }
+   483→   483→      }
+   484→   484→
+   485→   485→      /* ---------- état ---------- */
+   486→   486→      return {
+   487→   487→        view: 'hub',
+   488→   488→        sessions: [],
+   489→   489→        activeId: null,
+   490→   490→        hfModels: [],
+   491→   491→        editingMsg: null,
+   492→   492→
+   493→   493→        openHub: () => set({ view: 'hub' }),
+   494→   494→        openSession: (id) => set({ view: 'chat', activeId: id }),
+   495→   495→
+   496→   496→        startSession: (mode, brief) => {
+   497→   497→          const id = uid()
+   498→   498→          const now = Date.now()
+   499→   499→          const session: Session = {
+   500→   500→            id,
+   501→   501→            title: brief?.title?.trim() || `Nouvelle session ${mode === 'free' ? 'libre' : mode === 'book' ? 'Livre' : mode}`,
+   502→   502→            mode,
+   503→   503→            brief,
+   504→   504→            messages: [],
+   505→   505→            models: { ...DEFAULT_MODELS },
+   506→   506→            createdAt: now,
+   507→   507→            updatedAt: now,
+   508→   508→            exports: [],
+   509→   509→          }
+   510→   510→          set((st) => ({
+   511→   511→            sessions: [session, ...st.sessions].slice(0, 40),
+   512→   512→            activeId: id,
+   513→   513→            view: 'chat',
+   514→   514→          }))
+   515→   515→          return id
+   516→   516→        },
+   517→   517→
+   518→   518→        deleteSession: (id) => {
+   519→   519→          const s = get().sessions.find((x) => x.id === id)
+   520→   520→          s?.messages.forEach((m) => m.artifacts?.forEach((a) => void deleteArtifactData(a.id)))
+   521→   521→          set((st) => ({
+   522→   522→            sessions: st.sessions.filter((x) => x.id !== id),
+   523→   523→            activeId: st.activeId === id ? null : st.activeId,
+   524→   524→            view: st.activeId === id ? 'hub' : st.view,
+   525→   525→          }))
+   526→   526→        },
+   527→   527→
+   528→   528→        togglePin: (id) =>
+   529→   529→          updateSession(id, (s) => ({ ...s, pinned: !s.pinned })),
+   530→   530→
+   531→   531→        renameSession: (id, title) =>
+   532→   532→          updateSession(id, (s) => ({ ...s, title: title.trim() || s.title })),
+   533→   533→
+   534→   534→        setSessionMode: (id, mode) => updateSession(id, (s) => ({ ...s, mode })),
+   535→   535→
+   536→   536→        setSessionModel: (id, kind, providerId) =>
+   537→   537→          updateSession(id, (s) => ({ ...s, models: { ...s.models, [kind]: providerId } })),
+   538→   538→
+   539→   539→        sendMessage: async (sessionId, text, opts = {}) => {
+   540→   540→          const trimmed = text.trim()
+   541→   541→          const attachments = opts.attachments
+   542→   542→          if (!trimmed && !opts.file && !attachments?.length) return
+   543→   543→          const session = get().sessions.find((s) => s.id === sessionId)
+   544→   544→          if (!session) return
+   545→   545→
+   546→   546→          const isFirstUser =
+   547→   547→            session.messages.filter((m) => m.role === 'user').length === 0
+   548→   548→          addMessage(sessionId, {
+   549→   549→            id: uid(),
+   550→   550→            role: 'user',
+   551→   551→            content: trimmed || (opts.file ? `Transcrire « ${opts.file.name} »` : attachments?.[0]?.name || ''),
+   552→   552→            createdAt: Date.now(),
+   553→   553→            attachments: attachments?.length ? attachments : undefined,
+   554→   554→          })
+   555→   555→          if (isFirstUser) {
+   556→   556→            updateSession(sessionId, (s) => ({ ...s, title: truncate(trimmed || opts.file?.name || 'Session', 42) }))
+   557→   557→          }
+   558→   558→
+   559→   559→          const history = get().sessions.find((s) => s.id === sessionId)!.messages
+   560→   560→
+   561→   561→          if (session.mode === 'image') await imageFlow(sessionId, trimmed, opts)
+   562→   562→          else if (session.mode === 'video') await videoFlow(sessionId, trimmed, opts)
+   563→   563→          else if (session.mode === 'audio') {
+   564→   564→            if (opts.audioTab === 'music') await musicFlow(sessionId, trimmed, opts)
+   565→   565→            else await audioFlow(sessionId, trimmed, opts)
+   566→   566→          } else await chatFlow(sessionId, history)
+   567→   567→        },
+   568→   568→
+   569→   569→        editMessage: async (sessionId, msgId, newText, attachments) => {
+   570→   570→          const session = get().sessions.find((s) => s.id === sessionId)
+   571→   571→          if (!session) return
+   572→   572→          const idx = session.messages.findIndex((m) => m.id === msgId)
+   573→   573→          if (idx < 0) return
+   574→   574→          // Purger les artefacts des messages qui seront régénérés
+   575→   575→          session.messages.slice(idx + 1).forEach((m) =>
+   576→   576→            m.artifacts?.forEach((a) => void deleteArtifactData(a.id)),
+   577→   577→          )
+   578→   578→          const edited: Message = {
+   579→   579→            ...session.messages[idx],
+   580→   580→            content: newText.trim(),
+   581→   581→            attachments: attachments?.length ? attachments : undefined,
+   582→   582→            createdAt: Date.now(),
+   583→   583→          }
+   584→   584→          const kept = session.messages.slice(0, idx)
+   585→   585→          updateSession(sessionId, (s) => ({ ...s, messages: [...kept, edited], updatedAt: Date.now() }))
+   586→   586→
+   587→   587→          const mode = session.mode
+   588→   588→          const opts: SendOptions = { attachments }
+   589→   589→          if (mode === 'image') await imageFlow(sessionId, edited.content, opts)
+   590→   590→          else if (mode === 'video') await videoFlow(sessionId, edited.content, opts)
+   591→   591→          else if (mode === 'audio') await audioFlow(sessionId, edited.content, { ...opts, audioTab: 'voice' })
+   592→   592→          else await chatFlow(sessionId, [...kept, edited])
+   593→   593→        },
+   594→   594→
+   595→   595→        retryWithProvider: async (sessionId, provider, hfModel) => {
+   596→   596→          const session = get().sessions.find((s) => s.id === sessionId)
+   597→   597→          if (!session) return
+   598→   598→          const lastAssistantIdx = session.messages.map((m) => m.role).lastIndexOf('assistant')
+   599→   599→          if (lastAssistantIdx >= 0) {
+   600→   600→            const removed = session.messages[lastAssistantIdx]
+   601→   601→            removed.artifacts?.forEach((a) => void deleteArtifactData(a.id))
+   602→   602→            updateSession(sessionId, (s) => ({
+   603→   603→              ...s,
+   604→   604→              messages: s.messages.filter((_, i) => i !== lastAssistantIdx),
+   605→   605→            }))
+   606→   606→          }
+   607→   607→          const fresh = get().sessions.find((s) => s.id === sessionId)!
+   608→   608→          await chatFlow(sessionId, fresh.messages, { provider, hfModel })
+   609→   609→        },
+   610→   610→
+   611→   611→        stopGeneration: (sessionId) => {
+   612→   612→          const timers = sessionTimers.get(sessionId)
+   613→   613→          if (timers) {
+   614→   614→            timers.forEach((t) => clearTimeout(t))
+   615→   615→            sessionTimers.delete(sessionId)
+   616→   616→          }
+   617→   617→          const session = get().sessions.find((s) => s.id === sessionId)
+   618→   618→          const pendingMsg = session?.messages.find((m) => m.pending)
+   619→   619→          if (pendingMsg) {
+   620→   620→            const entry = Array.from(streams.entries()).find(([, v]) => v.sessionId === sessionId)
+   621→   621→            if (entry) {
+   622→   622→              clearInterval(entry[1].timer)
+   623→   623→              streams.delete(entry[0])
+   624→   624→            }
+   625→   625→            updateMessage(sessionId, pendingMsg.id, {
+   626→   626→              pending: false,
+   627→   627→              stopped: true,
+   628→   628→              content: pendingMsg.content || 'Génération interrompue.',
+   629→   629→            })
+   630→   630→          }
+   631→   631→        },
+   632→   632→
+   633→   633→        regenerateLast: async (sessionId) => {
+   634→   634→          const session = get().sessions.find((s) => s.id === sessionId)
+   635→   635→          if (!session) return
+   636→   636→          const lastAssistantIdx = session.messages.map((m) => m.role).lastIndexOf('assistant')
+   637→   637→          if (lastAssistantIdx < 0) return
+   638→   638→          const lastUser = session.messages
+   639→   639→            .slice(0, lastAssistantIdx)
+   640→   640→            .reverse()
+   641→   641→            .find((m) => m.role === 'user')
+   642→   642→          if (!lastUser) return
+   643→   643→          const removed = session.messages[lastAssistantIdx]
+   644→   644→          removed.artifacts?.forEach((a) => void deleteArtifactData(a.id))
+   645→   645→          updateSession(sessionId, (s) => ({
+   646→   646→            ...s,
+   647→   647→            messages: s.messages.filter((_, i) => i !== lastAssistantIdx),
+   648→   648→          }))
+   649→   649→          const mode = session.mode
+   650→   650→          if (mode === 'image') {
+   651→   651→            const size = (removed.artifacts?.[0]?.meta?.size as string) ?? '1024x1024'
+   652→   652→            const variations = (removed.artifacts?.length ?? 1) > 1 ? 4 : 1
+   653→   653→            await imageFlow(sessionId, lastUser.content, { imageSize: size, variations, attachments: lastUser.attachments })
+   654→   654→          } else if (mode === 'video') {
+   655→   655→            await videoFlow(sessionId, lastUser.content, { attachments: lastUser.attachments })
+   656→   656→          } else if (mode === 'audio') {
+   657→   657→            if (removed.flow === 'audio-music') {
+   658→   658→              await musicFlow(sessionId, lastUser.content, { audioTab: 'music', attachments: lastUser.attachments })
+   659→   659→            } else {
+   660→   660→              await audioFlow(sessionId, lastUser.content, {
+   661→   661→                audioTab: removed.flow === 'audio-transcript' ? 'transcript' : 'voice',
+   662→   662→                attachments: lastUser.attachments,
+   663→   663→              })
+   664→   664→            }
+   665→   665→          } else {
+   666→   666→            await chatFlow(sessionId, session.messages.slice(0, lastAssistantIdx))
+   667→   667→          }
+   668→   668→        },
+   669→   669→
+   670→   670→        generateBible: async (sessionId, brief) => {
+   671→   671→          const assistantId = uid()
+   672→   672→          addMessage(sessionId, {
+   673→   673→            id: assistantId,
+   674→   674→            role: 'assistant',
+   675→   675→            content: '',
+   676→   676→            createdAt: Date.now(),
+   677→   677→            pending: true,
+   678→   678→            flow: 'chat',
+   679→   679→            provider: 'lumo-core',
+   680→   680→          })
+   681→   681→          try {
+   682→   682→            const full = await apiChat(
+   683→   683→              [{ role: 'user', content: 'Voici mon brief. Rédige la Bible de l’œuvre.\n\n' + JSON.stringify(brief, null, 2) }],
+   684→   684→              BIBLE_SYSTEM,
+   685→   685→            )
+   686→   686→            const revealed = await revealStream(sessionId, assistantId, full)
+   687→   687→            const artifact: Artifact = {
+   688→   688→              id: uid(),
+   689→   689→              kind: 'bible',
+   690→   690→              name: 'bible_de_l_oeuvre.md',
+   691→   691→              mimeType: 'text/markdown',
+   692→   692→              createdAt: Date.now(),
+   693→   693→              provider: 'lumo-core',
+   694→   694→              text: revealed,
+   695→   695→            }
+   696→   696→            updateMessage(sessionId, assistantId, { artifacts: [artifact] })
+   697→   697→          } catch (e) {
+   698→   698→            const err = e as Error & { fallback?: string[] }
+   699→   699→            updateMessage(sessionId, assistantId, {
+   700→   700→              pending: false,
+   701→   701→              error: err.message,
+   702→   702→              fallback: err.fallback ?? ['mistral', 'agnes', 'hf'],
+   703→   703→            })
+   704→   704→          }
+   705→   705→        },
+   706→   706→
+   707→   707→        addHfModel: (model) =>
+   708→   708→          set((st) => ({
+   709→   709→            hfModels: st.hfModels.some((m) => m.id === model.id)
+   710→   710→              ? st.hfModels
+   711→   711→              : [model, ...st.hfModels],
+   712→   712→          })),
+   713→   713→
+   714→   714→        removeHfModel: (id) =>
+   715→   715→          set((st) => ({ hfModels: st.hfModels.filter((m) => m.id !== id) })),
+   716→   716→
+   717→   717→        recordExport: (sessionId, record) =>
+   718→   718→          updateSession(sessionId, (s) => ({
+   719→   719→            ...s,
+   720→   720→            savedToProject: s.savedToProject || record.keptInProject,
+   721→   721→            exports: [...s.exports, record],
+   722→   722→          })),
+   723→   723→
+   724→   724→        updateSession,
+   725→   725→        updateMessage,
+   726→   726→        setEditingMsg: (v) => set({ editingMsg: v }),
+   727→   727→      }
+   728→   728→    },
+   729→   729→    {
+   730→   730→      name: 'lumo-store-v1',
+   731→   731→      version: 2,
+   732→   732→      migrate: (state) => state as LumoState,
+   733→   733→      partialize: (state) => ({
+   734→   734→        sessions: state.sessions.map((s) => ({
+   735→   735→          ...s,
+   736→   736→          messages: s.messages
+   737→   737→            .filter((m) => !m.pending)
+   738→   738→            .map((m) => ({
+   739→   739→              ...m,
+   740→   740→              attachments: m.attachments?.map((a) => ({ ...a, text: a.text ? a.text.slice(0, 4000) : undefined })),
+   741→   741→              artifacts: m.artifacts?.map((a) => ({ ...a, data: undefined })),
+   742→   742→            })),
+   743→   743→        })),
+   744→   744→        hfModels: state.hfModels,
+   745→   745→      }),
+   746→   746→    },
+   747→   747→  ),
+   748→   748→)
+   749→   749→

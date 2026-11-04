@@ -20,6 +20,7 @@ import {
   FileAudio,
   FileText,
   FileUp,
+  LayoutDashboard,
   Loader2,
   Mic,
   Music,
@@ -30,6 +31,7 @@ import {
   Wand2,
   X,
 } from 'lucide-react'
+import { WEB_FRAMEWORKS, type WebFramework } from '@/lib/lumo/types'
 
 const RATIOS = [
   { value: '1024x1024', label: 'Carré 1:1' },
@@ -66,6 +68,8 @@ const PLACEHOLDERS: Record<Session['mode'], string> = {
   audio: 'Texte à transformer en voix…',
   book: 'Que dois écrire Lumo ? (chapitre, scène, dialogue…)',
   project: 'Décrivez votre livrable, Lumo le décompose…',
+  webdev: 'Décrivez le site ou l’app web à coder… (ex. : « la vitrine d’un fleuriste avec galerie et contact »)',
+  appdesign: 'Décrivez l’application à concevoir… (ex. : « une app de réservation de coach sportif »)',
 }
 
 const TEXT_EXT = /\.(txt|md|markdown|csv|json|ts|tsx?|jsx?|py|html?|css|xml|ya?ml|log|sql|rs|go|java|c|cpp|sh|ini|toml)$/i
@@ -231,6 +235,7 @@ function Composer({
   const [duration, setDuration] = useState('8 s')
   const [musicStyle, setMusicStyle] = useState('auto')
   const [musicDuration, setMusicDuration] = useState('24')
+  const [framework, setFramework] = useState<WebFramework>('html')
   const [micActive, setMicActive] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
   const taRef = useRef<HTMLTextAreaElement>(null)
@@ -266,6 +271,7 @@ function Composer({
       attachments: attachments.length ? attachments : undefined,
       musicStyle,
       musicDuration: Number(musicDuration),
+      framework,
     }
     setText('')
     setAttachments([])
@@ -350,6 +356,8 @@ function Composer({
   const isImage = mode === 'image'
   const isVideo = mode === 'video'
   const isMusic = mode === 'audio' && audioTab === 'music'
+  const isWebdev = mode === 'webdev'
+  const isAppDesign = mode === 'appdesign'
   const placeholder = isEditing
     ? 'Modifiez votre message…'
     : isMusic
@@ -398,6 +406,26 @@ function Composer({
 
           <div className="flex shrink-0 items-center gap-1.5">
             {attachButton}
+            {isWebdev && (
+              <Select value={framework} onValueChange={(v) => setFramework(v as WebFramework)}>
+                <SelectTrigger size="sm" className="h-9 w-[7.5rem] text-xs" aria-label="Framework de développement">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {WEB_FRAMEWORKS.map((f) => (
+                    <SelectItem key={f.value} value={f.value} className="text-xs">
+                      {f.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+            {isAppDesign && (
+              <span className="hidden items-center gap-1 rounded-full bg-primary/10 px-2.5 py-1 text-[11px] font-medium text-primary sm:inline-flex">
+                <LayoutDashboard className="h-3 w-3" aria-hidden="true" />
+                Studio WYSIWYG à chaque réponse
+              </span>
+            )}
             {isImage && (
               <>
                 <Select value={ratio} onValueChange={setRatio}>

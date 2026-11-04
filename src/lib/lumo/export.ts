@@ -57,9 +57,31 @@ function artifactFolder(kind: Artifact['kind']): string {
       return 'artifacts/audio'
     case 'video':
       return 'artifacts/video'
+    case 'webcode':
+      return 'artifacts/web'
+    case 'design':
+      return 'artifacts/design'
     default:
       return 'artifacts/text'
   }
+}
+
+function mimeFor(name: string): string {
+  const ext = name.split('.').pop()?.toLowerCase() ?? ''
+  const map: Record<string, string> = {
+    html: 'text/html; charset=utf-8',
+    css: 'text/css; charset=utf-8',
+    js: 'text/javascript; charset=utf-8',
+    mjs: 'text/javascript; charset=utf-8',
+    ts: 'text/plain; charset=utf-8',
+    tsx: 'text/plain; charset=utf-8',
+    jsx: 'text/plain; charset=utf-8',
+    json: 'application/json',
+    php: 'application/x-httpd-php',
+    dart: 'text/plain; charset=utf-8',
+    md: 'text/markdown; charset=utf-8',
+  }
+  return map[ext] ?? 'text/plain; charset=utf-8'
 }
 
 function artifactExtension(a: Artifact): string {
@@ -158,6 +180,14 @@ export async function buildExportZip(session: Session): Promise<ExportResult> {
   // 2. Artefacts
   const allArtifacts = messages.flatMap((m) => m.artifacts ?? [])
   for (const a of allArtifacts) {
+    if (a.kind === 'webcode' && a.files?.length) {
+      // Projet web : chaque fichier de code est exporté tel quel
+      for (const f of a.files) {
+        const safeName = f.name.replace(/[^\w.+-]/g, '_')
+        await addTextFile(`artifacts/web/${a.id}/${safeName}`, f.content, mimeFor(f.name))
+      }
+      continue
+    }
     const path = `${artifactFolder(a.kind)}/${a.id}.${artifactExtension(a)}`
     if (a.kind === 'image' || (a.kind === 'audio' && !a.demo)) {
       const data = a.data ?? (await getArtifactData(a.id))
@@ -169,7 +199,7 @@ export async function buildExportZip(session: Session): Promise<ExportResult> {
         (a.demo
           ? `# ${a.name}\n\nArtefact de démonstration Lumo (${a.kind}).\nBranchez le fournisseur « ${a.provider} » pour un rendu réel.`
           : '')
-      await addTextFile(path, text)
+      await addTextFile(path, text, a.kind === 'design' ? 'application/json' : 'text/markdown; charset=utf-8')
     }
   }
   if (missing.length) {

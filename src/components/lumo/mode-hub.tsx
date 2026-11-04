@@ -31,9 +31,11 @@ import { MODE_INFO, type Mode } from '@/lib/lumo/types'
 const CARD_MODES: { mode: Mode; featured?: boolean }[] = [
   { mode: 'text' },
   { mode: 'image' },
+  { mode: 'webdev' },
+  { mode: 'appdesign', featured: true },
   { mode: 'video' },
   { mode: 'audio' },
-  { mode: 'book', featured: true },
+  { mode: 'book' },
   { mode: 'project' },
   { mode: 'free' },
 ]

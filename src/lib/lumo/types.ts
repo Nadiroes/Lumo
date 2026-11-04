@@ -1,8 +1,46 @@
 /** Types du noyau Lumo */
 
-export type Mode = 'text' | 'image' | 'video' | 'audio' | 'book' | 'project' | 'free'
+export type Mode =
+  | 'text'
+  | 'image'
+  | 'video'
+  | 'audio'
+  | 'book'
+  | 'project'
+  | 'free'
+  | 'webdev'
+  | 'appdesign'
 
-export type ArtifactKind = 'image' | 'audio' | 'video' | 'text' | 'bible' | 'plan' | 'transcript'
+export type ArtifactKind =
+  | 'image'
+  | 'audio'
+  | 'video'
+  | 'text'
+  | 'bible'
+  | 'plan'
+  | 'transcript'
+  | 'webcode'
+  | 'design'
+
+/** Frameworks du mode Dev Web */
+export type WebFramework = 'html' | 'javascript' | 'typescript' | 'react' | 'next' | 'php'
+
+export const WEB_FRAMEWORKS: { value: WebFramework; label: string }[] = [
+  { value: 'html', label: 'HTML + CSS' },
+  { value: 'javascript', label: 'JavaScript' },
+  { value: 'typescript', label: 'TypeScript' },
+  { value: 'react', label: 'React' },
+  { value: 'next', label: 'Next.js' },
+  { value: 'php', label: 'PHP' },
+]
+
+/** Frameworks d’export du mode App Design */
+export type AppFramework = WebFramework | 'flutterflow'
+
+export const APP_FRAMEWORKS: { value: AppFramework; label: string }[] = [
+  ...WEB_FRAMEWORKS,
+  { value: 'flutterflow', label: 'FlutterFlow (Flutter)' },
+]
 
 export interface Artifact {
   id: string
@@ -20,9 +58,26 @@ export interface Artifact {
   /** Artefact de démonstration (vidéo/audio simulés) */
   demo?: boolean
   meta?: Record<string, string | number | boolean>
+  /** Fichiers de code (artefact webcode) — sérialisés dans meta.files */
+  files?: CodeFile[]
 }
 
-export type MessageFlow = 'chat' | 'image' | 'video' | 'audio-voice' | 'audio-transcript' | 'audio-music'
+export type MessageFlow =
+  | 'chat'
+  | 'image'
+  | 'video'
+  | 'audio-voice'
+  | 'audio-transcript'
+  | 'audio-music'
+  | 'webdev'
+  | 'appdesign'
+
+/** Fichier de code généré (mode Dev Web ou App Design) */
+export interface CodeFile {
+  name: string
+  lang: string
+  content: string
+}
 
 /** Pièce jointe d’un message (texte lisible, ou simple référence) */
 export interface Attachment {
@@ -112,6 +167,20 @@ export interface ModeInfo {
 }
 
 export const MODE_INFO: Record<Mode, ModeInfo> = {
+  webdev: {
+    label: 'Dev Web',
+    tagline: 'Sites et apps web, en vrai code',
+    description:
+      'Générez un site ou une app web complète : HTML, CSS, JavaScript, TypeScript, React, Next.js ou PHP — avec aperçu live et code exportable.',
+    capability: 'text',
+  },
+  appdesign: {
+    label: 'App Design',
+    tagline: 'Studio WYSIWYG, de l’écran au code',
+    description:
+      'Concevez votre application visuellement avec l’assistant de conception pas à pas, puis exportez le code : React, HTML, PHP ou FlutterFlow.',
+    capability: 'text',
+  },
   text: {
     label: 'Texte',
     tagline: 'Rédiger, analyser, coder, réfléchir',

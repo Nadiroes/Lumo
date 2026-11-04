@@ -33,7 +33,9 @@ import {
   apiListKeys,
 } from '@/lib/lumo/api'
 import { ArtifactViewDialog, AudioCard, ImageTile, TextFileCard, VideoCard } from '@/components/lumo/artifacts'
+import { DesignCard, DesignStudioDialog } from '@/components/lumo/app-studio'
 import { LumoMark } from '@/components/lumo/logo'
+import { CodePreviewDialog, WebCodeCard } from '@/components/lumo/web-preview'
 import { useLumo } from '@/lib/lumo/store'
 import { MODE_INFO, type Artifact, type Message, type Session } from '@/lib/lumo/types'
 
@@ -75,6 +77,18 @@ const SUGGESTIONS: Record<string, string[]> = {
     'Présente-toi et montre-moi ce que tu sais faire',
     'Écris un haïku puis illustre-le',
     'Aide-moi à brainstormer une campagne visuelle',
+  ],
+  webdev: [
+    'Crée la page d’accueil d’une boulangerie artisanale en HTML + CSS, responsive',
+    'Un tableau de bord météo en JavaScript vanilla avec graphiques',
+    'Une landing page SaaS en React, moderne et responsive',
+    'Un mini blog en PHP avec liste d’articles et formulaire de contact',
+  ],
+  appdesign: [
+    'Conçois une app de réservation de coach sportif',
+    'Maquette d’une app bancaire minimaliste, palette sombre',
+    'Une app de recettes avec écran d’accueil, détail et favoris',
+    'Conçois une app de livraison de repas colorée et joueuse',
   ],
 }
 
@@ -119,6 +133,8 @@ function ArtifactGrid({
       {others.map((a) => {
         if (a.kind === 'audio') return <AudioCard key={a.id} a={a} />
         if (a.kind === 'video') return <VideoCard key={a.id} a={a} />
+        if (a.kind === 'webcode') return <WebCodeCard key={a.id} a={a} onOpen={() => onOpen(a)} />
+        if (a.kind === 'design') return <DesignCard key={a.id} a={a} onOpen={() => onOpen(a)} />
         return <TextFileCard key={a.id} a={a} onOpen={() => onOpen(a)} />
       })}
     </div>
@@ -371,6 +387,18 @@ function AssistantMessage({
   const regenerateLast = useLumo((s) => s.regenerateLast)
   const [vote, setVote] = useState<'up' | 'down' | null>(null)
   const streaming = m.pending && m.flow === 'chat'
+  const isImageError = !!m.error && m.flow === 'image'
+  const [retrying, setRetrying] = useState(false)
+
+  async function retryImage() {
+    if (retrying) return
+    setRetrying(true)
+    try {
+      await regenerateLast(session.id)
+    } finally {
+      setRetrying(false)
+    }
+  }
 
   async function feedback(verdict: 'up' | 'down') {
     setVote(verdict)
@@ -423,9 +451,21 @@ function AssistantMessage({
           )}
           <ArtifactGrid artifacts={m.artifacts ?? []} flow={m.flow} pending={m.pending} onOpen={onOpenArtifact} />
           {m.error && (
-            <p className="mt-2 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            <div className="mt-2 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
               {m.error}
-            </p>
+              {isImageError && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="mt-2 h-7 gap-1 border-destructive/40 text-xs text-destructive hover:bg-destructive/10"
+                  onClick={() => void retryImage()}
+                  disabled={retrying}
+                >
+                  <RefreshCw className={`h-3 w-3 ${retrying ? 'animate-spin' : ''}`} />
+                  {retrying ? 'Nouvelle tentative…' : 'Réessayer la génération'}
+                </Button>
+              )}
+            </div>
           )}
           {m.error && m.fallback && m.fallback.length > 0 && <FallbackCard session={session} m={m} />}
         </div>
@@ -494,6 +534,8 @@ export function ChatMessages({ session }: { session: Session }) {
   const [viewing, setViewing] = useState<Artifact | null>(null)
   const sendMessage = useLumo((s) => s.sendMessage)
   const editingMsg = useLumo((s) => s.editingMsg)
+  const isWebcodeView = viewing?.kind === 'webcode'
+  const isDesignView = viewing?.kind === 'design'
 
   const contentLength = useMemo(
     () => messages.reduce((n, m) => n + m.content.length, 0),
@@ -578,7 +620,13 @@ export function ChatMessages({ session }: { session: Session }) {
           )}
         </div>
       </div>
-      <ArtifactViewDialog artifact={viewing} open={!!viewing} onOpenChange={(v) => !v && setViewing(null)} />
+      <CodePreviewDialog artifact={viewing} open={!!viewing && isWebcodeView} onOpenChange={(v) => !v && setViewing(null)} />
+      <DesignStudioDialog artifact={viewing} open={!!viewing && isDesignView} onOpenChange={(v) => !v && setViewing(null)} />
+      <ArtifactViewDialog
+        artifact={viewing}
+        open={!!viewing && !isWebcodeView && !isDesignView}
+        onOpenChange={(v) => !v && setViewing(null)}
+      />
     </>
   )
 }

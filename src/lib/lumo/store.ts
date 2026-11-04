@@ -6,6 +6,7 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { apiChat, apiImage, type ChatOverride } from './api'
 import { deleteArtifactData, putArtifactData } from './artifact-store'
+import { extractDesignDoc, parseCodeBlocks } from './codegen'
 import { generateMusic } from './music'
 import { DEFAULT_MODELS } from './providers'
 import type {
@@ -18,6 +19,7 @@ import type {
   Mode,
   ModelSelection,
   Session,
+  WebFramework,
 } from './types'
 
 const LUMO_SYSTEM =
@@ -32,6 +34,73 @@ const PROJECT_SYSTEM =
   LUMO_SYSTEM +
   '\n\nContexte : mode « Projet ». Tu es chef de projet créatif : décompose la demande en phases, ' +
   'jalons, livrables et artefacts (texte, image, audio, vidéo) avec des durées estimées. Termine par une section « Prochaine action ».'
+
+/* ---------------- Mode Dev Web ---------------- */
+
+const WEBDEV_NOTES: Record<WebFramework, string> = {
+  html: 'HTML sémantique complet (index.html) + styles.css (CSS moderne : variables, flex/grid) + app.js si des interactions sont utiles.',
+  javascript: 'JavaScript vanilla ES6+ dans app.js, index.html et styles.css. Aucun build, aucun framework.',
+  typescript:
+    'TypeScript strict et typé dans app.ts (interfaces, types explicites), index.html et styles.css. Garde un TS exécutable tel quel dans un projet TS.',
+  react:
+    'Composants React fonctionnels avec hooks. Pour un aperçu direct possible, fournis aussi un index.html qui charge React 18 UMD + Babel Standalone via CDN (unpkg) et monte <App />. Sinon App.jsx + composants séparés.',
+  next: 'Structure Next.js App Router complète : app/layout.tsx, app/page.tsx, composants dans app/components/, TypeScript + Tailwind CSS. Indique les commandes npm en commentaire.',
+  php: 'PHP 8 moderne : index.php (logique + htmlspecialchars contre XSS), traitement POST/GET, si formulaire : validation serveur. HTML/CSS responsive embarqué ou styles.css.',
+}
+
+function webDevSystem(framework: WebFramework): string {
+  return (
+    'Tu es Lumo Dev, ingénieur web senior. Génère un site/app web COMPLET, MODERNE et 100% RESPONSIVE ' +
+    '(mobile-first) pour la demande de l’utilisateur.\n\n' +
+    'FORMAT DE RÉPONSE (obligatoire) :\n' +
+    '1. Deux ou trois phrases de présentation de tes choix (pas plus).\n' +
+    '2. Ensuite UNIQUEMENT des blocs de code annotés du nom de fichier, un bloc par fichier :\n' +
+    '```html:index.html\n…\n```\n```css:styles.css\n…\n```\n```js:app.js\n…\n```\n\n' +
+    'SPÉCIFICATIONS :\n' +
+    '- Police Poppins (Google Fonts), palette chaleureuse cohérente, coins arrondis, ombres douces.\n' +
+    '- Responsive : media queries / flex / grid — rien ne doit déborder sur mobile (390px) comme sur desktop.\n' +
+    '- Accessibilité : contrastes, aria-labels, focus visibles, navigation clavier.\n' +
+    '- Contenu réaliste en français (jamais de lorem ipsum), pas de TODO.\n' +
+    '- Fichiers autonomes (aucun build requis) sauf CDN si le framework l’exige.\n\n' +
+    `FRAMEWORK IMPOSÉ : ${framework.toUpperCase()} — ${WEBDEV_NOTES[framework]}`
+  )
+}
+
+/* ---------------- Mode App Design ---------------- */
+
+const DESIGN_SYSTEM =
+  'Tu es le directeur de conception de Lumo (mode App Design). À partir de la demande, conçois ' +
+  'l’architecture UI d’une application RESPONSIVE (mobile-first).\n\n' +
+  'Réponds en DEUX parties, dans cet ordre :\n' +
+  '1. Trois à cinq phrases sur tes choix : type d’app, ton, style, palette.\n' +
+  '2. Un UNIQUE bloc ```json contenant EXACTEMENT ce schéma :\n' +
+  '{\n' +
+  '  "appName": "…",\n' +
+  '  "style": "moderne",\n' +
+  '  "palette": { "primary": "#E8930C", "bg": "#FDF9F0", "text": "#2B2118", "card": "#FFFFFF" },\n' +
+  '  "screens": [\n' +
+  '    { "name": "Accueil", "elements": [\n' +
+  '      { "type": "navbar", "props": { "text": "…", "links": "Accueil, Fonctions, Contact" } },\n' +
+  '      { "type": "hero", "props": { "title": "…", "subtitle": "…", "cta": "…" } },\n' +
+  '      { "type": "text", "props": { "text": "…", "size": "md" } }\n' +
+  '    ] }\n' +
+  '  ]\n' +
+  '}\n\n' +
+  'TYPES D’ÉLÉMENTS AUTORISÉS (rien d’autre) : navbar, hero, text, button, input, image, list, card, badge, divider, footer.\n' +
+  'RÈGLES : 2 à 5 écrans, 4 à 10 éléments par écran, textes réalistes en français, palette chaleureuse contrastée (AA), ' +
+  'props toujours en chaînes, aucun commentaire dans le JSON, aucun texte hors des deux parties.'
+
+const DESIGN_REPAIR_SYSTEM =
+  'Tu répares du JSON. On te fournit une réponse qui devait contenir un JSON de conception UI.\n' +
+  'Réponds UNIQUEMENT avec un bloc ```json STRICTEMENT valide, même schéma :\n' +
+  '{ "appName": string, "style": string, "palette": { "primary": "#hex", "bg": "#hex", "text": "#hex", "card": "#hex" },\n' +
+  '  "screens": [ { "name": string, "elements": [ { "type": "navbar"|"hero"|"text"|"button"|"input"|"image"|"list"|"card"|"badge"|"divider"|"footer", "props": { …chaînes } } ] } ] }\n' +
+  'Chaque clé suivie de deux-points, chaque paire séparée par des virgules, aucun commentaire, aucun texte hors du bloc.'
+
+const DESIGN_GUIDE_SYSTEM =
+  LUMO_SYSTEM +
+  '\n\nContexte : mode « App Design ». Tu es l’assistant de conception de Lumo : guide l’utilisateur écran par écran ' +
+  '(structure, palette, composants, accessibilité, responsive) et propose la prochaine étape concrète. Tu ne génères pas de JSON ici.'
 
 const BIBLE_SYSTEM =
   'Tu es directeur littéraire. À partir du brief JSON fourni par l’utilisateur, rédige la « Bible de l’œuvre » ' +
@@ -62,6 +131,7 @@ export interface SendOptions {
   musicStyle?: string
   musicDuration?: number
   instrumental?: boolean
+  framework?: string
 }
 
 interface LumoState {
@@ -482,6 +552,158 @@ export const useLumo = create<LumoState>()(
         }
       }
 
+      /* ---------- mode Dev Web ---------- */
+
+      async function webDevFlow(sessionId: string, prompt: string, opts: SendOptions) {
+        const session = get().sessions.find((s) => s.id === sessionId)
+        if (!session) return
+        const framework = ((opts.framework ?? 'html') as WebFramework) || 'html'
+        const provider = session.models.text
+        const assistantId = uid()
+        addMessage(sessionId, {
+          id: assistantId,
+          role: 'assistant',
+          content: '',
+          createdAt: Date.now(),
+          pending: true,
+          flow: 'webdev',
+          provider,
+        })
+        try {
+          const full = await apiChat(
+            [
+              {
+                role: 'user',
+                content: prompt + attachmentSummary(opts.attachments),
+              },
+            ],
+            webDevSystem(framework),
+          )
+          const files = parseCodeBlocks(full, framework)
+          if (files.length === 0) {
+            throw new Error('Aucun code exploitable dans la réponse — reformulez ou réessayez.')
+          }
+          const intro = full.slice(0, full.indexOf('```')).trim()
+          const artifact: Artifact = {
+            id: uid(),
+            kind: 'webcode',
+            name: `${files.find((f) => f.name.endsWith('.html'))?.name.replace(/\.html$/, '') ?? 'projet'}_${framework}`,
+            mimeType: 'text/plain',
+            createdAt: Date.now(),
+            provider,
+            prompt,
+            files,
+            meta: { framework, fileCount: files.length, previewable: buildPreviewable(files) ? 'oui' : 'non' },
+          }
+          updateMessage(sessionId, assistantId, {
+            content:
+              (intro || `Voici votre projet **${framework}** complet et responsive.`) +
+              `\n\n**${files.length} fichier(s)** généré(s). Ouvrez l’artefact ci-dessous pour l’aperçu live et le téléchargement.`,
+            pending: false,
+            artifacts: [artifact],
+          })
+        } catch (e) {
+          const err = e as Error & { fallback?: string[] }
+          updateMessage(sessionId, assistantId, {
+            pending: false,
+            error: `Génération du code impossible : ${err.message}`,
+            content: '',
+            fallback: err.fallback ?? ['mistral', 'agnes', 'hf'],
+          })
+        }
+      }
+
+      function buildPreviewable(files: NonNullable<Artifact['files']>): boolean {
+        return files.some((f) => f.lang === 'html' || f.name.endsWith('.html'))
+      }
+
+      /* ---------- mode App Design ---------- */
+
+      async function designFlow(sessionId: string, prompt: string, opts: SendOptions) {
+        const session = get().sessions.find((s) => s.id === sessionId)
+        if (!session) return
+        const provider = session.models.text
+        const assistantId = uid()
+        addMessage(sessionId, {
+          id: assistantId,
+          role: 'assistant',
+          content: '',
+          createdAt: Date.now(),
+          pending: true,
+          flow: 'appdesign',
+          provider,
+        })
+        try {
+          const full = await apiChat(
+            [{ role: 'user', content: prompt + attachmentSummary(opts.attachments) }],
+            DESIGN_SYSTEM,
+          )
+          let doc = extractDesignDoc(full)
+
+          // Passe de réparation : le modèle renvoie parfois un JSON mal formé
+          if (!doc) {
+            try {
+              const fixed = await apiChat(
+                [
+                  {
+                    role: 'user',
+                    content:
+                      'Voici la réponse à réparer (garde le même design, corrige la syntaxe) :\n\n' +
+                      full.slice(0, 6000),
+                  },
+                ],
+                DESIGN_REPAIR_SYSTEM,
+              )
+              doc = extractDesignDoc(fixed)
+            } catch {
+              /* réparation impossible → repli texte */
+            }
+          }
+          if (!doc) throw new Error('structure de design illisible')
+
+          const intro = full.replace(/```json[\s\S]*?```/, '').trim()
+          const elCount = doc.screens.reduce((n, s) => n + s.elements.length, 0)
+          const artifact: Artifact = {
+            id: uid(),
+            kind: 'design',
+            name: `design_${doc.appName.toLowerCase().replace(/[^\wà-ÿ]+/g, '_').slice(0, 30)}.json`,
+            mimeType: 'application/json',
+            createdAt: Date.now(),
+            provider,
+            prompt,
+            text: JSON.stringify(doc),
+            meta: { appName: doc.appName, screens: doc.screens.length, elements: elCount },
+          }
+          updateMessage(sessionId, assistantId, {
+            content:
+              (intro || `Voici la maquette de **${doc.appName}**.`) +
+              `\n\n**${doc.screens.length} écran(s)** · ${elCount} éléments · palette ${doc.palette.primary}.\n\n` +
+              `▶ **Ouvrez le studio visuel** (bouton sous ce message ou artefact) pour tout ajuster en WYSIWYG, ` +
+              `parler à l’assistant de conception et exporter le code : React, HTML ou FlutterFlow.`,
+            pending: false,
+            artifacts: [artifact],
+          })
+        } catch {
+          // Repli : réponse guidée en texte quand le JSON n’a pas abouti
+          try {
+            const turns = [{ role: 'user' as const, content: prompt }]
+            const guide = await apiChat(turns, DESIGN_GUIDE_SYSTEM)
+            updateMessage(sessionId, assistantId, {
+              content: guide,
+              pending: false,
+            })
+          } catch (e) {
+            const err = e as Error & { fallback?: string[] }
+            updateMessage(sessionId, assistantId, {
+              pending: false,
+              error: err.message,
+              content: '',
+              fallback: err.fallback ?? ['mistral', 'agnes', 'hf'],
+            })
+          }
+        }
+      }
+
       /* ---------- état ---------- */
       return {
         view: 'hub',
@@ -563,7 +785,9 @@ export const useLumo = create<LumoState>()(
           else if (session.mode === 'audio') {
             if (opts.audioTab === 'music') await musicFlow(sessionId, trimmed, opts)
             else await audioFlow(sessionId, trimmed, opts)
-          } else await chatFlow(sessionId, history)
+          } else if (session.mode === 'webdev') await webDevFlow(sessionId, trimmed, opts)
+          else if (session.mode === 'appdesign') await designFlow(sessionId, trimmed, opts)
+          else await chatFlow(sessionId, history)
         },
 
         editMessage: async (sessionId, msgId, newText, attachments) => {
@@ -589,6 +813,10 @@ export const useLumo = create<LumoState>()(
           if (mode === 'image') await imageFlow(sessionId, edited.content, opts)
           else if (mode === 'video') await videoFlow(sessionId, edited.content, opts)
           else if (mode === 'audio') await audioFlow(sessionId, edited.content, { ...opts, audioTab: 'voice' })
+          else if (mode === 'webdev') {
+            const fw = (session.messages[idx].artifacts?.[0]?.meta?.framework as string) ?? opts.framework ?? 'html'
+            await webDevFlow(sessionId, edited.content, { ...opts, framework: fw })
+          } else if (mode === 'appdesign') await designFlow(sessionId, edited.content, opts)
           else await chatFlow(sessionId, [...kept, edited])
         },
 
@@ -662,6 +890,13 @@ export const useLumo = create<LumoState>()(
                 attachments: lastUser.attachments,
               })
             }
+          } else if (mode === 'webdev') {
+            await webDevFlow(sessionId, lastUser.content, {
+              framework: (removed.artifacts?.[0]?.meta?.framework as string) ?? 'html',
+              attachments: lastUser.attachments,
+            })
+          } else if (mode === 'appdesign') {
+            await designFlow(sessionId, lastUser.content, { attachments: lastUser.attachments })
           } else {
             await chatFlow(sessionId, session.messages.slice(0, lastAssistantIdx))
           }
