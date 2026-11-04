@@ -90,6 +90,8 @@ function artifactExtension(a: Artifact): string {
     case 'image':
       return 'png'
     case 'audio':
+      if (a.mimeType?.includes('mpeg')) return 'mp3'
+      if (a.mimeType?.includes('ogg')) return 'ogg'
       return 'wav'
     case 'video':
       return 'mp4'

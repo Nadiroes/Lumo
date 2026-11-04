@@ -113,6 +113,10 @@ export function AudioCard({ a }: { a: Artifact }) {
   const bpm = a.meta?.bpm ? String(a.meta.bpm) : ''
   const keyName = a.meta?.key ? String(a.meta.key) : ''
   const durationSec = a.meta?.durationSec ? Number(a.meta.durationSec) : 0
+  const engine = a.meta?.engine ? String(a.meta.engine) : ''
+  const lyrics = a.meta?.lyrics ? String(a.meta.lyrics) : ''
+  const isDiffRhythm = engine === 'diffrhythm2'
+  const ext = a.mimeType?.includes('mpeg') ? 'MP3' : a.mimeType?.includes('ogg') ? 'OGG' : 'WAV'
   const { toast } = useToast()
 
   if (src) {
@@ -123,10 +127,18 @@ export function AudioCard({ a }: { a: Artifact }) {
             <AudioLines className="h-4.5 w-4.5" aria-hidden="true" />
           </span>
           <div className="min-w-0 flex-1">
-            <p className="truncate text-xs font-medium">{a.name.replace(/\.wav$/, '')}</p>
+            <p className="truncate text-xs font-medium">{a.name.replace(/\.(wav|mp3|ogg)$/, '')}</p>
             <p className="truncate text-[10px] text-muted-foreground">
               {isMusic
-                ? `piste générée · ${[style, bpm ? `${bpm} BPM` : '', keyName, durationSec ? `${durationSec} s` : ''].filter(Boolean).join(' · ')}`
+                ? [
+                    isDiffRhythm ? '🎤 DiffRhythm 2' : '🎹 Lumo Synth',
+                    style !== 'libre' ? style : '',
+                    bpm ? `${bpm} BPM` : '',
+                    keyName,
+                    durationSec ? `${durationSec} s` : '',
+                  ]
+                    .filter(Boolean)
+                    .join(' · ')
                 : `audio · ${a.provider}`}
             </p>
           </div>
@@ -142,10 +154,30 @@ export function AudioCard({ a }: { a: Artifact }) {
               toast({ title: 'Audio téléchargé', description: a.name })
             }}
           >
-            <Download className="h-3 w-3" /> WAV
+            <Download className="h-3 w-3" /> {ext}
           </Button>
         </div>
         <audio controls src={src} className="h-9 w-full" preload="metadata" aria-label={`Lecture de ${a.name}`} />
+        {lyrics && (
+          <details className="group mt-2 rounded-lg border bg-muted/30">
+            <summary className="cursor-pointer list-none px-3 py-2 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground">
+              📝 Paroles de la chanson
+              <span className="float-right text-[10px] group-open:hidden">afficher ▾</span>
+              <span className="float-right hidden text-[10px] group-open:inline">masquer ▴</span>
+            </summary>
+            <div className="max-h-44 overflow-y-auto whitespace-pre-line px-3 pb-3 text-[11px] leading-relaxed text-foreground/90">
+              {lyrics.split('\n').map((line, i) =>
+                line.trim().startsWith('[') ? (
+                  <p key={i} className="mt-2 font-semibold uppercase tracking-wide text-primary/80">
+                    {line.replace(/[[\]]/g, '')}
+                  </p>
+                ) : (
+                  <p key={i}>{line}</p>
+                ),
+              )}
+            </div>
+          </details>
+        )}
       </div>
     )
   }

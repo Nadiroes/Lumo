@@ -24,6 +24,7 @@ import {
   Loader2,
   Mic,
   Music,
+  Music2,
   Paperclip,
   PencilLine,
   SendHorizontal,
@@ -54,10 +55,10 @@ const MUSIC_STYLES = [
   { value: 'funk', label: 'Funk' },
 ]
 const MUSIC_DURATIONS = [
-  { value: '15', label: '15 s' },
-  { value: '24', label: '24 s' },
-  { value: '30', label: '30 s' },
-  { value: '45', label: '45 s' },
+  { value: '60', label: '~1 min' },
+  { value: '120', label: '~2 min' },
+  { value: '180', label: '~3 min' },
+  { value: '285', label: '~4 min 45' },
 ]
 
 const PLACEHOLDERS: Record<Session['mode'], string> = {
@@ -65,7 +66,7 @@ const PLACEHOLDERS: Record<Session['mode'], string> = {
   free: 'Demandez quelque chose à Lumo… (texte, idées, visuels…)',
   image: 'Décrivez l’image à générer…',
   video: 'Décrivez le clip à produire…',
-  audio: 'Texte à transformer en voix…',
+  audio: 'Décrivez la chanson ou le texte à transformer…',
   book: 'Que dois écrire Lumo ? (chapitre, scène, dialogue…)',
   project: 'Décrivez votre livrable, Lumo le décompose…',
   webdev: 'Décrivez le site ou l’app web à coder… (ex. : « la vitrine d’un fleuriste avec galerie et contact »)',
@@ -257,7 +258,9 @@ function Composer({
   const [voice, setVoice] = useState('Chloé')
   const [duration, setDuration] = useState('8 s')
   const [musicStyle, setMusicStyle] = useState('auto')
-  const [musicDuration, setMusicDuration] = useState('24')
+  const [musicDuration, setMusicDuration] = useState('120')
+  const [musicLyrics, setMusicLyrics] = useState('')
+  const [instrumental, setInstrumental] = useState(false)
   const [framework, setFramework] = useState<WebFramework>('html')
   const [micActive, setMicActive] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
@@ -294,6 +297,8 @@ function Composer({
       attachments: attachments.length ? attachments : undefined,
       musicStyle,
       musicDuration: Number(musicDuration),
+      musicLyrics: musicLyrics.trim() || undefined,
+      instrumental,
       framework,
     }
     setText('')
@@ -384,7 +389,7 @@ function Composer({
   const placeholder = isEditing
     ? 'Modifiez votre message…'
     : isMusic
-      ? 'Décrivez la musique à composer… (ex. : « lo-fi chaleureux au piano, ambiance pluie »)'
+      ? 'Décrivez la chanson à créer… (ex. : « une pop mélancolique sur la fin de l’été »)'
       : PLACEHOLDERS[mode]
 
   return (
@@ -411,6 +416,37 @@ function Composer({
         )}
 
         {attachmentChips}
+
+        {isMusic && (
+          <div className="mb-2 rounded-xl border bg-muted/30 p-2">
+            <div className="mb-1 flex flex-wrap items-center justify-between gap-x-2 gap-y-1 px-1">
+              <label htmlFor="lyrics-input" className="text-[11px] leading-tight text-muted-foreground">
+                Paroles <span className="hidden sm:inline">(optionnel)</span> — vides : Lumo les écrit ·
+                sections <code className="rounded bg-secondary px-1">[verse]</code>
+                /<code className="rounded bg-secondary px-1">[chorus]</code> : utilisées telles quelles
+              </label>
+              <Button
+                variant={instrumental ? 'secondary' : 'ghost'}
+                size="sm"
+                className="h-6 gap-1 px-2 text-[11px]"
+                onClick={() => setInstrumental((v) => !v)}
+                aria-pressed={instrumental}
+                title="Instrumental : synthèse locale sans voix chantée (DiffRhythm 2 chante le texte)"
+              >
+                <Music2 className="h-3 w-3" /> Instrumental
+              </Button>
+            </div>
+            <Textarea
+              id="lyrics-input"
+              value={musicLyrics}
+              onChange={(e) => setMusicLyrics(e.target.value)}
+              placeholder={'[verse]\nUne ligne par phrase…\n[chorus]\nLe refrain inoubliable'}
+              aria-label="Paroles de la chanson (optionnel)"
+              rows={2}
+              className="min-h-14 max-h-32 resize-none border-0 bg-transparent px-2 py-1 text-xs focus-visible:ring-0"
+            />
+          </div>
+        )}
 
         <div className="flex flex-wrap items-end gap-2 rounded-2xl border bg-card p-2 shadow-sm focus-within:border-primary/60">
           <Textarea

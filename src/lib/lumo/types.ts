@@ -220,7 +220,7 @@ export const MODE_INFO: Record<Mode, ModeInfo> = {
   },
   audio: {
     label: 'Audio',
-    tagline: 'Voix, musique, transcription',
+    tagline: 'Voix, chansons DiffRhythm, transcription',
     description: 'Synthèse vocale, génération de musique (façon Suno) et transcription de fichiers audio.',
     capability: 'audio',
   },

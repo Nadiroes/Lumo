@@ -4,7 +4,16 @@
 
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import { apiAsr, apiChat, apiChatStream, apiImage, apiTts, type ChatOverride } from './api'
+import {
+  apiAsr,
+  apiChat,
+  apiChatStream,
+  apiImage,
+  apiMusicStream,
+  apiTts,
+  type ChatOverride,
+  type MusicDoneEvent,
+} from './api'
 import { deleteArtifactData, putArtifactData } from './artifact-store'
 import { extractDesignDoc, parseCodeBlocks, parseOpeningFiles } from './codegen'
 import { generateMusic } from './music'
@@ -132,6 +141,8 @@ export interface SendOptions {
   attachments?: Attachment[]
   musicStyle?: string
   musicDuration?: number
+  /** Paroles fournies par l'utilisateur (v2, texte brut ou timestamps) — vides : Lumo les écrit */
+  musicLyrics?: string
   instrumental?: boolean
   framework?: string
   /** Durée du clip vidéo (ex. « 8 s ») */
@@ -691,72 +702,171 @@ export const useLumo = create<LumoState>()(
         }
       }
 
-      /** Génération musicale locale (façon Suno) — rendu WAV réel, lisible et téléchargeable */
+      /** Studio musical façon Suno — DiffRhythm 2 (Hugging Face) + repli synthèse locale */
       async function musicFlow(sessionId: string, prompt: string, opts: SendOptions) {
         const session = get().sessions.find((s) => s.id === sessionId)
         if (!session) return
         const provider = session.models.audio
         const assistantId = uid()
+        const instrumental = opts.instrumental ?? false
+        const styleLabel = opts.musicStyle === 'auto' || !opts.musicStyle ? 'libre' : opts.musicStyle
+
         addMessage(sessionId, {
           id: assistantId,
           role: 'assistant',
-          content: '🎼 Composition en cours… analyse du prompt, choix du style…',
+          content: instrumental
+            ? '🎹 Mode instrumental — composition par la synthèse locale Lumo…'
+            : '📝 Préparation du studio musical… analyse du thème, choix du style…',
           createdAt: Date.now(),
           pending: true,
           flow: 'audio-music',
           provider,
         })
-        try {
-          later(sessionId, 500, () => {
-            const m = get().sessions.find((s) => s.id === sessionId)?.messages.find((x) => x.id === assistantId)
-            if (m?.pending) {
-              updateMessage(sessionId, assistantId, {
-                content: '🎼 Style, tempo et tonalité choisis — enregistrement des pistes (nappes, basse, mélodie, batterie)…',
-              })
+
+        /** Fin de parcours commun : stocke l'artefact et finalise le message */
+        async function finishWithArtifact(artifact: Artifact, text: string) {
+          if (artifact.data) await putArtifactData(artifact.id, artifact.data)
+          updateMessage(sessionId, assistantId, { content: text, pending: false, artifacts: [artifact] })
+        }
+
+        /** Repli : synthèse locale (aussi utilisée pour l'instrumental) */
+        async function localSynth(intro: string) {
+          try {
+            const res = await generateMusic({
+              prompt,
+              style: opts.musicStyle ?? 'auto',
+              durationSec: opts.musicDuration ?? 24,
+              instrumental,
+            })
+            const artifact: Artifact = {
+              id: uid(),
+              kind: 'audio',
+              name: `${res.title.replace(/[^\wÀ-ÿ]+/g, '_')}.wav`,
+              mimeType: 'audio/wav',
+              createdAt: Date.now(),
+              provider: 'Lumo Synth (local)',
+              prompt,
+              data: res.wavBase64,
+              bytes: res.bytes,
+              meta: {
+                music: true,
+                engine: 'lumo-synth',
+                style: res.meta.style,
+                bpm: res.meta.bpm,
+                key: res.meta.key,
+                durationSec: res.meta.durationSec,
+                instrumental,
+              },
             }
-          })
-          later(sessionId, 1600, () => {
-            const m = get().sessions.find((s) => s.id === sessionId)?.messages.find((x) => x.id === assistantId)
-            if (m?.pending) {
-              updateMessage(sessionId, assistantId, {
-                content: '🎚 Mixage et rendu audio… réverbération, écho, masterisation.',
-              })
-            }
-          })
-          const res = await generateMusic({
-            prompt,
-            style: opts.musicStyle ?? 'auto',
-            durationSec: opts.musicDuration ?? 24,
-            instrumental: opts.instrumental ?? false,
-          })
-          const artifact: Artifact = {
-            id: uid(),
-            kind: 'audio',
-            name: `${res.title.replace(/[^\wÀ-ÿ]+/g, '_')}.wav`,
-            mimeType: 'audio/wav',
-            createdAt: Date.now(),
-            provider,
-            prompt,
-            data: res.wavBase64,
-            bytes: res.bytes,
-            meta: {
-              music: true,
-              style: res.meta.style,
-              bpm: res.meta.bpm,
-              key: res.meta.key,
-              durationSec: res.meta.durationSec,
-              instrumental: opts.instrumental ?? false,
-            },
+            await finishWithArtifact(
+              artifact,
+              `${intro}Voici **« ${res.title} »** — ${res.meta.style}, ${res.meta.bpm} BPM, ${res.meta.key} (${res.meta.durationSec} s), composée par la synthèse locale Lumo 🎹\n\n` +
+                `▶ Écoutez la piste ci-dessous et téléchargez-la en WAV. Pour une vraie chanson chantée, relancez sans le mode instrumental.`,
+            )
+          } catch (e) {
+            updateMessage(sessionId, assistantId, {
+              content: '',
+              pending: false,
+              error: `La génération musicale a échoué : ${e instanceof Error ? e.message : 'erreur inconnue'}`,
+            })
           }
-          await putArtifactData(artifact.id, artifact.data!)
-          updateMessage(sessionId, assistantId, {
-            content:
-              `Voici **« ${res.title} »** — ${res.meta.style}, ${res.meta.bpm} BPM, ${res.meta.key} (${res.meta.durationSec} s).\n\n` +
-              `▶ Écoutez la piste ci-dessous et téléchargez-la en WAV. Dites-moi si vous voulez une variation : plus rapide, plus sombre, autre style, autre durée…`,
-            pending: false,
-            artifacts: [artifact],
-          })
+        }
+
+        /* --- Instrumental : DiffRhythm 2 ne le couvre pas encore → synthèse locale directe --- */
+        if (instrumental) {
+          await localSynth('')
+          return
+        }
+
+        /* --- Chanson complète : paroles GLM + studio DiffRhythm 2 --- */
+        let done: MusicDoneEvent | undefined
+        let fallbackReason = ''
+        let studioStartedAt = 0
+        const tick = setInterval(() => {
+          const m = get().sessions.find((s) => s.id === sessionId)?.messages.find((x) => x.id === assistantId)
+          if (m?.pending && m.content.startsWith('🎼') && studioStartedAt > 0) {
+            const sec = Math.round((Date.now() - studioStartedAt) / 1000)
+            updateMessage(sessionId, assistantId, { content: `🎼 DiffRhythm 2 compose la chanson (voix + accompagnement)… ⏱ ${sec} s` })
+          }
+        }, 1000)
+        try {
+          const ac = new AbortController()
+          aborts.set(sessionId, ac)
+          await apiMusicStream(
+            {
+              prompt,
+              lyrics: opts.musicLyrics?.trim() || undefined,
+              style: opts.musicStyle ?? 'auto',
+              duration: opts.musicDuration ?? 120,
+              format: 'mp3',
+            },
+            {
+              onLyrics: (lrc, title) => {
+                const preview = lrc
+                  .split('\n')
+                  .filter((l) => l.trim() && !l.trim().startsWith('['))
+                  .slice(0, 4)
+                  .join('\n')
+                updateMessage(sessionId, assistantId, {
+                  content: `📝 Paroles prêtes : **« ${title} »** (style ${styleLabel})\n\n« ${preview.replace(/\n/g, ' /\n')} »…\n\n🎧 Connexion au studio DiffRhythm 2 (Hugging Face)…`,
+                })
+              },
+              onStudio: () => {
+                studioStartedAt = Date.now()
+                updateMessage(sessionId, assistantId, {
+                  content: '🎼 DiffRhythm 2 compose la chanson (voix + accompagnement)… ⏱ 0 s',
+                })
+              },
+              onDone: (evt) => {
+                done = evt
+              },
+              onFallback: (reason) => {
+                fallbackReason = reason
+              },
+              onError: (message) => {
+                fallbackReason = message
+              },
+            },
+            ac.signal,
+          )
+          clearInterval(tick)
+          aborts.delete(sessionId)
+
+          if (done) {
+            const ext = done.mime === 'audio/wav' ? 'wav' : done.mime === 'audio/ogg' ? 'ogg' : 'mp3'
+            const artifact: Artifact = {
+              id: uid(),
+              kind: 'audio',
+              name: `${done.title.replace(/[^\wÀ-ÿ]+/g, '_')}.${ext}`,
+              mimeType: done.mime || 'audio/mpeg',
+              createdAt: Date.now(),
+              provider: 'DiffRhythm 2 · Hugging Face',
+              prompt,
+              data: done.base64,
+              bytes: done.bytes,
+              meta: {
+                music: true,
+                engine: 'diffrhythm2',
+                style: styleLabel,
+                lyrics: done.lrc,
+                durationSec: done.durationSec,
+                instrumental: false,
+              },
+            }
+            const dur = done.durationSec >= 60 ? `${Math.floor(done.durationSec / 60)} min ${String(done.durationSec % 60).padStart(2, '0')}` : `${done.durationSec} s`
+            await finishWithArtifact(
+              artifact,
+              `Voici **« ${done.title} »** — chanson complète chantée 🎤 (${dur}), générée par **DiffRhythm 2** sur Hugging Face.\n\n` +
+                `▶ Écoutez le morceau ci-dessous — les paroles sont dépliables dans la carte audio et le MP3 est téléchargeable.\n` +
+                `Envie d'une autre version ? Demandez : autre style, paroles retouchées, plus longue, voix différente…`,
+            )
+          } else {
+            await localSynth(`🎛 Studio DiffRhythm indisponible (${fallbackReason || 'raison inconnue'}) — bascule sur la synthèse locale.\n\n`)
+          }
         } catch (e) {
+          clearInterval(tick)
+          aborts.delete(sessionId)
+          if (e instanceof Error && /interrompue/i.test(e.message)) return // stop déjà géré
           updateMessage(sessionId, assistantId, {
             content: '',
             pending: false,
@@ -1200,7 +1310,15 @@ export const useLumo = create<LumoState>()(
             await videoFlow(sessionId, lastUser.content, { attachments: lastUser.attachments })
           } else if (mode === 'audio') {
             if (removed.flow === 'audio-music') {
-              await musicFlow(sessionId, lastUser.content, { audioTab: 'music', attachments: lastUser.attachments })
+              const meta = removed.artifacts?.[0]?.meta ?? {}
+              await musicFlow(sessionId, lastUser.content, {
+                audioTab: 'music',
+                musicStyle: (meta.style as string) ?? 'auto',
+                musicDuration: (meta.durationSec as number) || undefined,
+                musicLyrics: (meta.lyrics as string) || undefined,
+                instrumental: Boolean(meta.instrumental),
+                attachments: lastUser.attachments,
+              })
             } else {
               await audioFlow(sessionId, lastUser.content, {
                 audioTab: removed.flow === 'audio-transcript' ? 'transcript' : 'voice',

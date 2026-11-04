@@ -151,6 +151,103 @@ export async function apiAsr(base64: string): Promise<{ text: string; segments: 
   return { text: String(json.text || ''), segments: (json.segments ?? []) as AsrSegment[] }
 }
 
+/* ---------------- Musique (studio DiffRhythm 2) ---------------- */
+
+export interface MusicRequest {
+  prompt: string
+  lyrics?: string
+  tags?: string
+  style?: string
+  duration?: number
+  format?: 'mp3' | 'wav' | 'ogg'
+}
+
+export interface MusicDoneEvent {
+  engine: string
+  title: string
+  lrc: string
+  base64: string
+  bytes: number
+  mime: string
+  durationSec: number
+}
+
+export interface MusicStreamHandlers {
+  onLyrics?: (lrc: string, title: string, source: string) => void
+  onStudio?: (engine: string) => void
+  onFallback?: (reason: string) => void
+  onDone?: (evt: MusicDoneEvent) => void
+  /** Appelé si le serveur renvoie une erreur HTTP (pas de flux du tout) */
+  onError?: (message: string) => void
+}
+
+/**
+ * Studio musical façon Suno : paroles → DiffRhythm 2 (Hugging Face) → audio réel.
+ * Consomme le flux NDJSON de /api/music et délègue chaque étape aux handlers.
+ */
+export async function apiMusicStream(req: MusicRequest, handlers: MusicStreamHandlers, signal?: AbortSignal): Promise<void> {
+  let res: Response
+  try {
+    res = await fetch('/api/music', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req),
+      signal,
+    })
+  } catch (e) {
+    if (signal?.aborted) throw new Error('Génération interrompue.')
+    handlers.onFallback?.('studio injoignable')
+    return
+  }
+  if (!res.ok || !res.body) {
+    const json = await res.json().catch(() => ({}))
+    handlers.onError?.(json.error || `Le studio musical a répondu ${res.status}.`)
+    return
+  }
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  for (;;) {
+    let done = false
+    let value: Uint8Array | undefined
+    try {
+      ;({ done, value } = await reader.read())
+    } catch {
+      if (signal?.aborted) throw new Error('Génération interrompue.')
+      handlers.onFallback?.('flux interrompu')
+      return
+    }
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    let nl: number
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim()
+      buf = buf.slice(nl + 1)
+      if (!line) continue
+      let evt: Record<string, unknown>
+      try {
+        evt = JSON.parse(line) as Record<string, unknown>
+      } catch {
+        continue
+      }
+      switch (evt.stage) {
+        case 'lyrics':
+          handlers.onLyrics?.(String(evt.lrc ?? ''), String(evt.title ?? ''), String(evt.source ?? ''))
+          break
+        case 'studio':
+          handlers.onStudio?.(String(evt.engine ?? 'DiffRhythm 2'))
+          break
+        case 'done':
+          handlers.onDone?.(evt as unknown as MusicDoneEvent)
+          break
+        case 'fallback':
+          handlers.onFallback?.(String(evt.reason ?? 'studio indisponible'))
+          break
+      }
+    }
+  }
+}
+
 /* ---------------- Clés API ---------------- */
 
 export interface ApiKeyRow {
