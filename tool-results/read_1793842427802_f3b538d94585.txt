@@ -1,0 +1,759 @@
+     1→'use client'
+     2→
+     3→/** Rendu des artefacts : images réelles, lecteurs audio/waveform, vidéos, cartes fichiers */
+     4→
+     5→import { useEffect, useMemo, useRef, useState } from 'react'
+     6→import { AudioLines, Download, Eye, FileText, Pause, Play, Sparkles, Volume2, VolumeX, Repeat } from 'lucide-react'
+     7→import { Button } from '@/components/ui/button'
+     8→import {
+     9→  Dialog,
+    10→  DialogContent,
+    11→  DialogDescription,
+    12→  DialogHeader,
+    13→  DialogTitle,
+    14→} from '@/components/ui/dialog'
+    15→import { useToast } from '@/hooks/use-toast'
+    16→import { getArtifactData } from '@/lib/lumo/artifact-store'
+    17→import { downloadText } from '@/lib/lumo/export'
+    18→import type { Artifact } from '@/lib/lumo/types'
+    19→
+    20→export function artifactDataUrl(a: Artifact, data?: string): string | undefined {
+    21→  const d = data ?? a.data
+    22→  return d ? `data:${a.mimeType};base64,${d}` : undefined
+    23→}
+    24→
+    25→function fmtSize(n?: number): string {
+    26→  if (!n) return ''
+    27→  if (n >= 1_048_576) return `${(n / 1_048_576).toFixed(1)} Mo`
+    28→  if (n >= 1024) return `${(n / 1024).toFixed(1)} Ko`
+    29→  return `${n} o`
+    30→}
+    31→
+    32→/** Charge les données binaires depuis IndexedDB si absentes de l’état.
+    33→ *  La donnée est écrite de façon asynchrone juste après la création de l’artefact :
+    34→ *  on relit donc plusieurs fois (poll court) pour éviter l’écran « statique » au premier rendu. */
+    35→export function useArtifactData(a: Artifact): string | undefined {
+    36→  const [stored, setStored] = useState<string | undefined>(undefined)
+    37→  useEffect(() => {
+    38→    if (a.data) return // donnée déjà en mémoire : rien à lire
+    39→    let alive = true
+    40→    let timer: ReturnType<typeof setTimeout> | null = null
+    41→    let tries = 0
+    42→    const read = () => {
+    43→      void getArtifactData(a.id).then((d) => {
+    44→        if (!alive) return
+    45→        if (d) {
+    46→          setStored(d)
+    47→          return
+    48→        }
+    49→        // L'écriture IndexedDB peut se terminer après ce rendu : on réessaie ~5 s
+    50→        if (tries < 12) {
+    51→          tries += 1
+    52→          timer = setTimeout(read, 400)
+    53→        }
+    54→      })
+    55→    }
+    56→    read()
+    57→    return () => {
+    58→      alive = false
+    59→      if (timer) clearTimeout(timer)
+    60→    }
+    61→  }, [a.id, a.data])
+    62→  // Priorité à la donnée en mémoire (rendu instantané), sinon la donnée stockée
+    63→  return a.data ?? stored
+    64→}
+    65→
+    66→/* ---------------- Image ---------------- */
+    67→
+    68→export function ImageTile({ a }: { a: Artifact }) {
+    69→  const data = useArtifactData(a)
+    70→  const src = artifactDataUrl(a, data)
+    71→  const { toast } = useToast()
+    72→
+    73→  if (!src) {
+    74→    return (
+    75→      <div className="shimmer flex aspect-square w-full items-center justify-center rounded-xl border text-xs text-muted-foreground">
+    76→        Image indisponible localement
+    77→      </div>
+    78→    )
+    79→  }
+    80→  return (
+    81→    <figure className="group relative overflow-hidden rounded-xl border">
+    82→      <img src={src} alt={a.prompt || a.name} className="aspect-square w-full object-cover" loading="lazy" />
+    83→      <figcaption className="absolute inset-x-0 bottom-0 flex items-center justify-between gap-2 bg-gradient-to-t from-black/70 to-transparent p-2 opacity-0 transition-opacity group-hover:opacity-100">
+    84→        <span className="truncate text-[11px] text-white/90">{a.provider}</span>
+    85→        <Button
+    86→          size="sm"
+    87→          variant="secondary"
+    88→          className="h-7 gap-1 text-[11px]"
+    89→          onClick={() => {
+    90→            const url = src
+    91→            const link = document.createElement('a')
+    92→            link.href = url
+    93→            link.download = a.name
+    94→            link.click()
+    95→            toast({ title: 'Image téléchargée', description: a.name })
+    96→          }}
+    97→        >
+    98→          <Download className="h-3 w-3" /> PNG
+    99→        </Button>
+   100→      </figcaption>
+   101→    </figure>
+   102→  )
+   103→}
+   104→
+   105→/* ---------------- Audio (voix TTS ou musique générée) ---------------- */
+   106→
+   107→/**
+   108→ * base64 → Blob → object URL.
+   109→ * Contrairement à une data-URI géante collée dans <audio src>, le Blob URL
+   110→ * offre une lecture native fiable (durée, seek, gros fichiers multi-Mo)
+   111→ * et est révoqué proprement au démontage.
+   112→ */
+   113→function useAudioObjectUrl(a: Artifact): string | undefined {
+   114→  const data = useArtifactData(a)
+   115→  const [url, setUrl] = useState<string | undefined>(undefined)
+   116→  useEffect(() => {
+   117→    let objectUrl: string | undefined
+   118→    let cancelled = false
+   119→    // Conversion en micro-tâche : évite un setState synchrone dans l'effet
+   120→    void Promise.resolve().then(() => {
+   121→      if (cancelled) return
+   122→      if (!data) {
+   123→        setUrl(undefined)
+   124→        return
+   125→      }
+   126→      try {
+   127→        const bin = atob(data)
+   128→        const bytes = new Uint8Array(bin.length)
+   129→        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+   130→        objectUrl = URL.createObjectURL(new Blob([bytes], { type: a.mimeType || 'audio/mpeg' }))
+   131→        setUrl(objectUrl)
+   132→      } catch {
+   133→        setUrl(undefined)
+   134→      }
+   135→    })
+   136→    return () => {
+   137→      cancelled = true
+   138→      if (objectUrl) URL.revokeObjectURL(objectUrl)
+   139→    }
+   140→  }, [data, a.mimeType])
+   141→  return url
+   142→}
+   143→
+   144→/** Forme d'onde par défaut (pendant le décodage ou en cas d'échec) : vague régulière. */
+   145→const DEFAULT_PEAKS = Array.from({ length: 84 }, (_, i) => 0.3 + Math.abs(Math.sin(i * 0.55)) * 0.45)
+   146→
+   147→/**
+   148→ * Décode l'audio réel via Web Audio et extrait 84 crêtes (0..1) —
+   149→ * c'est la « bande » affichée : la vraie enveloppe du morceau généré.
+   150→ */
+   151→function useWaveformPeaks(url: string | undefined): { peaks: number[]; decoding: boolean } {
+   152→  const [state, setState] = useState<{ peaks: number[]; decoding: boolean }>({ peaks: DEFAULT_PEAKS, decoding: true })
+   153→  useEffect(() => {
+   154→    if (!url) return
+   155→    let alive = true
+   156→    let ctx: AudioContext | undefined
+   157→    void (async () => {
+   158→      try {
+   159→        const AC =
+   160→          window.AudioContext ??
+   161→          (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+   162→        if (!AC) throw new Error('Web Audio indisponible')
+   163→        ctx = new AC()
+   164→        const buf = await fetch(url).then((r) => {
+   165→          if (!r.ok) throw new Error('lecture impossible')
+   166→          return r.arrayBuffer()
+   167→        })
+   168→        const audio = await ctx.decodeAudioData(buf)
+   169→        if (!alive) return
+   170→        const ch = audio.getChannelData(0)
+   171→        const BARS = 84
+   172→        const block = Math.max(1, Math.floor(ch.length / BARS))
+   173→        const out: number[] = []
+   174→        for (let i = 0; i < BARS; i++) {
+   175→          let max = 0
+   176→          for (let j = 0; j < block; j += 32) max = Math.max(max, Math.abs(ch[i * block + j]))
+   177→          out.push(max)
+   178→        }
+   179→        const top = Math.max(...out) || 1
+   180→        setState({ peaks: out.map((p) => Math.min(1, Math.max(0.12, p / top))), decoding: false })
+   181→      } catch {
+   182→        if (alive) setState({ peaks: DEFAULT_PEAKS, decoding: false })
+   183→      } finally {
+   184→        void ctx?.close().catch(() => {})
+   185→      }
+   186→    })()
+   187→    return () => {
+   188→      alive = false
+   189→    }
+   190→  }, [url])
+   191→  return state
+   192→}
+   193→
+   194→function fmtTime(sec: number): string {
+   195→  if (!Number.isFinite(sec) || sec < 0) return '0:00'
+   196→  const m = Math.floor(sec / 60)
+   197→  const s = Math.floor(sec % 60)
+   198→  return `${m}:${String(s).padStart(2, '0')}`
+   199→}
+   200→
+   201→interface EngineTheme {
+   202→  badge: string
+   203→  label: string
+   204→  played: string
+   205→  knob: string
+   206→  icon: string
+   207→}
+   208→
+   209→/** Couleurs distinctes selon le moteur : DiffRhythm (vert studio) vs aperçu local (ambre). */
+   210→function engineTheme(engine: string, isMusic: boolean): EngineTheme {
+   211→  if (engine === 'diffrhythm1' || engine === 'diffrhythm2')
+   212→    return {
+   213→      badge: 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400',
+   214→      label: engine === 'diffrhythm2' ? 'DiffRhythm 2' : 'DiffRhythm 1',
+   215→      played: 'bg-emerald-500',
+   216→      knob: 'bg-emerald-500',
+   217→      icon: '🎤',
+   218→    }
+   219→  if (isMusic)
+   220→    return {
+   221→      badge: 'bg-amber-500/15 text-amber-700 dark:text-amber-400',
+   222→      label: 'Aperçu local',
+   223→      played: 'bg-amber-500',
+   224→      knob: 'bg-amber-500',
+   225→      icon: '🎹',
+   226→    }
+   227→  return { badge: 'bg-primary/10 text-primary', label: 'Voix', played: 'bg-primary', knob: 'bg-primary', icon: '🔊' }
+   228→}
+   229→
+   230→export function AudioCard({ a }: { a: Artifact }) {
+   231→  const url = useAudioObjectUrl(a)
+   232→  const { peaks, decoding } = useWaveformPeaks(url)
+   233→  const isMusic = !!a.meta?.music
+   234→  const voice = a.meta?.voice ? String(a.meta.voice) : 'voix'
+   235→  const style = a.meta?.style ? String(a.meta.style) : ''
+   236→  const bpm = a.meta?.bpm ? String(a.meta.bpm) : ''
+   237→  const keyName = a.meta?.key ? String(a.meta.key) : ''
+   238→  const durationSec = a.meta?.durationSec ? Number(a.meta.durationSec) : 0
+   239→  const engine = a.meta?.engine ? String(a.meta.engine) : ''
+   240→  const instrumental = a.meta?.instrumental === true
+   241→  const lyrics = a.meta?.lyrics ? String(a.meta.lyrics) : ''
+   242→  const theme = engineTheme(engine, isMusic)
+   243→  const ext = a.mimeType?.includes('mpeg') ? 'MP3' : a.mimeType?.includes('ogg') ? 'OGG' : 'WAV'
+   244→  const { toast } = useToast()
+   245→
+   246→  /* Transport : lecture, progression, volume, boucle */
+   247→  const audioRef = useRef<HTMLAudioElement | null>(null)
+   248→  const [playing, setPlaying] = useState(false)
+   249→  const [cur, setCur] = useState(0)
+   250→  const [dur, setDur] = useState(durationSec)
+   251→  const [vol, setVol] = useState(1)
+   252→  const [muted, setMuted] = useState(false)
+   253→  const [loop, setLoop] = useState(false)
+   254→
+   255→  const pct = dur > 0 ? Math.min(100, (cur / dur) * 100) : 0
+   256→
+   257→  function toggle() {
+   258→    const el = audioRef.current
+   259→    if (!el) return
+   260→    if (el.paused) {
+   261→      void el.play().catch(() => toast({ title: 'Lecture impossible', variant: 'destructive' }))
+   262→    } else {
+   263→      el.pause()
+   264→    }
+   265→  }
+   266→
+   267→  /** Clic (ou clavier) sur la bande → seek à la position visée */
+   268→  function seekTo(clientX: number, el: HTMLElement) {
+   269→    const audio = audioRef.current
+   270→    if (!audio || !dur) return
+   271→    const rect = el.getBoundingClientRect()
+   272→    const frac = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width))
+   273→    audio.currentTime = frac * dur
+   274→    setCur(audio.currentTime)
+   275→  }
+   276→
+   277→  function onWaveKey(e: React.KeyboardEvent<HTMLDivElement>) {
+   278→    const audio = audioRef.current
+   279→    if (!audio) return
+   280→    if (e.key === 'ArrowRight') {
+   281→      e.preventDefault()
+   282→      audio.currentTime = Math.min(dur, audio.currentTime + 5)
+   283→    } else if (e.key === 'ArrowLeft') {
+   284→      e.preventDefault()
+   285→      audio.currentTime = Math.max(0, audio.currentTime - 5)
+   286→    } else if (e.key === ' ' || e.key === 'Enter') {
+   287→      e.preventDefault()
+   288→      toggle()
+   289→    }
+   290→  }
+   291→
+   292→  if (url) {
+   293→    const metaLine = isMusic
+   294→      ? [
+   295→          style !== 'libre' && style ? style : '',
+   296→          bpm ? `${bpm} BPM` : '',
+   297→          keyName,
+   298→          instrumental ? 'instrumental' : '',
+   299→        ]
+   300→          .filter(Boolean)
+   301→          .join(' · ')
+   302→      : `voix « ${voice} » · ${a.provider}`
+   303→
+   304→    return (
+   305→      <div className="overflow-hidden rounded-xl border bg-card">
+   306→        {/* Élément de lecture réel, caché — le Blob URL garantit seek + durée natives */}
+   307→        <audio
+   308→          ref={audioRef}
+   309→          src={url}
+   310→          loop={loop}
+   311→          preload="metadata"
+   312→          className="hidden"
+   313→          aria-label={`Lecture de ${a.name}`}
+   314→          onPlay={() => setPlaying(true)}
+   315→          onPause={() => setPlaying(false)}
+   316→          onEnded={() => setPlaying(false)}
+   317→          onTimeUpdate={(e) => setCur(e.currentTarget.currentTime)}
+   318→          onLoadedMetadata={(e) => {
+   319→            const d = e.currentTarget.duration
+   320→            if (Number.isFinite(d) && d > 0) setDur(d)
+   321→          }}
+   322→          onVolumeChange={(e) => setVol(e.currentTarget.volume)}
+   323→        />
+   324→
+   325→        {/* Ligne titre + badge moteur + téléchargement */}
+   326→        <div className="flex items-center gap-2.5 px-3 pb-1 pt-3">
+   327→          <span
+   328→            className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full ${theme.badge}`}
+   329→            aria-hidden="true"
+   330→          >
+   331→            <AudioLines className="h-4.5 w-4.5" />
+   332→          </span>
+   333→          <div className="min-w-0 flex-1">
+   334→            <p className="truncate text-xs font-medium">{a.name.replace(/\.(wav|mp3|ogg)$/, '')}</p>
+   335→            <p className="truncate text-[10px] text-muted-foreground">{metaLine}</p>
+   336→          </div>
+   337→          <span
+   338→            className={`inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold ${theme.badge}`}
+   339→            title={
+   340→              engine.startsWith('diffrhythm')
+   341→                ? `Généré par ${theme.label} (studio Hugging Face) — vraie chanson rendue`
+   342→                : isMusic
+   343→                  ? 'Composition procédurale locale — aperçu instrumental, pas une chanson DiffRhythm'
+   344→                  : 'Synthèse vocale Lumo'
+   345→            }
+   346→          >
+   347→            {theme.icon} {theme.label}
+   348→          </span>
+   349→          <Button
+   350→            size="sm"
+   351→            variant="secondary"
+   352→            className="h-7 shrink-0 gap-1 text-[11px]"
+   353→            onClick={() => {
+   354→              const link = document.createElement('a')
+   355→              link.href = url
+   356→              link.download = a.name
+   357→              link.click()
+   358→              toast({ title: 'Audio téléchargé', description: a.name })
+   359→            }}
+   360→          >
+   361→            <Download className="h-3 w-3" /> {ext}
+   362→          </Button>
+   363→        </div>
+   364→
+   365→        {/* La bande : lecture + forme d'onde réelle cliquable + temps + volume */}
+   366→        <div className="flex items-center gap-3 px-3 pb-3 pt-1.5">
+   367→          <button
+   368→            onClick={toggle}
+   369→            className={`inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-white shadow-md transition-transform hover:scale-105 active:scale-95 ${theme.played}`}
+   370→            aria-label={playing ? 'Pause' : 'Lecture'}
+   371→          >
+   372→            {playing ? <Pause className="h-5 w-5" /> : <Play className="ml-0.5 h-5 w-5" />}
+   373→          </button>
+   374→
+   375→          <div
+   376→            role="slider"
+   377→            tabIndex={0}
+   378→            aria-label="Position de lecture — cliquez pour vous déplacer"
+   379→            aria-valuemin={0}
+   380→            aria-valuemax={100}
+   381→            aria-valuenow={Math.round(pct)}
+   382→            aria-valuetext={`${fmtTime(cur)} sur ${fmtTime(dur)}`}
+   383→            onKeyDown={onWaveKey}
+   384→            onClick={(e) => seekTo(e.clientX, e.currentTarget)}
+   385→            className="group relative flex h-12 min-w-0 flex-1 cursor-pointer items-center gap-[2px] rounded-md px-0.5 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+   386→          >
+   387→            {peaks.map((p, i) => {
+   388→              const played = (i / peaks.length) * 100 <= pct
+   389→              return (
+   390→                <span
+   391→                  key={i}
+   392→                  className={`min-w-[2px] flex-1 rounded-full transition-[background-color] duration-150 ${
+   393→                    played ? theme.played : 'bg-muted-foreground/25'
+   394→                  } ${decoding ? 'opacity-60' : ''}`}
+   395→                  style={{ height: `${Math.max(8, Math.round(p * 100))}%` }}
+   396→                />
+   397→              )
+   398→            })}
+   399→            {/* Curseur de position */}
+   400→            <span
+   401→              className="pointer-events-none absolute top-0 h-full w-0.5 bg-foreground/70 opacity-0 shadow transition-opacity group-hover:opacity-100"
+   402→              style={{ left: `calc(${pct}% - 1px)`, opacity: pct > 0 && pct < 100 ? 1 : undefined }}
+   403→            />
+   404→          </div>
+   405→
+   406→          <div className="flex shrink-0 flex-col items-end gap-0.5">
+   407→            <span className="font-mono text-[10px] tabular-nums text-muted-foreground">
+   408→              {fmtTime(cur)} / {fmtTime(dur)}
+   409→            </span>
+   410→            <div className="flex items-center gap-1">
+   411→              <button
+   412→                onClick={() => setLoop((v) => !v)}
+   413→                aria-pressed={loop}
+   414→                aria-label="Lecture en boucle"
+   415→                title="Boucle"
+   416→                className={`rounded p-1 transition-colors ${loop ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:text-foreground'}`}
+   417→              >
+   418→                <Repeat className="h-3 w-3" />
+   419→              </button>
+   420→              <button
+   421→                onClick={() => {
+   422→                  const audio = audioRef.current
+   423→                  if (!audio) return
+   424→                  const next = !audio.muted
+   425→                  audio.muted = next
+   426→                  setMuted(next)
+   427→                }}
+   428→                aria-label={muted ? 'Réactiver le son' : 'Couper le son'}
+   429→                className="rounded p-1 text-muted-foreground transition-colors hover:text-foreground"
+   430→              >
+   431→                {muted ? <VolumeX className="h-3 w-3" /> : <Volume2 className="h-3 w-3" />}
+   432→              </button>
+   433→              <input
+   434→                type="range"
+   435→                min={0}
+   436→                max={1}
+   437→                step={0.05}
+   438→                value={muted ? 0 : vol}
+   439→                onChange={(e) => {
+   440→                  const v = Number(e.target.value)
+   441→                  const audio = audioRef.current
+   442→                  if (audio) {
+   443→                    audio.volume = v
+   444→                    audio.muted = false
+   445→                  }
+   446→                  setVol(v)
+   447→                  setMuted(false)
+   448→                }}
+   449→                aria-label="Volume"
+   450→                className="h-1 w-14 cursor-pointer accent-primary"
+   451→              />
+   452→            </div>
+   453→          </div>
+   454→        </div>
+   455→
+   456→        {lyrics && (
+   457→          <details className="group border-t bg-muted/30">
+   458→            <summary className="cursor-pointer list-none px-3 py-2 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground">
+   459→              📝 Paroles de la chanson
+   460→              <span className="float-right text-[10px] group-open:hidden">afficher ▾</span>
+   461→              <span className="float-right hidden text-[10px] group-open:inline">masquer ▴</span>
+   462→            </summary>
+   463→            <div className="max-h-44 overflow-y-auto whitespace-pre-line px-3 pb-3 text-[11px] leading-relaxed text-foreground/90">
+   464→              {lyrics.split('\n').map((line, i) =>
+   465→                line.trim().startsWith('[') ? (
+   466→                  <p key={i} className="mt-2 font-semibold uppercase tracking-wide text-primary/80">
+   467→                    {line.replace(/[[\]]/g, '')}
+   468→                  </p>
+   469→                ) : (
+   470→                  <p key={i}>{line}</p>
+   471→                ),
+   472→              )}
+   473→            </div>
+   474→          </details>
+   475→        )}
+   476→      </div>
+   477→    )
+   478→  }
+   479→
+   480→  return (
+   481→    <div className="flex items-center gap-3 rounded-xl border bg-card p-3">
+   482→      <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
+   483→        <AudioLines className="h-4.5 w-4.5" aria-hidden="true" />
+   484→      </span>
+   485→      <div className="flex h-8 flex-1 items-end gap-[3px]" aria-hidden="true">
+   486→        {Array.from({ length: 36 }).map((_, i) => (
+   487→          <span
+   488→            key={i}
+   489→            className="wave-bar"
+   490→            style={{ height: `${18 + Math.sin(i * 1.7) * 10 + (i % 5) * 3}px`, animationDelay: `${i * 0.06}s`, opacity: 0.75 }}
+   491→          />
+   492→        ))}
+   493→      </div>
+   494→      <div className="min-w-0 shrink-0 text-right">
+   495→        <p className="max-w-32 truncate text-xs font-medium sm:max-w-none">{a.name}</p>
+   496→        <p className="max-w-36 truncate text-[10px] text-muted-foreground sm:max-w-none">
+   497→          {isMusic ? 'préparation de la bande…' : `voix « ${voice} » · flux à brancher`} ({a.provider})
+   498→        </p>
+   499→      </div>
+   500→    </div>
+   501→  )
+   502→}
+   503→
+   504→/* ---------------- Vidéo : lecteur animé (storyboard Ken Burns) ---------------- */
+   505→
+   506→interface VideoPayload {
+   507→  frames: { mime: string; base64: string }[]
+   508→  duration: number
+   509→  ratio: string
+   510→}
+   511→
+   512→/** Séquence animée de secours quand aucun plan n'a pu être généré */
+   513→function FallbackAnimation() {
+   514→  return (
+   515→    <div className="video-fallback absolute inset-0" aria-hidden="true">
+   516→      <span className="video-fallback-ring" />
+   517→      <span className="video-fallback-ring video-fallback-ring-2" />
+   518→    </div>
+   519→  )
+   520→}
+   521→
+   522→export function VideoCard({ a }: { a: Artifact }) {
+   523→  const raw = useArtifactData(a)
+   524→  const payload = useMemo<VideoPayload | null>(() => {
+   525→    if (!raw) return null
+   526→    try {
+   527→      const p = JSON.parse(raw) as VideoPayload
+   528→      if (Array.isArray(p.frames)) return p
+   529→    } catch {
+   530→      /* données absentes ou corrompues */
+   531→    }
+   532→    return null
+   533→  }, [raw])
+   534→
+   535→  const frames = payload?.frames ?? []
+   536→  const durationSec = payload?.duration || Number(String(a.meta?.duration ?? '8').replace(/\D/g, '')) || 8
+   537→  const ratio = payload?.ratio || String(a.meta?.ratio ?? '16:9')
+   538→
+   539→  const [playing, setPlaying] = useState(false)
+   540→  const [progress, setProgress] = useState(0) // 0..1
+   541→  const rafRef = useRef<number | null>(null)
+   542→  const lastRef = useRef<number>(0)
+   543→
+   544→  useEffect(() => {
+   545→    if (!playing || frames.length === 0) return
+   546→    lastRef.current = performance.now()
+   547→    const loop = (t: number) => {
+   548→      const dt = (t - lastRef.current) / 1000
+   549→      lastRef.current = t
+   550→      setProgress((p) => {
+   551→        const next = p + dt / durationSec
+   552→        if (next >= 1) return 0
+   553→        return next
+   554→      })
+   555→      rafRef.current = requestAnimationFrame(loop)
+   556→    }
+   557→    rafRef.current = requestAnimationFrame(loop)
+   558→    return () => {
+   559→      if (rafRef.current) cancelAnimationFrame(rafRef.current)
+   560→    }
+   561→  }, [playing, frames.length, durationSec])
+   562→
+   563→  // Plan courant entièrement dérivé de la progression (aucun état redondant)
+   564→  const idx = frames.length > 1 ? Math.min(frames.length - 1, Math.floor(progress * frames.length)) : 0
+   565→
+   566→  const hasFrames = frames.length > 0
+   567→  const pct = Math.round(progress * 100)
+   568→
+   569→  return (
+   570→    <div className="overflow-hidden rounded-xl border">
+   571→      <div className="relative aspect-video overflow-hidden bg-secondary">
+   572→        {/* Plans : fondu enchaîné + effet Ken Burns */}
+   573→        {hasFrames
+   574→          ? frames.map((f, i) => (
+   575→              <img
+   576→                key={i}
+   577→                src={`data:${f.mime};base64,${f.base64}`}
+   578→                alt={`Plan ${i + 1}`}
+   579→                className={`absolute inset-0 h-full w-full object-cover transition-opacity duration-700 ${
+   580→                  playing && i === idx ? 'kenburns opacity-100' : i === idx ? 'opacity-100' : 'opacity-0'
+   581→                }`}
+   582→                aria-hidden={i !== idx}
+   583→              />
+   584→            ))
+   585→          : <FallbackAnimation />}
+   586→
+   587→        {/* Bouton lecture central */}
+   588→        {!playing && (
+   589→          <button
+   590→            onClick={() => setPlaying(true)}
+   591→            className="absolute inset-0 z-10 flex items-center justify-center bg-black/25 transition-colors hover:bg-black/15"
+   592→            aria-label="Lire l'aperçu animé"
+   593→          >
+   594→            <span className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg">
+   595→              <Play className="ml-0.5 h-5 w-5" aria-hidden="true" />
+   596→            </span>
+   597→          </button>
+   598→        )}
+   599→
+   600→        {/* Barre de contrôle */}
+   601→        <div className="absolute inset-x-0 bottom-0 z-10 flex items-center gap-2 bg-gradient-to-t from-black/70 to-transparent px-2.5 pb-2 pt-6">
+   602→          <button
+   603→            onClick={() => setPlaying((v) => !v)}
+   604→            className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-white/90 text-black hover:bg-white"
+   605→            aria-label={playing ? 'Pause' : 'Lecture'}
+   606→          >
+   607→            {playing ? (
+   608→              <Pause className="h-3.5 w-3.5" aria-hidden="true" />
+   609→            ) : (
+   610→              <Play className="ml-0.5 h-3.5 w-3.5" aria-hidden="true" />
+   611→            )}
+   612→          </button>
+   613→          <div
+   614→            className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-white/30"
+   615→            role="progressbar"
+   616→            aria-valuenow={pct}
+   617→            aria-valuemin={0}
+   618→            aria-valuemax={100}
+   619→          >
+   620→            <div className="h-full rounded-full bg-primary transition-[width] duration-150" style={{ width: `${pct}%` }} />
+   621→          </div>
+   622→          <span className="shrink-0 rounded-md bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">
+   623→            {ratio} · {durationSec} s
+   624→          </span>
+   625→        </div>
+   626→      </div>
+   627→      <div className="flex items-center gap-2 p-2.5">
+   628→        <p className="flex-1 truncate text-xs font-medium">{a.name}</p>
+   629→        <p className="flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground">
+   630→          <Sparkles className="h-3 w-3" aria-hidden="true" />
+   631→          {hasFrames ? 'aperçu animé — plans générés' : 'aperçu animé — plans stylisés'}
+   632→        </p>
+   633→      </div>
+   634→    </div>
+   635→  )
+   636→}
+   637→
+   638→/* ---------------- Fichiers texte / bible / plan / transcription ---------------- */
+   639→
+   640→export function TextFileCard({ a, onOpen }: { a: Artifact; onOpen: () => void }) {
+   641→  const icon = <FileText className="h-4 w-4" aria-hidden="true" />
+   642→  const label =
+   643→    a.kind === 'bible'
+   644→      ? 'Bible de l’œuvre'
+   645→      : a.kind === 'plan'
+   646→        ? 'Plan de projet'
+   647→        : a.kind === 'transcript'
+   648→          ? 'Transcription'
+   649→          : 'Document'
+   650→  return (
+   651→    <button
+   652→      onClick={onOpen}
+   653→      className="flex w-full items-center gap-3 rounded-xl border bg-card p-3 text-left transition-colors hover:border-primary/40 hover:bg-accent"
+   654→      aria-label={`Ouvrir ${label} ${a.name}`}
+   655→    >
+   656→      <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+   657→        {icon}
+   658→      </span>
+   659→      <span className="min-w-0 flex-1">
+   660→        <span className="block text-sm font-medium">{a.name}</span>
+   661→        <span className="text-[11px] text-muted-foreground">
+   662→          {label}
+   663→          {a.demo ? ' · démo' : ''} · via {a.provider}
+   664→        </span>
+   665→      </span>
+   666→      <Eye className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+   667→    </button>
+   668→  )
+   669→}
+   670→
+   671→/* ---------------- Visionneuse ---------------- */
+   672→
+   673→export function ArtifactViewDialog({
+   674→  artifact,
+   675→  open,
+   676→  onOpenChange,
+   677→}: {
+   678→  artifact: Artifact | null
+   679→  open: boolean
+   680→  onOpenChange: (v: boolean) => void
+   681→}) {
+   682→  const safe: Artifact =
+   683→    artifact ?? { id: '', kind: 'text', name: '', mimeType: 'text/plain', createdAt: 0, provider: '' }
+   684→  const data = useArtifactData(safe)
+   685→  const { toast } = useToast()
+   686→  if (!artifact) return null
+   687→  const src = artifactDataUrl(artifact, data)
+   688→
+   689→  return (
+   690→    <Dialog open={open} onOpenChange={onOpenChange}>
+   691→      <DialogContent className="sm:max-w-2xl">
+   692→        <DialogHeader>
+   693→          <DialogTitle className="truncate font-display">{artifact.name}</DialogTitle>
+   694→          <DialogDescription>
+   695→            {artifact.kind} · {artifact.provider}
+   696→            {artifact.demo ? ' · démo' : ''} {artifact.bytes ? `· ${fmtSize(artifact.bytes)}` : ''}
+   697→          </DialogDescription>
+   698→        </DialogHeader>
+   699→        {artifact.kind === 'image' && src && (
+   700→          <img src={src} alt={artifact.prompt || artifact.name} className="max-h-[55vh] w-full rounded-xl object-contain" />
+   701→        )}
+   702→        {artifact.kind === 'audio' && (
+   703→          /* Même lecteur waveform que dans la conversation : lecture fiable depuis le panneau artefacts */
+   704→          <AudioCard a={artifact} />
+   705→        )}
+   706→        {artifact.kind === 'video' && src?.startsWith('{') && (() => {
+   707→          try {
+   708→            const p = JSON.parse(src) as VideoPayload
+   709→            return p.frames?.length ? (
+   710→              <div className="grid grid-cols-3 gap-1.5">
+   711→                {p.frames.map((f, i) => (
+   712→                  <img
+   713→                    key={i}
+   714→                    src={`data:${f.mime};base64,${f.base64}`}
+   715→                    alt={`Plan ${i + 1}`}
+   716→                    className="aspect-video w-full rounded-lg border object-cover"
+   717→                  />
+   718→                ))}
+   719→              </div>
+   720→            ) : null
+   721→          } catch {
+   722→            return null
+   723→          }
+   724→        })()}
+   725→        {artifact.text !== undefined && (
+   726→          <pre className="max-h-[55vh] overflow-auto whitespace-pre-wrap rounded-xl border bg-secondary/50 p-4 text-xs leading-relaxed scrollbar-thin">
+   727→            {artifact.text}
+   728→          </pre>
+   729→        )}
+   730→        <div className="flex justify-end gap-2">
+   731→          {artifact.text !== undefined && (
+   732→            <Button
+   733→              size="sm"
+   734→              variant="outline"
+   735→              onClick={() => {
+   736→                void navigator.clipboard.writeText(artifact.text ?? '')
+   737→                toast({ title: 'Copié dans le presse-papiers' })
+   738→              }}
+   739→            >
+   740→              Copier le contenu
+   741→            </Button>
+   742→          )}
+   743→          {artifact.text !== undefined && (
+   744→            <Button
+   745→              size="sm"
+   746→              onClick={() => {
+   747→                downloadText(artifact.text ?? '', artifact.name)
+   748→                toast({ title: 'Fichier téléchargé', description: artifact.name })
+   749→              }}
+   750→            >
+   751→              <Download className="h-3.5 w-3.5" /> Télécharger
+   752→            </Button>
+   753→          )}
+   754→        </div>
+   755→      </DialogContent>
+   756→    </Dialog>
+   757→  )
+   758→}
+   759→
