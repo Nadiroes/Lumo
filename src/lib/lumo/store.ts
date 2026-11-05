@@ -729,7 +729,7 @@ export const useLumo = create<LumoState>()(
           id: assistantId,
           role: 'assistant',
           content: instrumental
-            ? '🎹 Mode instrumental — composition par la synthèse locale Lumo…'
+            ? '🎹 Mode instrumental — le studio DiffRhythm compose sans voix chantée…'
             : '📝 Préparation du studio musical… analyse du thème, choix du style…',
           createdAt: Date.now(),
           pending: true,
@@ -775,7 +775,7 @@ export const useLumo = create<LumoState>()(
             await finishWithArtifact(
               artifact,
               `${intro}Voici **« ${res.title} »** — ${res.meta.style}, ${res.meta.bpm} BPM, ${res.meta.key} (${res.meta.durationSec} s), composée par la synthèse locale Lumo 🎹\n\n` +
-                `▶ Écoutez la piste ci-dessous et téléchargez-la en WAV. Pour une vraie chanson chantée, relancez sans le mode instrumental.`,
+                `▶ Écoutez la piste ci-dessous et téléchargez-la en WAV.${instrumental ? '' : ' Pour une vraie chanson chantée, relancez sans le mode instrumental.'}`,
             )
           } catch (e) {
             updateMessage(sessionId, assistantId, {
@@ -850,14 +850,17 @@ export const useLumo = create<LumoState>()(
                     style: styleLabel,
                     lyrics: evt.lrc,
                     durationSec,
-                    instrumental: false,
+                    instrumental,
                   },
                 }
                 const dur = durationSec >= 60 ? `${Math.floor(durationSec / 60)} min ${String(durationSec % 60).padStart(2, '0')}` : `${durationSec} s`
                 await finishWithArtifact(
                   artifact,
-                  `Voici **« ${evt.title} »** — chanson complète chantée 🎤 (${dur}), générée par **${engine}**.\n\n` +
-                    `▶ Écoutez le morceau ci-dessous — les paroles sont dépliables dans la carte audio et le fichier est téléchargeable.`,
+                  instrumental
+                    ? `Voici **« ${evt.title} »** — pièce instrumentale 🎹 (${dur}), générée par **${engine}**.\n\n` +
+                      `▶ Écoutez le morceau ci-dessous — le fichier est téléchargeable.`
+                    : `Voici **« ${evt.title} »** — chanson complète chantée 🎤 (${dur}), générée par **${engine}**.\n\n` +
+                      `▶ Écoutez le morceau ci-dessous — les paroles sont dépliables dans la carte audio et le fichier est téléchargeable.`,
                 )
                 return true
               } catch (e) {
@@ -878,13 +881,9 @@ export const useLumo = create<LumoState>()(
           return false
         }
 
-        /* --- Instrumental : DiffRhythm 2 ne le couvre pas encore → synthèse locale directe --- */
-        if (instrumental) {
-          await localSynth('')
-          return
-        }
-
-        /* --- Chanson complète : paroles GLM + studio DiffRhythm (chaîne de repli) --- */
+        /* --- Chanson complète OU instrumental : tout passe par le studio DiffRhythm.
+         *  Le serveur adapte les paramètres (LRC minimal + « no vocals » en instrumental)
+         *  et n'appelle la synthèse locale qu'en tout dernier ressort. */
         let done: MusicDoneEvent | undefined
         let clientEvt: ClientStudioEvent | undefined
         let fallbackReason = ''
@@ -907,6 +906,7 @@ export const useLumo = create<LumoState>()(
               lyrics: opts.musicLyrics?.trim() || undefined,
               style: opts.musicStyle ?? 'auto',
               duration: opts.musicDuration ?? 120,
+              instrumental,
               format: 'mp3',
             },
             {
@@ -917,20 +917,26 @@ export const useLumo = create<LumoState>()(
                   .slice(0, 4)
                   .join('\n')
                 updateMessage(sessionId, assistantId, {
-                  content: `📝 Paroles prêtes : **« ${title} »** (style ${styleLabel})\n\n« ${preview.replace(/\n/g, ' /\n')} »…\n\n🎧 Connexion au studio DiffRhythm (Hugging Face)…`,
+                  content: instrumental
+                    ? `🎹 Instrumental « ${title} » (style ${styleLabel}) — le studio compose une pièce sans voix…\n\n🎧 Connexion au studio DiffRhythm (Hugging Face)…`
+                    : `📝 Paroles prêtes : **« ${title} »** (style ${styleLabel})${preview ? `\n\n« ${preview.replace(/\n/g, ' /\n')} »…` : ''}\n\n🎧 Connexion au studio DiffRhythm (Hugging Face)…`,
                 })
               },
               onStudio: () => {
                 studioStartedAt = Date.now()
                 updateMessage(sessionId, assistantId, {
-                  content: `🎼 ${attemptLabel} compose la chanson (voix + accompagnement)… ⏱ 0 s`,
+                  content: instrumental
+                    ? `🎼 ${attemptLabel} compose l'instrumental… ⏱ 0 s`
+                    : `🎼 ${attemptLabel} compose la chanson (voix + accompagnement)… ⏱ 0 s`,
                 })
               },
               onStudioAttempt: (label) => {
                 attemptLabel = label
                 studioStartedAt = Date.now()
                 updateMessage(sessionId, assistantId, {
-                  content: `🎼 Génération via ${label} — composition en cours (voix + accompagnement)… ⏱ 0 s`,
+                  content: instrumental
+                    ? `🎼 Génération via ${label} — composition instrumentale en cours… ⏱ 0 s`
+                    : `🎼 Génération via ${label} — composition en cours (voix + accompagnement)… ⏱ 0 s`,
                 })
               },
               onStudioRetry: (label, reason) => {
@@ -974,15 +980,18 @@ export const useLumo = create<LumoState>()(
                 style: styleLabel,
                 lyrics: done.lrc,
                 durationSec: done.durationSec,
-                instrumental: false,
+                instrumental,
               },
             }
             const dur = done.durationSec >= 60 ? `${Math.floor(done.durationSec / 60)} min ${String(done.durationSec % 60).padStart(2, '0')}` : `${done.durationSec} s`
             await finishWithArtifact(
               artifact,
-              `Voici **« ${done.title} »** — chanson complète chantée 🎤 (${dur}), générée par **${done.engine}** (Hugging Face).\n\n` +
-                `▶ Écoutez le morceau ci-dessous — les paroles sont dépliables dans la carte audio et le MP3 est téléchargeable.\n` +
-                `Envie d'une autre version ? Demandez : autre style, paroles retouchées, plus longue, voix différente…`,
+              instrumental
+                ? `Voici **« ${done.title} »** — pièce instrumentale 🎹 (${dur}), générée par **${done.engine}** (Hugging Face).\n\n` +
+                  `▶ Écoutez le morceau ci-dessous et téléchargez le MP3. Envie d'une autre ambiance ? Changez le style et relancez.`
+                : `Voici **« ${done.title} »** — chanson complète chantée 🎤 (${dur}), générée par **${done.engine}** (Hugging Face).\n\n` +
+                  `▶ Écoutez le morceau ci-dessous — les paroles sont dépliables dans la carte audio et le MP3 est téléchargeable.\n` +
+                  `Envie d'une autre version ? Demandez : autre style, paroles retouchées, plus longue, voix différente…`,
             )
           } else if (clientEvt && clientEvt.attempts.length > 0) {
             const ok = await clientStudioFlow(clientEvt, ac.signal)
@@ -990,13 +999,13 @@ export const useLumo = create<LumoState>()(
               await localSynth(
                 `🎛 Tous les accès au studio ont échoué (${clientEvt.reason}).\n` +
                   `Quotas GPU Hugging Face gratuits : compte ~1×/jour, accès public par connexion — ils se rechargent en quelques heures. ` +
-                  `En attendant, voici un **aperçu instrumental local** — une vraie chanson chantée nécessite le studio.\n\n`,
+                  `En attendant, voici un **aperçu local**${instrumental ? ' (mode instrumental demandé)' : ' — une vraie chanson chantée nécessite le studio'}.\n\n`,
               )
             }
           } else {
             await localSynth(
               `🎛 Studio DiffRhythm indisponible (${fallbackReason || 'raison inconnue'}).\n` +
-                `En attendant la réinitialisation du quota GPU (compte gratuit : ~1×/jour), voici un **aperçu instrumental local** — une vraie chanson chantée nécessite le studio.\n\n`,
+                `En attendant la réinitialisation du quota GPU (compte gratuit : ~1×/jour), voici un **aperçu local**${instrumental ? '' : ' — une vraie chanson chantée nécessite le studio'}.\n\n`,
             )
           }
         } catch (e) {

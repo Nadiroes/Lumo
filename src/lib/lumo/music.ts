@@ -357,7 +357,10 @@ function triadChord(rootMidi: number, minor: boolean): number[] {
 /* ---------- rendu ---------- */
 
 export async function generateMusic(req: MusicRequest): Promise<MusicResult> {
-  const seed = hashString(req.prompt.trim().toLowerCase() + '|' + req.style)
+  /* Graine salée à chaque appel : deux envois du même prompt donnent deux prises
+   * différentes (variatio de BPM, progression, motif) au lieu du même son répété. */
+  const salt = `${Date.now().toString(36)}-${Math.floor(Math.random() * 0xffffffff).toString(36)}`
+  const seed = hashString(req.prompt.trim().toLowerCase() + '|' + req.style + '|' + salt)
   const rand = mulberry32(seed)
   const preset = pickPreset(req.prompt, req.style)
   const bpm = preset.bpm + Math.floor(rand() * 7) - 3

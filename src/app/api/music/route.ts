@@ -49,6 +49,8 @@ interface MusicBody {
   style?: string
   /** Durée cible approximative (s) — pilote le volume de paroles écrit */
   duration?: number
+  /** Instrumental : DiffRhythm compose sans paroles chantées */
+  instrumental?: boolean
   format?: 'mp3' | 'wav' | 'ogg'
 }
 
@@ -314,10 +316,11 @@ async function predictWithRetry(
   throw lastErr
 }
 
-/** Prompt de style consolidé (tags préréglés + tags libres + thème). */
+/** Prompt de style consolidé (tags préréglés + tags libres + thème [+ instrumental]). */
 function buildTextPrompt(body: MusicBody): string {
   const preset = STYLE_TAGS[body.style ?? 'auto'] ?? ''
-  return [preset, (body.tags ?? '').trim(), body.prompt].filter(Boolean).join(', ').slice(0, 300)
+  const base = [preset, (body.tags ?? '').trim(), body.prompt].filter(Boolean).join(', ').slice(0, 260)
+  return body.instrumental ? `${base ? base + ', ' : ''}instrumental, no vocals, music only`.slice(0, 300) : base
 }
 
 /** Paramètres de l'endpoint /infer_music du Space DiffRhythm 2. */
@@ -325,7 +328,7 @@ function buildV2Params(lrc: string, body: MusicBody): Record<string, unknown> {
   return {
     lrc,
     audio_prompt: null,
-    text_prompt: buildTextPrompt(body) || 'pop, piano, warm vocals',
+    text_prompt: buildTextPrompt(body) || (body.instrumental ? 'instrumental' : 'pop, piano, warm vocals'),
     seed: 0,
     randomize_seed: true,
     steps: 16,
@@ -356,9 +359,10 @@ function buildV1Params(lrc: string, body: MusicBody): Record<string, unknown> {
   })
   const duration = Math.max(30, Math.min(95, Math.round(START + lines.length * PER_LINE + 8)))
   return {
-    lrc: stamped.join('\n'),
+    /* v1 chante chaque ligne : en instrumental on laisse une seule ligne de vocalise minimale */
+    lrc: body.instrumental && stamped.length === 0 ? '[00:12.000] ♪' : stamped.join('\n'),
     ref_audio_path: null,
-    text_prompt: buildTextPrompt(body) || 'pop, piano, warm vocals',
+    text_prompt: buildTextPrompt(body) || (body.instrumental ? 'instrumental' : 'pop, piano, warm vocals'),
     seed: 0,
     randomize_seed: true,
     steps: 32,
@@ -456,7 +460,13 @@ export async function POST(req: NextRequest) {
         /* ---- 1. Paroles ---- */
         let title: string
         let lrc: string
-        if (userLyrics && hasV2Sections(userLyrics)) {
+        if (body.instrumental) {
+          /* Instrumental : pas de parolier — LRC minimal, le prompt « no vocals » dirige le style.
+           * DiffRhythm 2 génère alors une pièce musicale sans voix. */
+          title = fallbackTitle(body, '')
+          lrc = '[start]'
+          safeEmit({ stage: 'lyrics', source: 'instrumental', title, lrc })
+        } else if (userLyrics && hasV2Sections(userLyrics)) {
           title = fallbackTitle(body, userLyrics)
           lrc = userLyrics.startsWith('[start]') ? userLyrics : `[start]\n${userLyrics}`
           safeEmit({ stage: 'lyrics', source: 'user', title, lrc })

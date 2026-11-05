@@ -159,6 +159,8 @@ export interface MusicRequest {
   tags?: string
   style?: string
   duration?: number
+  /** Instrumental : DiffRhythm compose sans voix chantées */
+  instrumental?: boolean
   format?: 'mp3' | 'wav' | 'ogg'
 }
 

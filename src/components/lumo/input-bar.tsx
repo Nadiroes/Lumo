@@ -431,7 +431,7 @@ function Composer({
                 className="h-6 gap-1 px-2 text-[11px]"
                 onClick={() => setInstrumental((v) => !v)}
                 aria-pressed={instrumental}
-                title="Instrumental : synthèse locale sans voix chantée (DiffRhythm 2 chante le texte)"
+                title="Instrumental : le studio DiffRhythm compose une pièce sans voix chantée (repli local si le studio est saturé)"
               >
                 <Music2 className="h-3 w-3" /> Instrumental
               </Button>
