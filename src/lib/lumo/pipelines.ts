@@ -125,7 +125,8 @@ export const PIPELINES: Record<PipelineId, PipelineDef> = {
       },
     ],
     totalBytes: Math.round(2.6 * GB),
-    ramMinBytes: Math.round(4 * GB),
+    // ~1,2 Go (modèle bf16) + codec fp32 + runtime torch : 5 Go réels minimum
+    ramMinBytes: Math.round(5 * GB),
     gpuRecommended: false,
     runner: 'tts_run.py',
   },
