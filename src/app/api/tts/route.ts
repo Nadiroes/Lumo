@@ -26,8 +26,10 @@ async function attemptAudio8(text: string): Promise<{ buf: Buffer; note: string 
       buf,
       note: 'Synthèse locale Audio8 TTS (0.6B · Realistic Air) — aucune donnée envoyée en ligne.',
     }
-  } catch {
-    return undefined // bascule silencieuse sur le moteur intégré
+  } catch (e) {
+    // Bascule sur le moteur intégré, mais l'échec local reste visible dans les logs serveur
+    console.error('[tts] pipeline Audio8 indisponible :', e instanceof Error ? e.message : e)
+    return undefined
   }
 }
 
