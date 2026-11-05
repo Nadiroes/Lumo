@@ -2,7 +2,8 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   output: "standalone",
-  /* config options here */
+  /* Autorise le domaine de prévisualisation à charger les chunks dev /_next/* */
+  allowedDevOrigins: ["*.space-z.ai"],
   typescript: {
     ignoreBuildErrors: true,
   },
