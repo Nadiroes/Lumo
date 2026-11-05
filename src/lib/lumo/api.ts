@@ -19,6 +19,8 @@ export interface ChatOverride {
   hfModel?: string
   /** Modèle du lien HF général — sert de relais si hfModel échoue (quota…) */
   globalHf?: string
+  /** Modèle local (GGUF, runtime CPU llama.cpp) — tête de chaîne de repli */
+  localModel?: string
 }
 
 export async function apiChat(
@@ -126,6 +128,57 @@ export async function apiImage(
     engine: json.engine ? String(json.engine) : undefined,
     note: json.note ? String(json.note) : undefined,
   }
+}
+
+/* ---------------- Moteur local (llama.cpp CPU) ---------------- */
+
+export interface LocalEngineStatus {
+  running: boolean
+  port?: number
+}
+
+export interface LocalDownloadState {
+  id: string
+  repoId: string
+  file: string
+  status: 'download' | 'done' | 'error'
+  bytes: number
+  total: number
+  startedAt: number
+  error?: string
+  speed?: number
+}
+
+export interface LocalStatus {
+  ok: true
+  runtime: { installed: boolean; dir?: string; version?: string; url: string }
+  disk: { totalBytes: number; freeBytes: number }
+  ram: { totalBytes: number; freeBytes: number }
+  models: {
+    id: string
+    repoId: string
+    file: string
+    size: number
+    addedAt: number
+    engine: LocalEngineStatus
+  }[]
+  downloads: LocalDownloadState[]
+}
+
+export async function apiLocalStatus(): Promise<LocalStatus> {
+  const res = await fetch('/api/local')
+  return (await res.json()) as LocalStatus
+}
+
+export async function apiLocalAction(body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const res = await fetch('/api/local', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const json = (await res.json()) as { ok?: boolean; error?: string }
+  if (!res.ok || !json.ok) throw new Error(json.error || 'Action du moteur local impossible.')
+  return json as Record<string, unknown>
 }
 
 /** Détection d'un lien HF : dépôt précis, organisation (liste des modèles) ou recherche */

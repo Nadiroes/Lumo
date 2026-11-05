@@ -7,20 +7,29 @@
  *   (huggingface.co/deepseek-ai → tous ses modèles) ou simple nom à rechercher.
  * - Les modèles détectés sont listés pour être CHARGÉS puis UTILISÉS dans ce bloc,
  *   indépendamment du lien HF général (qui reste actif comme une connexion API).
- * - Chaîne de repli à la génération : modèle du bloc → lien général → clés API → Lumo Core.
+ * - Moteur local (llama.cpp CPU) : les fichiers .gguf peuvent être INSTALLÉS sur la
+ *   machine (vérification disque, aucune limite de taille) puis LANCÉS dans l'app.
+ * - Chaîne de repli à la génération : modèle local → modèle du bloc → lien
+ *   général → clés API → Lumo Core.
  */
 
-import { useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import {
   ArrowUpRight,
   Check,
   Cuboid,
+  Cpu,
   Database,
+  Download,
   Folder,
+  HardDrive,
   Link2,
   Loader2,
+  Play,
   RotateCcw,
   ShieldCheck,
+  Square,
+  Trash2,
   TriangleAlert,
   X,
 } from 'lucide-react'
@@ -28,7 +37,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { useToast } from '@/hooks/use-toast'
-import { apiHfDetect } from '@/lib/lumo/api'
+import { apiHfDetect, apiLocalAction, apiLocalStatus, type LocalStatus } from '@/lib/lumo/api'
 import { hfTaskToCaps, type Capability } from '@/lib/lumo/providers'
 import { useLumo } from '@/lib/lumo/store'
 import {
@@ -106,6 +115,8 @@ function RepoFiles({
   files,
   onOpenDir,
   loadingDir,
+  onInstallLocal,
+  busyFile,
 }: {
   repoId: string
   kind: string
@@ -113,6 +124,9 @@ function RepoFiles({
   files: { path: string; size: number; ext: string }[]
   onOpenDir: (dir: string) => void
   loadingDir: boolean
+  /** Installe un .gguf sur la machine (runtime CPU) */
+  onInstallLocal?: (file: string, size: number) => void
+  busyFile?: string | null
 }) {
   return (
     <div className="mt-2 space-y-1.5">
@@ -137,6 +151,7 @@ function RepoFiles({
       {files.length > 0 ? (
         <ul className="space-y-1">
           {files.map((f) => {
+            const gguf = /\.gguf$/i.test(f.path)
             const weight = /\.(safetensors|gguf|onnx|bin|pth|ckpt|tar|tgz)$/i.test(f.path)
             return (
               <li key={f.path} className="flex items-center gap-2 rounded-md border bg-background px-2 py-1.5">
@@ -147,6 +162,23 @@ function RepoFiles({
                   {weight ? 'poids · ' : 'config · '}
                   {fmtSize(f.size)}
                 </span>
+                {gguf && onInstallLocal && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-6 shrink-0 gap-1 px-2 text-[10px]"
+                    disabled={busyFile === f.path}
+                    onClick={() => onInstallLocal(f.path, f.size)}
+                    title="Installer ce modèle sur cette machine (CPU) et l'utiliser dans l'app"
+                  >
+                    {busyFile === f.path ? (
+                      <Loader2 className="h-2.5 w-2.5 animate-spin" />
+                    ) : (
+                      <Download className="h-2.5 w-2.5" />
+                    )}
+                    Local
+                  </Button>
+                )}
                 <a
                   href={`https://huggingface.co/${kind === 'dataset' ? 'datasets/' : ''}${repoId}/resolve/main/${f.path}`}
                   target="_blank"
@@ -167,6 +199,175 @@ function RepoFiles({
             Aucun fichier de poids détecté — le dépôt reste utilisable par son identifiant.
           </p>
         )
+      )}
+    </div>
+  )
+}
+
+/* ---------------------------------------------------------------- */
+/* Moteur local : runtime, disque, modèles installés, téléchargements */
+/* ---------------------------------------------------------------- */
+
+function LocalModelsSection({
+  local,
+  busy,
+  onSetupRuntime,
+  onStart,
+  onStop,
+  onRemove,
+}: {
+  local: LocalStatus | null
+  busy: string | null
+  onSetupRuntime: () => void
+  onStart: (id: string) => void
+  onStop: (id: string) => void
+  onRemove: (id: string) => void
+}) {
+  const installed = local?.runtime.installed ?? false
+  const models = local?.models ?? []
+  const dls = (local?.downloads ?? []).filter((d) => d.status !== 'done')
+
+  return (
+    <div className="rounded-lg border p-2.5">
+      <div className="flex items-center justify-between gap-2">
+        <p className="flex items-center gap-1.5 text-xs font-semibold">
+          <Cpu className="h-3.5 w-3.5 shrink-0 text-primary" aria-hidden="true" />
+          Moteur local — CPU
+          {installed && local?.runtime.version && (
+            <span className="truncate text-[10px] font-normal text-muted-foreground">
+              {local.runtime.version.split('(')[0].trim()}
+            </span>
+          )}
+        </p>
+        {local && (
+          <p className="flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground" title="Espace disque libre">
+            <HardDrive className="h-3 w-3" aria-hidden="true" />
+            {fmtSize(local.disk.freeBytes)} libres
+          </p>
+        )}
+      </div>
+
+      {!installed ? (
+        <div className="mt-2 space-y-2">
+          <p className="text-[11px] leading-snug text-muted-foreground">
+            Exécutez les modèles <span className="font-mono">.gguf</span> directement sur cette machine (CPU) :
+            aucune donnée envoyée en ligne, aucun quota. Installation une seule fois (~25 Mo).
+          </p>
+          <Button
+            size="sm"
+            className="h-7 w-full gap-1 text-[11px]"
+            disabled={busy === 'runtime'}
+            onClick={onSetupRuntime}
+          >
+            {busy === 'runtime' ? <Loader2 className="h-3 w-3 animate-spin" /> : <Download className="h-3 w-3" />}
+            Installer le runtime local (llama.cpp)
+          </Button>
+        </div>
+      ) : (
+        <div className="mt-2 space-y-1.5">
+          {/* Téléchargements en cours / en erreur */}
+          {dls.map((d) => {
+            const pct = d.total > 0 ? Math.min(100, Math.round((d.bytes / d.total) * 100)) : null
+            return (
+              <div key={d.id} className="rounded-md border bg-background px-2 py-1.5">
+                <div className="flex items-center gap-2">
+                  {d.status === 'download' ? (
+                    <Loader2 className="h-3 w-3 shrink-0 animate-spin text-primary" aria-hidden="true" />
+                  ) : (
+                    <TriangleAlert className="h-3 w-3 shrink-0 text-destructive" aria-hidden="true" />
+                  )}
+                  <span className="min-w-0 flex-1 truncate font-mono text-[11px]">{d.file.split('/').pop()}</span>
+                  <span className="shrink-0 text-[10px] text-muted-foreground">
+                    {pct !== null ? `${pct} % · ${fmtSize(d.bytes)}` : fmtSize(d.bytes)}
+                    {d.speed ? ` · ${fmtSize(d.speed)}/s` : ''}
+                  </span>
+                </div>
+                {pct !== null && (
+                  <div className="mt-1 h-1 overflow-hidden rounded-full bg-muted" role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}>
+                    <div className="h-full rounded-full bg-primary transition-all" style={{ width: `${pct}%` }} />
+                  </div>
+                )}
+                {d.status === 'error' && <p className="mt-1 text-[10px] text-destructive">{d.error}</p>}
+              </div>
+            )
+          })}
+
+          {/* Modèles installés */}
+          {models.map((m) => (
+            <div key={m.id} className="flex items-center gap-2 rounded-md border bg-background px-2 py-1.5">
+              <span
+                className={`h-1.5 w-1.5 shrink-0 rounded-full ${m.engine.running ? 'bg-emerald-500' : 'bg-muted-foreground/40'}`}
+                aria-hidden="true"
+              />
+              <div className="min-w-0 flex-1">
+                <p className="truncate font-mono text-[11px]" title={m.file}>
+                  {m.file.split('/').pop()}
+                </p>
+                <p className="truncate text-[10px] text-muted-foreground">
+                  {m.repoId} · {fmtSize(m.size)}
+                  {m.engine.running ? ` · en cours (port ${m.engine.port})` : ' · prêt'}
+                </p>
+              </div>
+              <div className="flex shrink-0 items-center gap-0.5">
+                {m.engine.running ? (
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-6 w-6"
+                    disabled={busy === `stop:${m.id}`}
+                    onClick={() => onStop(m.id)}
+                    aria-label="Arrêter le modèle"
+                    title="Arrêter (libère la RAM)"
+                  >
+                    {busy === `stop:${m.id}` ? (
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <Square className="h-2.5 w-2.5" />
+                    )}
+                  </Button>
+                ) : (
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-6 w-6"
+                    disabled={busy === `start:${m.id}`}
+                    onClick={() => onStart(m.id)}
+                    aria-label="Démarrer le modèle"
+                    title="Démarrer en local"
+                  >
+                    {busy === `start:${m.id}` ? (
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <Play className="h-2.5 w-2.5" />
+                    )}
+                  </Button>
+                )}
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-6 w-6 text-muted-foreground hover:text-destructive"
+                  disabled={busy === `rm:${m.id}`}
+                  onClick={() => onRemove(m.id)}
+                  aria-label="Supprimer le modèle local"
+                  title="Supprimer du disque"
+                >
+                  {busy === `rm:${m.id}` ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <Trash2 className="h-2.5 w-2.5" />
+                  )}
+                </Button>
+              </div>
+            </div>
+          ))}
+
+          {models.length === 0 && dls.length === 0 && (
+            <p className="text-[10px] leading-snug text-muted-foreground">
+              Aucun modèle local — cliquez « Local » à côté d'un fichier <span className="font-mono">.gguf</span>{' '}
+              d'un dépôt pour l'installer ici. La vérification du disque est automatique, sans limite de taille.
+            </p>
+          )}
+        </div>
       )}
     </div>
   )
@@ -203,6 +404,31 @@ export function BlockHfButton({
   const [result, setResult] = useState<HfDetectResult | null>(null)
   const [dir, setDir] = useState<string | undefined>(undefined)
 
+  /* ----- état du moteur local ----- */
+  const [local, setLocal] = useState<LocalStatus | null>(null)
+  const [localBusy, setLocalBusy] = useState<string | null>(null)
+  /** Modèle fraîchement installé à démarrer dès que le téléchargement est fini */
+  const [pendingStart, setPendingStart] = useState<string | null>(null)
+
+  const refreshLocal = useCallback(async () => {
+    try {
+      setLocal(await apiLocalStatus())
+    } catch {
+      /* panneau local indisponible : silencieux */
+    }
+  }, [])
+
+  useEffect(() => {
+    if (open) void refreshLocal()
+  }, [open, refreshLocal])
+
+  const hasActiveDownload = local?.downloads.some((d) => d.status === 'download') ?? false
+  useEffect(() => {
+    if (!open || (!hasActiveDownload && !pendingStart)) return
+    const t = setInterval(() => void refreshLocal(), 1500)
+    return () => clearInterval(t)
+  }, [open, hasActiveDownload, pendingStart, refreshLocal])
+
   const cfg: HfLinkConfig | null | undefined = isGlobal ? globalHf : blockHf
   const label = isGlobal ? 'Lien HF général' : mode ? `Bloc ${MODE_INFO[mode].label}` : 'Bloc'
   const capability: Capability | undefined = !isGlobal && mode ? MODE_INFO[mode].capability : undefined
@@ -228,6 +454,7 @@ export function BlockHfButton({
           repoId: m.id,
           models: [{ id: m.id, task: m.task, downloads: m.downloads, likes: m.likes }],
           selected: r.kind === 'model' && verified ? m.id : undefined,
+          local: cfg?.repoId === m.id ? cfg?.local : undefined,
           status:
             r.kind === 'dataset'
               ? 'Jeu de données reconnu — consultation/téléchargement uniquement (non exécutable).'
@@ -279,6 +506,7 @@ export function BlockHfButton({
       repoId: result?.kind === 'org' ? result.query : c.id.split('/')[0],
       models: result?.models ?? [c],
       selected: c.id,
+      local: cfg?.repoId === c.id ? cfg?.local : undefined,
       status: `Modèle actif : ${c.id}`,
       updatedAt: Date.now(),
     }
@@ -319,6 +547,147 @@ export function BlockHfButton({
     }
   }
 
+  /* ----- actions du moteur local ----- */
+
+  const setupRuntime = async () => {
+    setLocalBusy('runtime')
+    try {
+      await apiLocalAction({ action: 'setup-runtime' })
+      await refreshLocal()
+      toast({
+        title: 'Runtime local installé',
+        description: 'llama.cpp est prêt — installez un .gguf depuis un dépôt pour travailler hors ligne.',
+      })
+    } catch (e) {
+      toast({
+        title: 'Installation impossible',
+        description: e instanceof Error ? e.message : 'Réessayez.',
+        variant: 'destructive',
+      })
+    } finally {
+      setLocalBusy(null)
+    }
+  }
+
+  /** Installe un .gguf du dépôt détecté sur la machine (disque vérifié côté serveur) */
+  const installLocal = async (file: string, size: number) => {
+    const repoId = result?.model?.id ?? cfg?.repoId ?? link.trim()
+    if (!repoId.includes('/')) return
+    const id = `${repoId}::${file}`
+    setLocalBusy(`dl:${file}`)
+    try {
+      await apiLocalAction({ action: 'download', repoId, file, sizeBytes: size })
+      setPendingStart(id)
+      void refreshLocal()
+      toast({
+        title: 'Installation locale lancée',
+        description: `${file.split('/').pop()} (${fmtSize(size)}) — progression dans « Moteur local ». Le démarrage est automatique à la fin.`,
+      })
+    } catch (e) {
+      toast({
+        title: 'Installation impossible',
+        description: e instanceof Error ? e.message : 'Vérifiez l’espace disque.',
+        variant: 'destructive',
+      })
+    } finally {
+      setLocalBusy(null)
+    }
+  }
+
+  const startLocal = async (id: string) => {
+    setLocalBusy(`start:${id}`)
+    try {
+      await apiLocalAction({ action: 'start', id })
+      await refreshLocal()
+      const m = local?.models.find((x) => x.id === id)
+      // Le bloc adopte le modèle local : priorité maximale dans la chaîne de repli
+      if (!isGlobal && mode) {
+        const repoId = m?.repoId ?? id.split('::')[0]
+        const file = m?.file ?? id.split('::')[1] ?? id
+        const cur: HfLinkConfig =
+          cfg ?? {
+            link: `https://huggingface.co/${repoId}`,
+            kind: 'model',
+            repoId,
+            models: [],
+            status: '',
+            updatedAt: Date.now(),
+          }
+        setBlockHf(mode, {
+          ...cur,
+          repoId: cur.repoId ?? repoId,
+          local: id,
+          status: `Modèle local actif : ${file.split('/').pop()} (CPU) — prioritaire dans ce bloc.`,
+          updatedAt: Date.now(),
+        })
+      }
+      toast({
+        title: 'Modèle lancé en local',
+        description: isGlobal
+          ? 'Le modèle tourne sur cette machine.'
+          : `${m?.file.split('/').pop() ?? id} travaille dans le bloc ${mode ? MODE_INFO[mode].label : ''} — priorité sur les liens HF.`,
+      })
+    } catch (e) {
+      toast({
+        title: 'Démarrage impossible',
+        description: e instanceof Error ? e.message : 'Le modèle n’a pas pu être chargé en RAM.',
+        variant: 'destructive',
+      })
+    } finally {
+      setPendingStart(null)
+      setLocalBusy(null)
+    }
+  }
+
+  const stopLocal = async (id: string) => {
+    setLocalBusy(`stop:${id}`)
+    try {
+      await apiLocalAction({ action: 'stop', id })
+      await refreshLocal()
+      toast({ title: 'Modèle arrêté', description: 'La RAM est libérée — il reste installé sur le disque.' })
+    } catch (e) {
+      toast({ title: 'Arrêt impossible', description: e instanceof Error ? e.message : '', variant: 'destructive' })
+    } finally {
+      setLocalBusy(null)
+    }
+  }
+
+  const removeLocal = async (id: string) => {
+    setLocalBusy(`rm:${id}`)
+    try {
+      await apiLocalAction({ action: 'remove', id })
+      await refreshLocal()
+      if (!isGlobal && mode && cfg?.local === id) {
+        setBlockHf(mode, { ...cfg, local: undefined, status: 'Modèle local supprimé — retour au lien du bloc.' })
+      }
+      toast({ title: 'Modèle supprimé', description: 'Le disque est libéré.' })
+    } catch (e) {
+      toast({ title: 'Suppression impossible', description: e instanceof Error ? e.message : '', variant: 'destructive' })
+    } finally {
+      setLocalBusy(null)
+    }
+  }
+
+  /* Démarrage auto après installation : le modèle apparaît dans la liste → on le lance */
+  useEffect(() => {
+    if (!pendingStart || !local) return
+    const done = local.models.find((m) => m.id === pendingStart)
+    if (done) {
+      setPendingStart(null)
+      void startLocal(done.id)
+      return
+    }
+    const dl = local.downloads.find((d) => d.id === pendingStart)
+    if (dl?.status === 'error') {
+      setPendingStart(null)
+      toast({
+        title: 'Téléchargement interrompu',
+        description: dl.error,
+        variant: 'destructive',
+      })
+    }
+  }, [local, pendingStart])
+
   const capsFor = (c: HfCandidate) => hfTaskToCaps(c.task, c.id).filter((x) => (capability ? x === capability : true))
 
   return (
@@ -328,20 +697,26 @@ export function BlockHfButton({
           <Button
             variant="outline"
             size="sm"
-            className={`h-8 max-w-48 gap-1.5 text-xs ${cfg?.selected ? 'border-primary/50 text-primary' : ''}`}
-            aria-label={`${label} : ${cfg?.selected ? `actif (${cfg.selected})` : 'non configuré'}. Configurer le lien Hugging Face.`}
+            className={`h-8 max-w-48 gap-1.5 text-xs ${cfg?.selected || cfg?.local ? 'border-primary/50 text-primary' : ''}`}
+            aria-label={`${label} : ${cfg?.local ? `modèle local actif (${cfg.local.split('::').pop()})` : cfg?.selected ? `actif (${cfg.selected})` : 'non configuré'}. Configurer le lien Hugging Face.`}
           >
             {cfg?.kind === 'dataset' ? (
               <Database className="h-3.5 w-3.5 shrink-0 text-amber-500" aria-hidden="true" />
+            ) : cfg?.local ? (
+              <Cpu className="h-3.5 w-3.5 shrink-0 text-primary" aria-hidden="true" />
             ) : (
               <Link2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
             )}
             <span className="truncate">
               {isGlobal ? 'HF général' : `HF · ${mode ? MODE_INFO[mode].label : ''}`}
-              {cfg?.selected ? ` : ${cfg.selected.split('/').pop()}` : ''}
+              {cfg?.local
+                ? ` : ${cfg.local.split('::').pop()?.replace(/\.gguf$/i, '')}`
+                : cfg?.selected
+                  ? ` : ${cfg.selected.split('/').pop()}`
+                  : ''}
             </span>
             <span
-              className={`h-1.5 w-1.5 shrink-0 rounded-full ${cfg?.selected ? 'bg-emerald-500' : cfg ? 'bg-amber-500' : 'bg-muted-foreground/40'}`}
+              className={`h-1.5 w-1.5 shrink-0 rounded-full ${cfg?.local ? 'bg-emerald-500' : cfg?.selected ? 'bg-emerald-500' : cfg ? 'bg-amber-500' : 'bg-muted-foreground/40'}`}
               aria-hidden="true"
             />
           </Button>
@@ -357,24 +732,33 @@ export function BlockHfButton({
           </p>
         </div>
 
-        <div className="max-h-[26rem] space-y-3 overflow-y-auto p-3 scrollbar-thin">
+        <div className="max-h-[32rem] space-y-3 overflow-y-auto p-3 scrollbar-thin">
           {/* Lien actif */}
           {cfg && (
             <div className="rounded-lg border bg-primary/5 p-2.5">
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0">
                   <p className="flex items-center gap-1.5 text-xs font-medium">
-                    <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-emerald-500" aria-hidden="true" />
-                    <span className="truncate">{cfg.selected ?? cfg.repoId ?? cfg.link}</span>
+                    {cfg.local ? (
+                      <Cpu className="h-3.5 w-3.5 shrink-0 text-emerald-500" aria-hidden="true" />
+                    ) : (
+                      <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-emerald-500" aria-hidden="true" />
+                    )}
+                    <span className="truncate">{cfg.local ?? cfg.selected ?? cfg.repoId ?? cfg.link}</span>
                   </p>
                   <p className="mt-0.5 truncate text-[10px] text-muted-foreground">
-                    {isGlobal ? 'relais général' : 'prioritaire dans ce bloc'} · {cfg.kind}
-                    {cfg.selected ? '' : ' — aucun modèle actif'}
+                    {cfg.local
+                      ? 'modèle local (CPU) · prioritaire dans ce bloc'
+                      : isGlobal
+                        ? 'relais général'
+                        : 'prioritaire dans ce bloc'}{' '}
+                    · {cfg.kind}
+                    {cfg.selected || cfg.local ? '' : ' — aucun modèle actif'}
                   </p>
                   {cfg.status && <p className="mt-1 text-[10px] leading-snug text-muted-foreground">{cfg.status}</p>}
                 </div>
                 <div className="flex shrink-0 gap-1">
-                  {cfg.selected && (
+                  {(cfg.selected || cfg.local) && (
                     <Button
                       variant="ghost"
                       size="icon"
@@ -472,6 +856,8 @@ export function BlockHfButton({
                     dirs={result.model.dirs ?? []}
                     files={result.model.files ?? []}
                     loadingDir={loading}
+                    onInstallLocal={installLocal}
+                    busyFile={localBusy?.startsWith('dl:') ? localBusy.slice(3) : null}
                     onOpenDir={(d) => {
                       const base = (result.model?.id ?? link).trim()
                       void detect(base, d)
@@ -489,12 +875,23 @@ export function BlockHfButton({
               <span className="font-mono">Wan2.2</span> (recherche). {hfModels.length > 0 && `${hfModels.length} modèle(s) déjà dans la bibliothèque.`}
             </p>
           )}
+
+          {/* Moteur local : runtime, disque, modèles installés */}
+          <LocalModelsSection
+            local={local}
+            busy={localBusy}
+            onSetupRuntime={setupRuntime}
+            onStart={startLocal}
+            onStop={stopLocal}
+            onRemove={removeLocal}
+          />
         </div>
 
         <div className="border-t bg-muted/40 px-3 py-2">
           <p className="text-[10px] leading-snug text-muted-foreground">
-            <strong>Chaîne de repli :</strong> modèle du bloc → lien général → clés API (Mistral, Agnes…) → moteur Lumo.
-            En cas de quota épuisé, le relais s'active automatiquement et la note s'affiche sous la réponse.
+            <strong>Chaîne de repli :</strong> modèle local (CPU) → modèle du bloc → lien général → clés API (Mistral,
+            Agnes…) → moteur Lumo. En cas de quota épuisé ou d'absence de réseau, le relais s'active automatiquement et
+            la note s'affiche sous la réponse.
           </p>
         </div>
       </PopoverContent>

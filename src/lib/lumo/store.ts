@@ -167,18 +167,20 @@ export interface SendOptions {
 }
 
 /**
- * Override de chaîne HF pour un bloc : le modèle du bloc travaille en premier,
- * le modèle du lien général prend le relais en cas d'échec (quota…),
- * puis les clés API puis Lumo Core (chaîne gérée côté serveur).
+ * Override de chaîne pour un bloc : le modèle local (CPU) travaille en premier,
+ * puis le modèle du bloc, le modèle du lien général prend le relais en cas
+ * d'échec (quota…), puis les clés API puis Lumo Core (chaîne côté serveur).
  */
 function hfOverrideFor(block: HfLinkConfig | undefined, glob: HfLinkConfig | null): ChatOverride | undefined {
   const hfModel = block?.selected
   const globalHf = glob?.selected
-  if (!hfModel && !globalHf) return undefined
+  const localModel = block?.local
+  if (!hfModel && !globalHf && !localModel) return undefined
   return {
     provider: 'hf',
     hfModel: hfModel ?? globalHf,
     globalHf: globalHf && globalHf !== hfModel ? globalHf : undefined,
+    localModel,
   }
 }
 
@@ -351,7 +353,9 @@ export const useLumo = create<LumoState>()(
             : override?.provider && override.provider !== 'lumo-core'
               ? override.provider
               : blockOv
-                ? `hf:${blockOv.hfModel}`
+                ? blockOv.localModel && !blockOv.hfModel
+                  ? `local:${blockOv.localModel.split('::').pop()}`
+                  : `hf:${blockOv.hfModel}`
                 : session.models.text
         const assistantId = uid()
         addMessage(sessionId, {
@@ -385,6 +389,7 @@ export const useLumo = create<LumoState>()(
                   provider: override.provider as ChatOverride['provider'],
                   hfModel: override.hfModel,
                   globalHf: get().globalHf?.selected,
+                  localModel: get().blockHf[session.mode]?.local,
                 }
               : blockOv
 

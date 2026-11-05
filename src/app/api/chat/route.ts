@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import ZAI from 'z-ai-web-dev-sdk'
 import { db } from '@/lib/db'
+import { chatLocal, findLocalForRepo } from '@/lib/lumo/local-engine'
 
 export const runtime = 'nodejs'
 export const maxDuration = 120
@@ -173,7 +174,7 @@ function lumoCoreStream(fullSystem: string, history: Turn[]): ReadableStream<Uin
   })
 }
 
-/* ---------------- Chaîne de repli : bloc → lien général → clés API → Lumo Core ---------------- */
+/* ------------- Chaîne de repli : local → bloc → lien général → clés API → Lumo Core ------------- */
 
 interface ChainStep {
   source: string
@@ -194,6 +195,7 @@ async function runFallbackChain(
   history: Turn[],
   blockHf: string | undefined,
   globalHf: string | undefined,
+  localModelHint: string | undefined,
 ): Promise<{ content: string; providerUsed: string; chain: ChainStep[]; note?: string }> {
   const chain: ChainStep[] = []
   const hfKey = (await db.apiKey.findUnique({ where: { provider: 'huggingface' } }).catch(() => null))?.secret
@@ -208,6 +210,22 @@ async function runFallbackChain(
       const msg = e instanceof Error ? e.message : 'erreur inconnue'
       chain.push({ source, model, ok: false, error: msg.slice(0, 180) })
       return null
+    }
+  }
+
+  // 0) Moteur local (CPU, llama.cpp) — prioritaire quand installé : rapide, sans quota,
+  //    les données ne quittent pas la machine. Choisi explicitement, ou retrouvé
+  //    automatiquement quand un GGUF du modèle de bloc est installé.
+  const localId = localModelHint || (blockHf ? (await findLocalForRepo(blockHf))?.id : undefined)
+  if (localId) {
+    const content = await tryStep('local', localId, () => chatLocal(localId, fullSystem, history))
+    if (content !== null) {
+      return {
+        content,
+        providerUsed: `local:${localId}`,
+        chain,
+        note: `Généré localement sur CPU par ${localId.split('::').pop()} — aucune donnée envoyée en ligne.`,
+      }
     }
   }
 
@@ -301,6 +319,8 @@ export async function POST(req: NextRequest) {
     const hfModel: string | undefined = typeof body.hfModel === 'string' && body.hfModel.trim() ? body.hfModel.trim() : undefined
     const globalHf: string | undefined =
       typeof body.globalHf === 'string' && body.globalHf.trim() ? body.globalHf.trim() : undefined
+    const localModel: string | undefined =
+      typeof body.localModel === 'string' && body.localModel.trim() ? body.localModel.trim() : undefined
     const wantStream: boolean = body.stream === true
 
     if (!messages.length) {
@@ -326,9 +346,9 @@ export async function POST(req: NextRequest) {
       /* la mémoire est optionnelle */
     }
 
-    /* ---- Chaîne de repli : modèle de bloc → lien général → clés API → Lumo Core ---- */
-    if (hfModel || globalHf) {
-      const r = await runFallbackChain(fullSystem, history, hfModel, globalHf)
+    /* ---- Chaîne de repli : local → modèle de bloc → lien général → clés API → Lumo Core ---- */
+    if (hfModel || globalHf || localModel) {
+      const r = await runFallbackChain(fullSystem, history, hfModel, globalHf, localModel)
       if (r.content) {
         return NextResponse.json({
           ok: true,

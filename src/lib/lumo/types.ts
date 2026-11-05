@@ -213,6 +213,8 @@ export interface HfLinkConfig {
   models: HfCandidate[]
   /** Modèle actif — celui qui travaille dans le bloc (ou en relais général) */
   selected?: string
+  /** Modèle GGUF installé en local (runtime CPU) — prioritaire sur tout le reste dans ce bloc */
+  local?: string
   /** Dernier état connu (erreur de quota, note de relais…) */
   status?: string
   updatedAt: number
