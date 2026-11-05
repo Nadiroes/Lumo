@@ -92,10 +92,10 @@ function hasV2Sections(raw: string): boolean {
   return /^\s*\[(?:start|intro|verse|chorus|bridge|outro)\]/im.test(raw)
 }
 
-async function getUserHfToken(): Promise<string | undefined> {
+async function getUserHfToken(): Promise<`hf_${string}` | undefined> {
   try {
     const key = await db.apiKey.findFirst({ where: { provider: 'huggingface' }, select: { secret: true } })
-    return key?.secret || undefined
+    return (key?.secret || undefined) as `hf_${string}` | undefined
   } catch {
     return undefined
   }
@@ -106,14 +106,68 @@ interface LyricsResult {
   lrc: string
 }
 
-function parseLyricsJson(raw: string, what: string): LyricsResult {
+/** Nettoie un lrc parsé : « \\n » littéraux → retours ligne, backslashes parasites, espaces. */
+function sanitizeLrc(raw: string): string {
+  return raw
+    .replace(/\\r/g, '')
+    .replace(/\\n/g, '\n') // « \n » écrit littéralement par le modèle
+    .replace(/\\(?!["\\/bfnrtu])/g, '') // backslash isolé parasite
+    .split('\n')
+    .map((l) => l.replace(/\s+$/, ''))
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+/**
+ * Parse la réponse du parolier avec tolérance :
+ * 1. JSON strict extrait du texte ; 2. réparation des échappements invalides
+ * et caractères de contrôle ; 3. extraction par regex du champ lrc en dernier recours.
+ */
+function tolerantParseLyrics(raw: string): { title: string; lrc: string } | undefined {
   const start = raw.indexOf('{')
   const end = raw.lastIndexOf('}')
-  if (start < 0 || end <= start) throw new Error(`${what} : réponse illisible`)
-  const parsed = JSON.parse(raw.slice(start, end + 1)) as { title?: string; lrc?: string }
-  const lrc = String(parsed.lrc ?? '').trim()
+  if (start < 0 || end <= start) return undefined
+  const chunk = raw.slice(start, end + 1)
+
+  try {
+    const parsed = JSON.parse(chunk) as { title?: string; lrc?: string }
+    if (parsed?.lrc) return { title: String(parsed.title ?? ''), lrc: String(parsed.lrc) }
+  } catch {
+    /* réparation ci-dessous */
+  }
+
+  try {
+    const repaired = chunk
+      .replace(/\\(?!["\\/bfnrtu])/g, '\\\\') // \x invalide → \\x
+      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, ' ') // contrôles bruts
+    const parsed = JSON.parse(repaired) as { title?: string; lrc?: string }
+    if (parsed?.lrc) return { title: String(parsed.title ?? ''), lrc: String(parsed.lrc) }
+  } catch {
+    /* extraction regex ci-dessous */
+  }
+
+  const lrcMatch = chunk.match(/"lrc"\s*:\s*"([\s\S]*)/) // jusqu'à la fin, on déséchappe à la main
+  if (lrcMatch) {
+    let body = lrcMatch[1]
+    const lastQuote = body.lastIndexOf('"')
+    if (lastQuote > 0) body = body.slice(0, lastQuote)
+    const unescaped = body
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, '\\')
+      .replace(/\\n/g, '\n')
+    const titleMatch = chunk.match(/"title"\s*:\s*"([^"]*)"/)
+    return { title: titleMatch?.[1] ?? '', lrc: unescaped }
+  }
+  return undefined
+}
+
+function parseLyricsJson(raw: string, what: string): LyricsResult {
+  const parsed = tolerantParseLyrics(raw)
+  if (!parsed) throw new Error(`${what} : réponse illisible`)
+  const lrc = sanitizeLrc(parsed.lrc)
   if (!lrc || !hasV2Sections(lrc)) throw new Error(`${what} : sections absentes`)
-  return { title: String(parsed.title ?? '').trim() || 'Chanson Lumo', lrc }
+  return { title: parsed.title.trim() || 'Chanson Lumo', lrc }
 }
 
 /** Appel GLM : écrit des paroles complètes pour DiffRhythm 2. */
@@ -146,15 +200,31 @@ async function generateLyrics(body: MusicBody): Promise<LyricsResult> {
   ].join('\n')
 
   const zai = await ZAI.create()
-  const completion = await zai.chat.completions.create({
-    messages: [
-      { role: 'assistant', content: sys },
-      { role: 'user', content: user },
-    ],
-    thinking: { type: 'disabled' },
-  })
-  const raw = completion.choices[0]?.message?.content ?? ''
-  return parseLyricsJson(raw, 'Parolier')
+  // 1re tentative, puis 1 reprise avec consigne renforcée si le JSON est inexploitable
+  for (let essai = 0; essai < 2; essai++) {
+    const completion = await zai.chat.completions.create({
+      messages: [
+        { role: 'assistant', content: sys },
+        {
+          role: 'user',
+          content:
+            essai === 0
+              ? user
+              : user +
+                '\n\nATTENTION : ta réponse précédente était un JSON invalide. Réponds avec un UNIQUE objet JSON valide ' +
+                '(échappements \" et \\n corrects, aucun backslash superflu), sans texte autour.',
+        },
+      ],
+      thinking: { type: 'disabled' },
+    })
+    const raw = completion.choices[0]?.message?.content ?? ''
+    try {
+      return parseLyricsJson(raw, 'Parolier')
+    } catch (e) {
+      if (essai === 1) throw e
+    }
+  }
+  throw new Error('Parolier : réponse illisible')
 }
 
 /** Structure des paroles fournies par l'utilisateur (préserve ses mots). */
@@ -169,15 +239,22 @@ async function structureUserLyrics(body: MusicBody, cleaned: string): Promise<Ly
     'sections parmi [intro] [verse] [chorus] [bridge] [outro], une ligne par phrase, aucun commentaire.'
   const user = `Thème/contexte : « ${body.prompt} ». Style : ${[preset, body.tags ?? ''].filter(Boolean).join(', ') || 'libre'}.\n\nParoles à organiser :\n${cleaned}`
   const zai = await ZAI.create()
-  const completion = await zai.chat.completions.create({
-    messages: [
-      { role: 'assistant', content: sys },
-      { role: 'user', content: user },
-    ],
-    thinking: { type: 'disabled' },
-  })
-  const raw = completion.choices[0]?.message?.content ?? ''
-  return parseLyricsJson(raw, 'Arrangeur')
+  for (let essai = 0; essai < 2; essai++) {
+    const completion = await zai.chat.completions.create({
+      messages: [
+        { role: 'assistant', content: sys },
+        { role: 'user', content: user },
+      ],
+      thinking: { type: 'disabled' },
+    })
+    const raw = completion.choices[0]?.message?.content ?? ''
+    try {
+      return parseLyricsJson(raw, 'Arrangeur')
+    } catch (e) {
+      if (essai === 1) throw e
+    }
+  }
+  throw new Error('Arrangeur : réponse illisible')
 }
 
 /** Titre de secours dérivé du prompt ou de la première ligne de paroles. */
@@ -198,33 +275,115 @@ interface AudioResult {
   engine: string
 }
 
+/** Shape minimal du client Gradio utilisé ici. */
+interface GradioClient {
+  predict: (endpoint: string, params?: unknown) => Promise<{ data: unknown }>
+}
+
+/**
+ * Appel Space avec reconnexion automatique (nouvelle session Gradio à chaque essai).
+ * « 404: Session not found » = session périmée : le Space ZeroGPU a redémarré entre
+ * la connexion et l'appel — une reconnexion fraîche suffit presque toujours.
+ */
+async function predictWithRetry(
+  connect: () => Promise<GradioClient>,
+  endpoint: string,
+  params: Record<string, unknown>,
+  timeoutMs = 240_000,
+  tries = 3,
+): Promise<{ data: unknown }> {
+  let lastErr: unknown
+  for (let i = 0; i < tries; i++) {
+    try {
+      const client = await connect()
+      return (await Promise.race([
+        client.predict(endpoint, params),
+        new Promise<never>((_, rej) =>
+          setTimeout(() => rej(new Error(`Délai du studio dépassé (${Math.round(timeoutMs / 1000)} s)`)), timeoutMs),
+        ),
+      ])) as { data: unknown }
+    } catch (e) {
+      lastErr = e
+      const msg = e instanceof Error ? e.message : String(e)
+      const transient =
+        /session not found|connection closed|fetch failed|network|econnreset|socket|502|503|overloaded/i.test(msg)
+      if (!transient || i === tries - 1) throw e
+      await new Promise((r) => setTimeout(r, 1500 * (i + 1)))
+    }
+  }
+  throw lastErr
+}
+
+/** Prompt de style consolidé (tags préréglés + tags libres + thème). */
+function buildTextPrompt(body: MusicBody): string {
+  const preset = STYLE_TAGS[body.style ?? 'auto'] ?? ''
+  return [preset, (body.tags ?? '').trim(), body.prompt].filter(Boolean).join(', ').slice(0, 300)
+}
+
+/** Paramètres de l'endpoint /infer_music du Space DiffRhythm 2. */
+function buildV2Params(lrc: string, body: MusicBody): Record<string, unknown> {
+  return {
+    lrc,
+    audio_prompt: null,
+    text_prompt: buildTextPrompt(body) || 'pop, piano, warm vocals',
+    seed: 0,
+    randomize_seed: true,
+    steps: 16,
+    cfg_strength: 1.3,
+    file_type: body.format ?? 'mp3',
+    odeint_method: 'euler',
+  }
+}
+
+/**
+ * Paramètres du Space DiffRhythm 1 : convertit les paroles à sections en LRC
+ * horodaté (~4,2 s par ligne, chant régulier), durée plafonnée à 95 s.
+ */
+function buildV1Params(lrc: string, body: MusicBody): Record<string, unknown> {
+  const lines = lrc
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('['))
+  const START = 12
+  const PER_LINE = 4.2
+  let t = START
+  const stamped = lines.map((line) => {
+    const mm = String(Math.floor(t / 60)).padStart(2, '0')
+    const ss = (t % 60).toFixed(3).padStart(6, '0')
+    const out = `[${mm}:${ss}] ${line}`
+    t += PER_LINE
+    return out
+  })
+  const duration = Math.max(30, Math.min(95, Math.round(START + lines.length * PER_LINE + 8)))
+  return {
+    lrc: stamped.join('\n'),
+    ref_audio_path: null,
+    text_prompt: buildTextPrompt(body) || 'pop, piano, warm vocals',
+    seed: 0,
+    randomize_seed: true,
+    steps: 32,
+    cfg_strength: 4.0,
+    file_type: body.format ?? 'mp3',
+    odeint_method: 'euler',
+    preference_infer: 'quality first',
+    Music_Duration: duration,
+  }
+}
+
 /** Appel du Space DiffRhythm 2 (avec ou sans token HF) et téléchargement du morceau. */
 async function callSpaceV2(
   lrc: string,
   body: MusicBody,
-  token?: string,
+  token?: `hf_${string}`,
 ): Promise<AudioResult> {
   const { Client } = await import('@gradio/client')
-  const client = await Client.connect(SPACE_V2, token ? { token } : {})
-
-  const preset = STYLE_TAGS[body.style ?? 'auto'] ?? ''
-  const textPrompt = [preset, (body.tags ?? '').trim(), body.prompt].filter(Boolean).join(', ').slice(0, 300)
   const format = body.format ?? 'mp3'
 
-  const result = (await Promise.race([
-    client.predict('/infer_music', {
-      lrc,
-      audio_prompt: null,
-      text_prompt: textPrompt || 'pop, piano, warm vocals',
-      seed: 0,
-      randomize_seed: true,
-      steps: 16,
-      cfg_strength: 1.3,
-      file_type: format,
-      odeint_method: 'euler',
-    }),
-    new Promise<never>((_, rej) => setTimeout(() => rej(new Error('Délai du studio dépassé (240 s)')), 240_000)),
-  ])) as { data: unknown }
+  const result = await predictWithRetry(
+    () => Client.connect(SPACE_V2, token ? { token } : undefined) as Promise<GradioClient>,
+    '/infer_music',
+    buildV2Params(lrc, body),
+  )
 
   const first = Array.isArray(result.data) ? result.data[0] : result.data
   const url = (first as { url?: string })?.url
@@ -247,44 +406,13 @@ async function callSpaceV2(
  */
 async function callSpaceV1(lrc: string, body: MusicBody): Promise<AudioResult> {
   const { Client } = await import('@gradio/client')
-  const client = await Client.connect(SPACE_V1, {})
-
-  const lines = lrc
-    .split('\n')
-    .map((l) => l.trim())
-    .filter((l) => l && !l.startsWith('['))
-  const START = 12
-  const PER_LINE = 4.2
-  let t = START
-  const stamped = lines.map((line) => {
-    const mm = String(Math.floor(t / 60)).padStart(2, '0')
-    const ss = (t % 60).toFixed(3).padStart(6, '0')
-    const out = `[${mm}:${ss}] ${line}`
-    t += PER_LINE
-    return out
-  })
-
-  const preset = STYLE_TAGS[body.style ?? 'auto'] ?? ''
-  const textPrompt = [preset, (body.tags ?? '').trim(), body.prompt].filter(Boolean).join(', ').slice(0, 300)
   const format = body.format ?? 'mp3'
-  const duration = Math.max(30, Math.min(95, Math.round(START + lines.length * PER_LINE + 8)))
 
-  const result = (await Promise.race([
-    client.predict('/infer_music', {
-      lrc: stamped.join('\n'),
-      ref_audio_path: null,
-      text_prompt: textPrompt || 'pop, piano, warm vocals',
-      seed: 0,
-      randomize_seed: true,
-      steps: 32,
-      cfg_strength: 4.0,
-      file_type: format,
-      odeint_method: 'euler',
-      preference_infer: 'quality first',
-      Music_Duration: duration,
-    }),
-    new Promise<never>((_, rej) => setTimeout(() => rej(new Error('Délai du studio dépassé (240 s)')), 240_000)),
-  ])) as { data: unknown }
+  const result = await predictWithRetry(
+    () => Client.connect(SPACE_V1, {}) as Promise<GradioClient>,
+    '/infer_music',
+    buildV1Params(lrc, body),
+  )
 
   const first = Array.isArray(result.data) ? result.data[0] : result.data
   const url = (first as { url?: string })?.url
@@ -385,7 +513,9 @@ export async function POST(req: NextRequest) {
             const raw = e instanceof Error ? e.message : String(e)
             lastReason = isQuotaError(raw)
               ? `Quota GPU Hugging Face épuisé pour ${attempt.label}` + (quotaResetIn(raw) ? ` (réinitialisation dans ${quotaResetIn(raw)})` : '')
-              : raw.slice(0, 180)
+              : /session not found/i.test(raw)
+                ? `session du studio expirée (${attempt.label}) — le Space a redémarré, nouvelles tentatives effectuées`
+                : raw.slice(0, 180)
             safeEmit({ stage: 'studio-retry', label: attempt.label, reason: lastReason })
           }
         }
@@ -403,7 +533,19 @@ export async function POST(req: NextRequest) {
             durationSec,
           })
         } else {
-          safeEmit({ stage: 'fallback', reason: lastReason })
+          /* Tous les chemins serveur sont morts (quotas IP serveur, Space en redémarrage).
+           * Dernière carte : le navigateur de l'utilisateur appelle lui-même le Space —
+           * sa connexion possède son propre seau de quota ZeroGPU, indépendant du serveur. */
+          safeEmit({
+            stage: 'client-studio',
+            reason: lastReason,
+            title,
+            lrc,
+            attempts: [
+              { space: SPACE_V2, label: 'DiffRhythm 2', params: buildV2Params(lrc, body) },
+              { space: SPACE_V1, label: 'DiffRhythm 1 (≤ 95 s)', params: buildV1Params(lrc, body) },
+            ],
+          })
         }
       } catch (e) {
         safeEmit({

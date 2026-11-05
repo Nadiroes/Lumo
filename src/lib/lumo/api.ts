@@ -172,6 +172,20 @@ export interface MusicDoneEvent {
   durationSec: number
 }
 
+/** Tentative de studio exécutée directement depuis le navigateur (quota ZeroGPU propre à l'IP de l'utilisateur). */
+export interface ClientStudioAttempt {
+  space: string
+  label: string
+  params: Record<string, unknown>
+}
+
+export interface ClientStudioEvent {
+  reason: string
+  title: string
+  lrc: string
+  attempts: ClientStudioAttempt[]
+}
+
 export interface MusicStreamHandlers {
   onLyrics?: (lrc: string, title: string, source: string) => void
   onStudio?: (engine: string) => void
@@ -179,6 +193,8 @@ export interface MusicStreamHandlers {
   onStudioAttempt?: (label: string) => void
   /** Une tentative a échoué, la suivante démarre — reason est lisible par l'utilisateur */
   onStudioRetry?: (label: string, reason: string) => void
+  /** Les chemins serveur ont échoué : tentatives à relancer depuis le navigateur */
+  onClientStudio?: (evt: ClientStudioEvent) => void
   onFallback?: (reason: string) => void
   onDone?: (evt: MusicDoneEvent) => void
   /** Appelé si le serveur renvoie une erreur HTTP (pas de flux du tout) */
@@ -246,6 +262,14 @@ export async function apiMusicStream(req: MusicRequest, handlers: MusicStreamHan
           break
         case 'studio-retry':
           handlers.onStudioRetry?.(String(evt.label ?? ''), String(evt.reason ?? ''))
+          break
+        case 'client-studio':
+          handlers.onClientStudio?.({
+            reason: String(evt.reason ?? ''),
+            title: String(evt.title ?? ''),
+            lrc: String(evt.lrc ?? ''),
+            attempts: (Array.isArray(evt.attempts) ? evt.attempts : []) as ClientStudioAttempt[],
+          })
           break
         case 'done':
           handlers.onDone?.(evt as unknown as MusicDoneEvent)

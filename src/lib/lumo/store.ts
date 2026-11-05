@@ -12,6 +12,7 @@ import {
   apiMusicStream,
   apiTts,
   type ChatOverride,
+  type ClientStudioEvent,
   type MusicDoneEvent,
 } from './api'
 import { deleteArtifactData, putArtifactData } from './artifact-store'
@@ -30,6 +31,19 @@ import type {
   Session,
   WebFramework,
 } from './types'
+
+/** Blob (fichier audio téléchargé du Space) → base64 brut pour l'artefact. */
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const dataUrl = String(reader.result)
+      resolve(dataUrl.slice(dataUrl.indexOf(',') + 1))
+    }
+    reader.onerror = () => reject(new Error('Lecture du fichier audio impossible'))
+    reader.readAsDataURL(blob)
+  })
+}
 
 const LUMO_SYSTEM =
   'Tu es Lumo, un agent conversationnel chaleureux, lumineux et efficace. ' +
@@ -772,6 +786,98 @@ export const useLumo = create<LumoState>()(
           }
         }
 
+        /**
+         * Dernière carte : le navigateur appelle lui-même le Space DiffRhythm.
+         * La connexion de l'utilisateur dispose de son propre seau de quota ZeroGPU,
+         * indépendant de celui du serveur — souvent frais quand le serveur est à sec.
+         */
+        async function clientStudioFlow(evt: ClientStudioEvent, signal: AbortSignal): Promise<boolean> {
+          let gradio: typeof import('@gradio/client')
+          try {
+            gradio = await import('@gradio/client')
+          } catch {
+            return false
+          }
+          for (const attempt of evt.attempts) {
+            if (signal.aborted) return false
+            attemptLabel = `${attempt.label} via votre navigateur`
+            studioStartedAt = Date.now()
+            updateMessage(sessionId, assistantId, {
+              content:
+                `🎧 Dernière carte : **${attempt.label} appelé depuis votre navigateur** — ` +
+                `votre connexion dispose de son propre quota GPU Hugging Face… ⏱ 0 s`,
+            })
+            for (let essai = 0; essai < 2; essai++) {
+              try {
+                const client = (await gradio.Client.connect(attempt.space, {})) as unknown as {
+                  predict: (endpoint: string, params?: unknown) => Promise<{ data: unknown }>
+                }
+                const result = (await Promise.race([
+                  client.predict('/infer_music', attempt.params),
+                  new Promise<never>((_, rej) =>
+                    setTimeout(() => rej(new Error('Délai du studio dépassé (240 s)')), 240_000),
+                  ),
+                ])) as { data: unknown }
+                const first = Array.isArray(result.data) ? result.data[0] : result.data
+                const url = (first as { url?: string })?.url
+                if (!url) throw new Error('Le studio n’a pas renvoyé de fichier audio')
+
+                updateMessage(sessionId, assistantId, { content: '⬇ Téléchargement du morceau…' })
+                const dl = await fetch(`/api/music/download?url=${encodeURIComponent(url)}`, {
+                  signal: AbortSignal.timeout(90_000),
+                })
+                if (!dl.ok) throw new Error(`Téléchargement impossible (${dl.status})`)
+                const blob = await dl.blob()
+                const base64 = await blobToBase64(blob)
+                const mime = blob.type || 'audio/mpeg'
+                const bytes = blob.size
+                const durationSec = mime.includes('mpeg') ? Math.round((bytes * 8) / 128_000) : 0
+                const engine = `${attempt.label} · votre accès public (navigateur)`
+                const ext = mime.includes('wav') ? 'wav' : mime.includes('ogg') ? 'ogg' : 'mp3'
+                const artifact: Artifact = {
+                  id: uid(),
+                  kind: 'audio',
+                  name: `${evt.title.replace(/[^\wÀ-ÿ]+/g, '_')}.${ext}`,
+                  mimeType: mime,
+                  createdAt: Date.now(),
+                  provider: `DiffRhythm · Hugging Face (${engine})`,
+                  prompt,
+                  data: base64,
+                  bytes,
+                  meta: {
+                    music: true,
+                    engine: attempt.label.includes('DiffRhythm 1') ? 'diffrhythm1' : 'diffrhythm2',
+                    style: styleLabel,
+                    lyrics: evt.lrc,
+                    durationSec,
+                    instrumental: false,
+                  },
+                }
+                const dur = durationSec >= 60 ? `${Math.floor(durationSec / 60)} min ${String(durationSec % 60).padStart(2, '0')}` : `${durationSec} s`
+                await finishWithArtifact(
+                  artifact,
+                  `Voici **« ${evt.title} »** — chanson complète chantée 🎤 (${dur}), générée par **${engine}**.\n\n` +
+                    `▶ Écoutez le morceau ci-dessous — les paroles sont dépliables dans la carte audio et le fichier est téléchargeable.`,
+                )
+                return true
+              } catch (e) {
+                if (signal.aborted) return false
+                const msg = e instanceof Error ? e.message : String(e)
+                const transient = /session not found|connection|fetch|network|502|503|overloaded/i.test(msg)
+                if (essai === 0 && transient) {
+                  await new Promise((r) => setTimeout(r, 1500))
+                  continue
+                }
+                updateMessage(sessionId, assistantId, {
+                  content: `⚠️ ${attempt.label} depuis le navigateur : ${msg.slice(0, 140)} — solution suivante…`,
+                })
+                break
+              }
+            }
+          }
+          return false
+        }
+
         /* --- Instrumental : DiffRhythm 2 ne le couvre pas encore → synthèse locale directe --- */
         if (instrumental) {
           await localSynth('')
@@ -780,14 +886,16 @@ export const useLumo = create<LumoState>()(
 
         /* --- Chanson complète : paroles GLM + studio DiffRhythm (chaîne de repli) --- */
         let done: MusicDoneEvent | undefined
+        let clientEvt: ClientStudioEvent | undefined
         let fallbackReason = ''
         let attemptLabel = 'DiffRhythm 2'
         let studioStartedAt = 0
         const tick = setInterval(() => {
           const m = get().sessions.find((s) => s.id === sessionId)?.messages.find((x) => x.id === assistantId)
-          if (m?.pending && m.content.startsWith('🎼') && studioStartedAt > 0) {
+          if (m?.pending && studioStartedAt > 0 && /^(🎼|🎧|⬇)/.test(m.content)) {
             const sec = Math.round((Date.now() - studioStartedAt) / 1000)
-            updateMessage(sessionId, assistantId, { content: `🎼 ${attemptLabel} compose la chanson (voix + accompagnement)… ⏱ ${sec} s` })
+            const base = m.content.replace(/\s*⏱ \d+ s$/, '')
+            updateMessage(sessionId, assistantId, { content: `${base} ⏱ ${sec} s` })
           }
         }, 1000)
         try {
@@ -829,6 +937,9 @@ export const useLumo = create<LumoState>()(
                 updateMessage(sessionId, assistantId, {
                   content: `⚠️ ${label} : ${reason}.\n\n🔄 Bascule sur la solution suivante…`,
                 })
+              },
+              onClientStudio: (evt) => {
+                clientEvt = evt
               },
               onDone: (evt) => {
                 done = evt
@@ -873,6 +984,15 @@ export const useLumo = create<LumoState>()(
                 `▶ Écoutez le morceau ci-dessous — les paroles sont dépliables dans la carte audio et le MP3 est téléchargeable.\n` +
                 `Envie d'une autre version ? Demandez : autre style, paroles retouchées, plus longue, voix différente…`,
             )
+          } else if (clientEvt && clientEvt.attempts.length > 0) {
+            const ok = await clientStudioFlow(clientEvt, ac.signal)
+            if (!ok) {
+              await localSynth(
+                `🎛 Tous les accès au studio ont échoué (${clientEvt.reason}).\n` +
+                  `Quotas GPU Hugging Face gratuits : compte ~1×/jour, accès public par connexion — ils se rechargent en quelques heures. ` +
+                  `En attendant, voici un **aperçu instrumental local** — une vraie chanson chantée nécessite le studio.\n\n`,
+              )
+            }
           } else {
             await localSynth(
               `🎛 Studio DiffRhythm indisponible (${fallbackReason || 'raison inconnue'}).\n` +
