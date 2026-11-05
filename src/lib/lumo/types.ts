@@ -113,6 +113,8 @@ export interface Message {
   fallback?: string[]
   /** Suivi temps réel des agents (Dev Web, App Design…) */
   activity?: AgentActivity
+  /** Note de chaîne de repli (quota du lien de bloc → relais général/API…) */
+  providerNote?: string
 }
 
 export interface BookBrief {
@@ -174,6 +176,46 @@ export interface HfModel {
   kind?: 'model' | 'dataset'
   /** Fichiers détectés sur le dépôt HF (proposés au branchement / téléchargement) */
   files?: { path: string; size: number; ext: string }[]
+  /** Sous-dossiers du dépôt (poids rangés dans des dossiers) */
+  dirs?: string[]
+}
+
+/** Modèle proposé par une liste Hub (organisation ou recherche) */
+export interface HfCandidate {
+  id: string
+  task: string
+  downloads?: number
+  likes?: number
+}
+
+/** Résultat de détection d'un lien HF (route /api/hf-model) */
+export interface HfDetectResult {
+  ok: boolean
+  kind: 'model' | 'dataset' | 'org' | 'search'
+  query: string
+  model?: HfModel
+  models?: HfCandidate[]
+  error?: string
+}
+
+/**
+ * Lien HF configuré — pour un bloc (mode) donné ou pour tout Lumo (général).
+ * Le lien général reste actif même quand des liens par bloc existent :
+ * il sert de relais quand un lien de bloc tombe (quota, indisponibilité…).
+ */
+export interface HfLinkConfig {
+  /** Lien brut collé par l'utilisateur */
+  link: string
+  kind: 'model' | 'org' | 'dataset' | 'search'
+  /** Identifiant résolu : owner/name pour un dépôt, owner pour une organisation */
+  repoId?: string
+  /** Modèles proposés/chargés depuis ce lien */
+  models: HfCandidate[]
+  /** Modèle actif — celui qui travaille dans le bloc (ou en relais général) */
+  selected?: string
+  /** Dernier état connu (erreur de quota, note de relais…) */
+  status?: string
+  updatedAt: number
 }
 
 export interface ModeInfo {

@@ -49,12 +49,15 @@ import {
   type MemoryRow,
 } from '@/lib/lumo/api'
 import { clearArtifactStore } from '@/lib/lumo/artifact-store'
+import { BlockHfButton } from '@/components/lumo/block-hf'
+import { useLumo } from '@/lib/lumo/store'
 import {
   BadgeCheck,
   Brain,
   Eye,
   EyeOff,
   KeyRound,
+  Link2,
   Loader2,
   Settings,
   Trash2,
@@ -74,6 +77,31 @@ const KEY_PROVIDERS = [
 ]
 
 const SUCCESS_TOAST = 'border-emerald-500 bg-emerald-50 text-emerald-900 dark:bg-emerald-950 dark:text-emerald-100'
+
+/** Lien HF général : exploitation d'un dépôt/organisation en relais pour tous les blocs */
+function GlobalHfSection() {
+  const globalHf = useLumo((s) => s.globalHf)
+  return (
+    <div>
+      <Label className="flex items-center gap-1.5 text-sm font-medium">
+        <Link2 className="h-4 w-4 text-primary" /> Lien Hugging Face général
+      </Label>
+      <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+        Chargez un dépôt ou une organisation complète (ex. DeepSeek) pour exploiter tout son contenu. Ce lien
+        reste actif comme vos connexions API : chaque bloc peut lui préférer son propre lien HF, et en cas de
+        quota épuisé, ce lien général prend le relais automatiquement.
+      </p>
+      <div className="mt-2.5">
+        <BlockHfButton variant="global" />
+      </div>
+      {globalHf?.selected && (
+        <p className="mt-1.5 text-[11px] text-muted-foreground">
+          Relais actuel : <span className="font-mono text-foreground">{globalHf.selected}</span>
+        </p>
+      )}
+    </div>
+  )
+}
 
 function ApiKeysSection() {
   const { toast } = useToast()
@@ -387,6 +415,9 @@ export function SettingsDialog({ trigger }: { trigger?: React.ReactNode }) {
 
           <Separator />
           <ApiKeysSection />
+
+          <Separator />
+          <GlobalHfSection />
 
           <Separator />
           <MemorySection />

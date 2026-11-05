@@ -46,6 +46,7 @@ import { LumoWordmark } from '@/components/lumo/logo'
 import { ChatMessages } from '@/components/lumo/messages'
 import { ModeIcon } from '@/components/lumo/mode-icon'
 import { ModelHubDialog, ModelPicker } from '@/components/lumo/model-picker'
+import { BlockHfButton } from '@/components/lumo/block-hf'
 import { SettingsDialog } from '@/components/lumo/settings-dialog'
 import { CodePreviewDialog } from '@/components/lumo/web-preview'
 import { useLumo } from '@/lib/lumo/store'
@@ -397,8 +398,9 @@ export function ChatWindow({ onStartBook }: { onStartBook: () => void }) {
             </DropdownMenu>
           </div>
 
-          {/* Modèle + statut + actions */}
+          {/* Modèle + lien HF du bloc + statut + actions */}
           <div className="flex shrink-0 items-center gap-1.5">
+            <BlockHfButton mode={session.mode} />
             <span className="hidden lg:inline">
               <ModelPicker session={session} />
             </span>

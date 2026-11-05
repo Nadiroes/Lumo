@@ -36,7 +36,7 @@ import { Input } from '@/components/ui/input'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useToast } from '@/hooks/use-toast'
-import { apiHfLookup, hfResolveUrl } from '@/lib/lumo/api'
+import { apiHfDetect, hfResolveUrl } from '@/lib/lumo/api'
 import {
   allProviders,
   BUILTIN_PROVIDERS,
@@ -46,7 +46,15 @@ import {
   type ProviderInfo,
 } from '@/lib/lumo/providers'
 import { useLumo } from '@/lib/lumo/store'
-import { MODE_INFO, type HfModel, type ModelSelection, type Mode, type Session } from '@/lib/lumo/types'
+import {
+  MODE_INFO,
+  type HfCandidate,
+  type HfDetectResult,
+  type HfModel,
+  type ModelSelection,
+  type Mode,
+  type Session,
+} from '@/lib/lumo/types'
 
 const CAPS: Capability[] = ['text', 'image', 'video', 'audio']
 const CAP_LABEL: Record<Capability, string> = {
@@ -156,6 +164,8 @@ export function ModelHubDialog({
   const [loading, setLoading] = useState(false)
   const [busyFile, setBusyFile] = useState(false)
   const [expanded, setExpanded] = useState<string | null>(null)
+  /** Résultat « liste » : organisation entière ou propositions de recherche */
+  const [found, setFound] = useState<{ kind: 'org' | 'search'; query: string; models: HfCandidate[] } | null>(null)
 
   /** Connecte un modèle (et un fichier précis) à la bibliothèque + à la session active */
   function connect(m: HfModel, file?: string) {
@@ -187,8 +197,27 @@ export function ModelHubDialog({
     if (!value) return
     setLoading(true)
     try {
-      const model = await apiHfLookup(value)
+      const r: HfDetectResult = await apiHfDetect(value)
+      if ((r.kind === 'org' || r.kind === 'search') && r.models?.length) {
+        // Organisation complète ou dépôt exact introuvable : on PROPOSE les modèles
+        setFound({ kind: r.kind, query: r.query, models: r.models })
+        setLink('')
+        toast({
+          title: r.kind === 'org' ? `Organisation ${r.query} — ${r.models.length} modèles` : `${r.models.length} modèles trouvés`,
+          description:
+            r.kind === 'org'
+              ? 'Chargez les modèles de votre choix — ils rejoignent la bibliothèque et la session.'
+              : `« ${r.query} » n'existe pas à l'identique : voici les dépôts les plus proches.`,
+        })
+        return
+      }
+      if (!r.model) {
+        toast({ title: 'Aucun modèle trouvé', description: 'Vérifiez le lien ou essayez un autre nom.', variant: 'destructive' })
+        return
+      }
+      const model = r.model
       addHfModel(model)
+      setFound(null)
       setLink('')
       const nFiles = model.files?.length ?? 0
       toast({
@@ -209,6 +238,11 @@ export function ModelHubDialog({
     }
   }
 
+  /** Charge un modèle proposé (liste organisation / recherche) dans la bibliothèque + la session */
+  function loadCandidate(c: HfCandidate) {
+    connect({ id: c.id, task: c.task, downloads: c.downloads, likes: c.likes, source: 'api', addedAt: Date.now(), kind: 'model' })
+  }
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogTrigger asChild>{trigger}</DialogTrigger>
@@ -216,9 +250,9 @@ export function ModelHubDialog({
         <DialogHeader>
           <DialogTitle className="font-display">Hub de modèles</DialogTitle>
           <DialogDescription>
-            Collez un lien Hugging Face : Lumo détecte les fichiers (.safetensors, .gguf, .tar, .json), puis vous
-            choisissez de <strong>connecter</strong> un modèle au projet ou de le <strong>télécharger</strong>. Plusieurs
-            modèles peuvent cohabiter — un par capacité (texte, image, vidéo, audio).
+            Collez un lien Hugging Face : dépôt précis (fichiers .safetensors, .gguf…), organisation complète
+            (tous ses modèles sont listés pour être chargés) ou simple nom. Plusieurs modèles peuvent cohabiter —
+            un par capacité (texte, image, vidéo, audio).
           </DialogDescription>
         </DialogHeader>
 
@@ -237,6 +271,48 @@ export function ModelHubDialog({
         </div>
 
         <div className="max-h-96 space-y-4 overflow-y-auto pr-1 scrollbar-thin">
+          {/* Liste détectée : organisation ou recherche */}
+          {found && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                  {found.kind === 'org'
+                    ? `Modèles de ${found.query} (${found.models.length})`
+                    : `Propositions pour « ${found.query} » (${found.models.length})`}
+                </p>
+                <Button variant="ghost" size="sm" className="h-6 px-2 text-[10px]" onClick={() => setFound(null)}>
+                  Masquer
+                </Button>
+              </div>
+              <ul className="space-y-1.5">
+                {found.models.map((c) => (
+                  <li key={c.id} className="flex items-center gap-2 rounded-lg border bg-background p-2">
+                    <Cuboid className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" aria-hidden="true" />
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-xs font-medium" title={c.id}>
+                        {c.id}
+                      </p>
+                      <p className="truncate text-[10px] text-muted-foreground">
+                        {c.task}
+                        {c.downloads ? ` · ${c.downloads.toLocaleString('fr-FR')} téléch.` : ''}
+                        {c.likes ? ` · ♥ ${c.likes}` : ''}
+                      </p>
+                      <CapBadges caps={hfTaskToCaps(c.task, c.id)} className="mt-1" />
+                    </div>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 shrink-0 gap-1 text-[11px]"
+                      onClick={() => loadCandidate(c)}
+                    >
+                      <Plug className="h-3 w-3" /> Charger
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           <div className="space-y-2">
             <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               Modèles importés ({hfModels.length})

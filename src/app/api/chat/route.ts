@@ -173,6 +173,124 @@ function lumoCoreStream(fullSystem: string, history: Turn[]): ReadableStream<Uin
   })
 }
 
+/* ---------------- Chaîne de repli : bloc → lien général → clés API → Lumo Core ---------------- */
+
+interface ChainStep {
+  source: string
+  model?: string
+  ok: boolean
+  error?: string
+}
+
+/** Ordre de repli sur les clés API enregistrées */
+const API_ORDER = ['mistral', 'agnes', 'openai', 'openrouter', 'groq', 'custom'] as const
+
+async function runHfRouter(hfKey: string, model: string, fullSystem: string, history: Turn[]): Promise<string> {
+  return callOpenAICompatible('https://router.huggingface.co/v1', hfKey, model, fullSystem, history)
+}
+
+async function runFallbackChain(
+  fullSystem: string,
+  history: Turn[],
+  blockHf: string | undefined,
+  globalHf: string | undefined,
+): Promise<{ content: string; providerUsed: string; chain: ChainStep[]; note?: string }> {
+  const chain: ChainStep[] = []
+  const hfKey = (await db.apiKey.findUnique({ where: { provider: 'huggingface' } }).catch(() => null))?.secret
+
+  const tryStep = async (source: string, model: string | undefined, run: () => Promise<string>): Promise<string | null> => {
+    if (!model) return null
+    try {
+      const content = await run()
+      chain.push({ source, model, ok: true })
+      return content
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'erreur inconnue'
+      chain.push({ source, model, ok: false, error: msg.slice(0, 180) })
+      return null
+    }
+  }
+
+  // 1) Modèle du bloc (lien HF spécifique)
+  if (blockHf) {
+    if (!hfKey) {
+      chain.push({ source: 'bloc', model: blockHf, ok: false, error: 'aucune clé Hugging Face enregistrée' })
+    } else {
+      const content = await tryStep('bloc', blockHf, () => runHfRouter(hfKey, blockHf, fullSystem, history))
+      if (content !== null) return { content, providerUsed: `hf:${blockHf}`, chain }
+    }
+  }
+
+  // 2) Lien général HF (relais principal)
+  if (globalHf && globalHf !== blockHf) {
+    if (!hfKey) {
+      chain.push({ source: 'général', model: globalHf, ok: false, error: 'aucune clé Hugging Face enregistrée' })
+    } else {
+      const content = await tryStep('général', globalHf, () => runHfRouter(hfKey, globalHf, fullSystem, history))
+      if (content !== null) {
+        const failedBloc = chain.find((s) => s.source === 'bloc' && !s.ok)
+        const note = failedBloc
+          ? `Lien du bloc indisponible (${failedBloc.error ?? 'erreur'}) → relais via le lien général (${globalHf}).`
+          : undefined
+        return { content, providerUsed: `hf:${globalHf}`, chain, note }
+      }
+    }
+  }
+
+  // 3) Clés API enregistrées (Mistral, Agnes, OpenAI…)
+  const failedSoFar = () =>
+    chain
+      .filter((s) => !s.ok)
+      .map((s) => `${s.source === 'bloc' ? 'lien du bloc' : s.source === 'général' ? 'lien général' : s.source} (${s.error?.slice(0, 70) ?? 'erreur'})`)
+      .join(' ; ')
+  for (const provider of API_ORDER) {
+    const keyRow = await db.apiKey.findUnique({ where: { provider } }).catch(() => null)
+    if (!keyRow) continue
+    const cfg = EXTERNAL_BASE[provider]
+    const base = provider === 'custom' && keyRow.baseUrl ? keyRow.baseUrl : cfg?.baseUrl
+    if (!base) continue
+    const content = await tryStep(`api:${provider}`, cfg?.model, () =>
+      callOpenAICompatible(base, keyRow.secret, cfg?.model ?? 'local-model', fullSystem, history),
+    )
+    if (content !== null) {
+      return {
+        content,
+        providerUsed: provider,
+        chain,
+        note: chain.some((s) => !s.ok) ? `Liens HF indisponibles — ${failedSoFar()} → relais via la clé API ${provider}.` : undefined,
+      }
+    }
+  }
+
+  // 4) Lumo Core (moteur intégré)
+  try {
+    const zai = await ZAI.create()
+    const completion = await zai.chat.completions.create({
+      messages: [{ role: 'assistant', content: fullSystem }, ...history],
+      thinking: { type: 'disabled' },
+    })
+    const content = completion.choices[0]?.message?.content ?? ''
+    if (!content.trim()) throw new Error('Réponse vide du moteur.')
+    return {
+      content,
+      providerUsed: 'lumo-core',
+      chain,
+      note: chain.some((s) => !s.ok)
+        ? `Liens HF indisponibles — ${failedSoFar()} → relais via le moteur intégré Lumo Core.`
+        : 'Relais via le moteur intégré Lumo Core.',
+    }
+  } catch (e) {
+    chain.push({ source: 'lumo-core', ok: false, error: e instanceof Error ? e.message.slice(0, 180) : 'erreur moteur' })
+    const failed = chain.find((s) => !s.ok)
+    return {
+      content: '',
+      providerUsed: 'aucun',
+      chain,
+      note: `Toute la chaîne a échoué (début : ${failed?.source ?? '?'} — ${failed?.error ?? 'erreur'}).`,
+    }
+  }
+}
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
@@ -181,6 +299,8 @@ export async function POST(req: NextRequest) {
       typeof body.system === 'string' && body.system.trim() ? body.system : undefined
     const provider: string = typeof body.provider === 'string' ? body.provider : 'lumo-core'
     const hfModel: string | undefined = typeof body.hfModel === 'string' && body.hfModel.trim() ? body.hfModel.trim() : undefined
+    const globalHf: string | undefined =
+      typeof body.globalHf === 'string' && body.globalHf.trim() ? body.globalHf.trim() : undefined
     const wantStream: boolean = body.stream === true
 
     if (!messages.length) {
@@ -206,7 +326,25 @@ export async function POST(req: NextRequest) {
       /* la mémoire est optionnelle */
     }
 
-    /* ---- Routage fournisseur ---- */
+    /* ---- Chaîne de repli : modèle de bloc → lien général → clés API → Lumo Core ---- */
+    if (hfModel || globalHf) {
+      const r = await runFallbackChain(fullSystem, history, hfModel, globalHf)
+      if (r.content) {
+        return NextResponse.json({
+          ok: true,
+          content: r.content,
+          providerUsed: r.providerUsed,
+          chain: r.chain,
+          note: r.note,
+        })
+      }
+      return NextResponse.json(
+        { ok: false, error: r.note ?? 'Tous les moteurs sont indisponibles.', chain: r.chain, fallback: true },
+        { status: 503 },
+      )
+    }
+
+    /* ---- Routage fournisseur explicite (bouton « Réessayer avec… ») ---- */
     if (provider !== 'lumo-core') {
       if (provider === 'hf') {
         const hfKey = (await db.apiKey.findUnique({ where: { provider: 'huggingface' } }))?.secret

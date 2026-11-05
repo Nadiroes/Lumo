@@ -24,6 +24,7 @@ import type {
   Attachment,
   BookBrief,
   ExportRecord,
+  HfLinkConfig,
   HfModel,
   Message,
   Mode,
@@ -165,11 +166,31 @@ export interface SendOptions {
   duration?: string
 }
 
+/**
+ * Override de chaîne HF pour un bloc : le modèle du bloc travaille en premier,
+ * le modèle du lien général prend le relais en cas d'échec (quota…),
+ * puis les clés API puis Lumo Core (chaîne gérée côté serveur).
+ */
+function hfOverrideFor(block: HfLinkConfig | undefined, glob: HfLinkConfig | null): ChatOverride | undefined {
+  const hfModel = block?.selected
+  const globalHf = glob?.selected
+  if (!hfModel && !globalHf) return undefined
+  return {
+    provider: 'hf',
+    hfModel: hfModel ?? globalHf,
+    globalHf: globalHf && globalHf !== hfModel ? globalHf : undefined,
+  }
+}
+
 interface LumoState {
   view: 'hub' | 'chat'
   sessions: Session[]
   activeId: string | null
   hfModels: HfModel[]
+  /** Lien HF spécifique par bloc (mode) — prioritaire sur le lien général */
+  blockHf: Partial<Record<Mode, HfLinkConfig>>
+  /** Lien HF général — reste actif en relais même quand des liens de bloc existent */
+  globalHf: HfLinkConfig | null
   editingMsg: { sessionId: string; msgId: string } | null
 
   openHub: () => void
@@ -190,6 +211,18 @@ interface LumoState {
 
   addHfModel: (model: HfModel) => void
   removeHfModel: (id: string) => void
+
+  /** Enregistre le lien HF d'un bloc (détecté depuis l'UI) */
+  setBlockHf: (mode: Mode, cfg: HfLinkConfig) => void
+  /** Change le modèle actif d'un bloc */
+  setBlockHfModel: (mode: Mode, modelId: string, status?: string) => void
+  /** Note d'état d'un lien de bloc (quota, relais…) */
+  setBlockHfStatus: (mode: Mode, status: string) => void
+  clearBlockHf: (mode: Mode) => void
+  setGlobalHf: (cfg: HfLinkConfig) => void
+  setGlobalHfModel: (modelId: string, status?: string) => void
+  setGlobalHfStatus: (status: string) => void
+  clearGlobalHf: () => void
 
   recordExport: (sessionId: string, record: ExportRecord) => void
 
@@ -310,10 +343,16 @@ export const useLumo = create<LumoState>()(
       ) {
         const session = get().sessions.find((s) => s.id === sessionId)
         if (!session) return
+        // Chaîne HF du bloc : modèle du bloc → lien général → clés API → Lumo Core
+        const blockOv = hfOverrideFor(get().blockHf[session.mode], get().globalHf)
         const providerLabel =
-          override?.provider === 'hf'
+          override?.provider === 'hf' && override.hfModel
             ? `hf:${override.hfModel}`
-            : (override?.provider ?? session.models.text)
+            : override?.provider && override.provider !== 'lumo-core'
+              ? override.provider
+              : blockOv
+                ? `hf:${blockOv.hfModel}`
+                : session.models.text
         const assistantId = uid()
         addMessage(sessionId, {
           id: assistantId,
@@ -342,8 +381,12 @@ export const useLumo = create<LumoState>()(
           }
           const useOverride: ChatOverride | undefined =
             override?.provider && override.provider !== 'lumo-core'
-              ? { provider: override.provider as ChatOverride['provider'], hfModel: override.hfModel }
-              : undefined
+              ? {
+                  provider: override.provider as ChatOverride['provider'],
+                  hfModel: override.hfModel,
+                  globalHf: get().globalHf?.selected,
+                }
+              : blockOv
 
           // Streaming réel : le texte s'affiche au fil de la génération du modèle
           const ac = new AbortController()
@@ -361,6 +404,12 @@ export const useLumo = create<LumoState>()(
             },
             useOverride,
             ac.signal,
+            (meta) => {
+              updateMessage(sessionId, assistantId, {
+                providerNote: meta.note,
+                provider: meta.providerUsed ?? providerLabel,
+              })
+            },
           )
           aborts.delete(sessionId)
           updateMessage(sessionId, assistantId, { content: full, pending: false })
@@ -423,9 +472,16 @@ export const useLumo = create<LumoState>()(
         const artifacts: Artifact[] = []
         let failed = 0
         let lastErrorDetail = ''
+        let engineNote = ''
+        let usedEngine = ''
+        // Chaîne HF du bloc Image : modèle du bloc → lien général → moteur intégré
+        const hfArg = {
+          model: get().blockHf[session.mode]?.selected,
+          globalHf: get().globalHf?.selected,
+        }
         for (let i = 0; i < count; i++) {
           try {
-            const r = await apiImage(fullPrompt, size)
+            const r = await apiImage(fullPrompt, size, hfArg)
             const mime = sniffImageMime(r.base64)
             const a: Artifact = {
               id: uid(),
@@ -433,12 +489,14 @@ export const useLumo = create<LumoState>()(
               name: `image_${String(artifacts.length + 1).padStart(3, '0')}.${imageExt(mime)}`,
               mimeType: mime,
               createdAt: Date.now(),
-              provider,
+              provider: r.engine ?? provider,
               prompt: fullPrompt,
               data: r.base64,
               bytes: r.bytes,
               meta: { size },
             }
+            if (r.engine) usedEngine = r.engine
+            if (r.note) engineNote = r.note
             void putArtifactData(a.id, r.base64)
             artifacts.push(a)
             // Affichage immédiat de chaque image terminée
@@ -469,6 +527,8 @@ export const useLumo = create<LumoState>()(
           content,
           pending: false,
           artifacts,
+          provider: usedEngine || provider,
+          providerNote: engineNote || undefined,
           error: ok === 0 ? 'Génération impossible' : undefined,
         })
       }
@@ -500,6 +560,12 @@ export const useLumo = create<LumoState>()(
         ]
         const frames: { mime: string; base64: string }[] = []
         const started = Date.now()
+        let videoEngineNote = ''
+        // Chaîne HF du bloc Vidéo : modèle du bloc → lien général → moteur intégré
+        const hfArgVideo = {
+          model: get().blockHf[session.mode]?.selected,
+          globalHf: get().globalHf?.selected,
+        }
 
         later(sessionId, 700, () =>
           updateMessage(sessionId, assistantId, {
@@ -517,7 +583,8 @@ export const useLumo = create<LumoState>()(
             content: `🎞 ${p.label} — rendu en cours… ⏱ ${sec} s`,
           })
           try {
-            const r = await apiImage(`${basePrompt}, ${p.suffix}`, '1344x768')
+            const r = await apiImage(`${basePrompt}, ${p.suffix}`, '1344x768', hfArgVideo)
+            if (r.note) videoEngineNote = r.note
             frames.push({ mime: sniffImageMime(r.base64), base64: r.base64 })
             const done = Math.round((Date.now() - started) / 1000)
             updateMessage(sessionId, assistantId, {
@@ -561,6 +628,7 @@ export const useLumo = create<LumoState>()(
             `Pour un rendu vidéo complet (mp4), branchez une API vidéo (Agnes AI) — la structure est prête à la recevoir.`,
           pending: false,
           artifacts: [playable],
+          providerNote: videoEngineNote || undefined,
         })
       }
 
@@ -1108,6 +1176,12 @@ export const useLumo = create<LumoState>()(
             },
             undefined,
             ac.signal,
+            (meta) => {
+              updateMessage(sessionId, assistantId, {
+                providerNote: meta.note,
+                provider: meta.providerUsed ?? provider,
+              })
+            },
           )
           aborts.delete(sessionId)
 
@@ -1199,6 +1273,16 @@ export const useLumo = create<LumoState>()(
               ...(note ? { note } : {}),
             },
           })
+        // Chaîne HF du bloc App Design : modèle du bloc → lien général → clés API → Lumo Core
+        const hfOv = hfOverrideFor(get().blockHf[session.mode], get().globalHf)
+        const noteHf = (meta: { note?: string; providerUsed?: string }) => {
+          if (meta.note || meta.providerUsed) {
+            updateMessage(sessionId, assistantId, {
+              providerNote: meta.note,
+              provider: meta.providerUsed ?? provider,
+            })
+          }
+        }
         try {
           const ac = new AbortController()
           aborts.set(sessionId, ac)
@@ -1206,6 +1290,8 @@ export const useLumo = create<LumoState>()(
           const full = await apiChat(
             [{ role: 'user', content: prompt + attachmentSummary(opts.attachments) }],
             DESIGN_SYSTEM,
+            hfOv,
+            noteHf,
           )
           aborts.delete(sessionId)
           advance(2, 'Extraction de la structure de la maquette…')
@@ -1224,6 +1310,7 @@ export const useLumo = create<LumoState>()(
                   },
                 ],
                 DESIGN_REPAIR_SYSTEM,
+                hfOv,
               )
               doc = extractDesignDoc(fixed)
             } catch {
@@ -1263,7 +1350,7 @@ export const useLumo = create<LumoState>()(
           // Repli : réponse guidée en texte quand le JSON n’a pas abouti
           try {
             const turns = [{ role: 'user' as const, content: prompt }]
-            const guide = await apiChat(turns, DESIGN_GUIDE_SYSTEM)
+            const guide = await apiChat(turns, DESIGN_GUIDE_SYSTEM, hfOv, noteHf)
             updateMessage(sessionId, assistantId, {
               content: guide,
               pending: false,
@@ -1286,6 +1373,8 @@ export const useLumo = create<LumoState>()(
         sessions: [],
         activeId: null,
         hfModels: [],
+        blockHf: {},
+        globalHf: null,
         editingMsg: null,
 
         openHub: () => set({ view: 'hub' }),
@@ -1491,6 +1580,9 @@ export const useLumo = create<LumoState>()(
 
         generateBible: async (sessionId, brief) => {
           const assistantId = uid()
+          const session = get().sessions.find((s) => s.id === sessionId)
+          // Chaîne HF du bloc Livre : modèle du bloc → lien général → clés API → Lumo Core
+          const hfOv = hfOverrideFor(get().blockHf[session?.mode ?? 'book'], get().globalHf)
           addMessage(sessionId, {
             id: assistantId,
             role: 'assistant',
@@ -1498,12 +1590,21 @@ export const useLumo = create<LumoState>()(
             createdAt: Date.now(),
             pending: true,
             flow: 'chat',
-            provider: 'lumo-core',
+            provider: hfOv?.hfModel ? `hf:${hfOv.hfModel}` : 'lumo-core',
           })
           try {
             const full = await apiChat(
               [{ role: 'user', content: 'Voici mon brief. Rédige la Bible de l’œuvre.\n\n' + JSON.stringify(brief, null, 2) }],
               BIBLE_SYSTEM,
+              hfOv,
+              (meta) => {
+                if (meta.note || meta.providerUsed) {
+                  updateMessage(sessionId, assistantId, {
+                    providerNote: meta.note,
+                    provider: meta.providerUsed,
+                  })
+                }
+              },
             )
             const revealed = await revealStream(sessionId, assistantId, full)
             const artifact: Artifact = {
@@ -1535,6 +1636,49 @@ export const useLumo = create<LumoState>()(
         removeHfModel: (id) =>
           set((st) => ({ hfModels: st.hfModels.filter((m) => m.id !== id) })),
 
+        setBlockHf: (mode, cfg) =>
+          set((st) => ({ blockHf: { ...st.blockHf, [mode]: cfg } })),
+
+        setBlockHfModel: (mode, modelId, status) =>
+          set((st) => {
+            const cur = st.blockHf[mode]
+            if (!cur) return st
+            return {
+              blockHf: {
+                ...st.blockHf,
+                [mode]: { ...cur, selected: modelId, status: status ?? `Modèle actif : ${modelId}`, updatedAt: Date.now() },
+              },
+            }
+          }),
+
+        setBlockHfStatus: (mode, status) =>
+          set((st) => {
+            const cur = st.blockHf[mode]
+            if (!cur) return st
+            return { blockHf: { ...st.blockHf, [mode]: { ...cur, status, updatedAt: Date.now() } } }
+          }),
+
+        clearBlockHf: (mode) =>
+          set((st) => {
+            const next = { ...st.blockHf }
+            delete next[mode]
+            return { blockHf: next }
+          }),
+
+        setGlobalHf: (cfg) => set({ globalHf: cfg }),
+
+        setGlobalHfModel: (modelId, status) =>
+          set((st) =>
+            st.globalHf
+              ? { globalHf: { ...st.globalHf, selected: modelId, status: status ?? `Modèle relais : ${modelId}`, updatedAt: Date.now() } }
+              : st,
+          ),
+
+        setGlobalHfStatus: (status) =>
+          set((st) => (st.globalHf ? { globalHf: { ...st.globalHf, status, updatedAt: Date.now() } } : st)),
+
+        clearGlobalHf: () => set({ globalHf: null }),
+
         recordExport: (sessionId, record) =>
           updateSession(sessionId, (s) => ({
             ...s,
@@ -1549,7 +1693,7 @@ export const useLumo = create<LumoState>()(
     },
     {
       name: 'lumo-store-v1',
-      version: 2,
+      version: 3,
       migrate: (state) => state as never,
       partialize: (state) => ({
         sessions: state.sessions.map((s) => ({
@@ -1563,6 +1707,8 @@ export const useLumo = create<LumoState>()(
             })),
         })),
         hfModels: state.hfModels,
+        blockHf: state.blockHf,
+        globalHf: state.globalHf,
       }),
     },
   ),

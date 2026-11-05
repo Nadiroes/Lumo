@@ -1,18 +1,32 @@
 /** Appels API côté client */
 
-import type { HfModel } from './types'
+import type { HfDetectResult, HfModel } from './types'
 
 export interface ChatTurn {
   role: 'user' | 'assistant'
   content: string
 }
 
+/** Métadonnées de chaîne renvoyées par le serveur (repli, traçabilité) */
+export interface ChainMeta {
+  providerUsed?: string
+  chain?: { source: string; model?: string; ok: boolean; error?: string }[]
+  note?: string
+}
+
 export interface ChatOverride {
   provider?: 'lumo-core' | 'mistral' | 'agnes' | 'hf' | 'openai' | 'openrouter' | 'groq' | 'custom'
   hfModel?: string
+  /** Modèle du lien HF général — sert de relais si hfModel échoue (quota…) */
+  globalHf?: string
 }
 
-export async function apiChat(messages: ChatTurn[], system?: string, override?: ChatOverride): Promise<string> {
+export async function apiChat(
+  messages: ChatTurn[],
+  system?: string,
+  override?: ChatOverride,
+  onMeta?: (meta: ChainMeta) => void,
+): Promise<string> {
   const res = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -25,6 +39,7 @@ export async function apiChat(messages: ChatTurn[], system?: string, override?: 
     else if (json.fallback) err.fallback = ['mistral', 'agnes', 'hf']
     throw err
   }
+  onMeta?.({ providerUsed: json.providerUsed, chain: json.chain, note: json.note })
   return String(json.content || '')
 }
 
@@ -38,6 +53,7 @@ export async function apiChatStream(
   onDelta: (full: string, delta: string) => void,
   override?: ChatOverride,
   signal?: AbortSignal,
+  onMeta?: (meta: ChainMeta) => void,
 ): Promise<string> {
   let res: Response
   try {
@@ -53,7 +69,7 @@ export async function apiChatStream(
   }
   const ct = res.headers.get('content-type') ?? ''
   if (!ct.includes('text/plain') || !res.body) {
-    // Réponse JSON (erreur ou repli serveur sans streaming)
+    // Réponse JSON (erreur, chaîne de repli ou repli serveur sans streaming)
     const json = await res.json().catch(() => ({}))
     if (!res.ok || !json.ok) {
       const err = new Error(json.error || 'Le moteur Lumo est indisponible.') as Error & { fallback?: string[] }
@@ -63,6 +79,7 @@ export async function apiChatStream(
     }
     const content = String(json.content || '')
     onDelta(content, content)
+    onMeta?.({ providerUsed: json.providerUsed, chain: json.chain, note: json.note })
     return content
   }
 
@@ -91,22 +108,54 @@ export async function apiChatStream(
   return full
 }
 
-export async function apiImage(prompt: string, size: string): Promise<{ base64: string; bytes: number }> {
+export async function apiImage(
+  prompt: string,
+  size: string,
+  hf?: { model?: string; globalHf?: string },
+): Promise<{ base64: string; bytes: number; engine?: string; note?: string }> {
   const res = await fetch('/api/image', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt, size }),
+    body: JSON.stringify({ prompt, size, ...(hf ?? {}) }),
   })
   const json = await res.json()
   if (!res.ok || !json.ok) throw new Error(json.error || 'La génération d’image a échoué.')
-  return { base64: String(json.base64), bytes: Number(json.bytes || 0) }
+  return {
+    base64: String(json.base64),
+    bytes: Number(json.bytes || 0),
+    engine: json.engine ? String(json.engine) : undefined,
+    note: json.note ? String(json.note) : undefined,
+  }
+}
+
+/** Détection d'un lien HF : dépôt précis, organisation (liste des modèles) ou recherche */
+export async function apiHfDetect(link: string, dir?: string): Promise<HfDetectResult> {
+  const qs = new URLSearchParams({ id: link })
+  if (dir) qs.set('dir', dir)
+  const res = await fetch(`/api/hf-model?${qs.toString()}`)
+  const json = (await res.json()) as HfDetectResult
+  if (!res.ok || !json.ok) throw new Error(json.error || 'Lien introuvable sur le Hub.')
+  return json
 }
 
 export async function apiHfLookup(id: string): Promise<HfModel> {
-  const res = await fetch(`/api/hf-model?id=${encodeURIComponent(id)}`)
-  const json = await res.json()
-  if (!res.ok || !json.ok || !json.model) throw new Error(json.error || 'Modèle introuvable.')
-  return json.model as HfModel
+  const r = await apiHfDetect(id)
+  if (r.kind === 'org') {
+    throw new Error(
+      r.models?.length
+        ? `« ${r.query} » est une organisation : ${r.models.length} modèles proposés ci-dessous — choisissez celui à charger.`
+        : `« ${r.query} » est une organisation sans modèle public répertorié.`,
+    )
+  }
+  if (r.kind === 'search') {
+    throw new Error(
+      r.models?.length
+        ? `Dépôt exact introuvable : ${r.models.length} modèles correspondants proposés ci-dessous.`
+        : 'Dépôt introuvable sur le Hub.',
+    )
+  }
+  if (!r.model) throw new Error('Modèle introuvable.')
+  return r.model
 }
 
 /** URL de téléchargement direct d'un fichier HF (les dépôts privés demandent un token) */

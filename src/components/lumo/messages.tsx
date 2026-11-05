@@ -13,6 +13,7 @@ import {
   Music,
   PencilLine,
   RefreshCw,
+  Repeat,
   ThumbsDown,
   ThumbsUp,
 } from 'lucide-react'
@@ -435,6 +436,13 @@ function AssistantMessage({
             {m.provider ? ` · ${m.provider}` : ''}
           </span>
         </div>
+
+        {m.providerNote && !m.pending && (
+          <p className="mb-1 flex items-start gap-1.5 rounded-md bg-amber-500/10 px-2 py-1 text-[11px] leading-snug text-amber-700 dark:text-amber-400">
+            <Repeat className="mt-0.5 h-3 w-3 shrink-0" aria-hidden="true" />
+            <span>{m.providerNote}</span>
+          </p>
+        )}
 
         <div className="rounded-2xl rounded-tl-md border bg-card px-4 py-3">
           {m.pending && !m.content && m.flow !== 'image' && !m.activity && (
