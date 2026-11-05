@@ -60,6 +60,12 @@ const MUSIC_DURATIONS = [
   { value: '180', label: '~3 min' },
   { value: '285', label: '~4 min 45' },
 ]
+/** Présélections de rendu DiffRhythm : netteté du chant vs temps GPU (quota). */
+const MUSIC_QUALITIES = [
+  { value: 'rapide', label: 'Rapide', hint: 'Rendu le plus vite — chant correct, léger voile' },
+  { value: 'standard', label: 'Standard', hint: 'Recommandé — chant net et clair (solveur midpoint)' },
+  { value: 'studio', label: 'Studio', hint: 'Le plus fidèle et audible — plus lent, plus de quota GPU' },
+]
 
 const PLACEHOLDERS: Record<Session['mode'], string> = {
   text: 'Demandez quelque chose à Lumo…',
@@ -259,6 +265,7 @@ function Composer({
   const [duration, setDuration] = useState('8 s')
   const [musicStyle, setMusicStyle] = useState('auto')
   const [musicDuration, setMusicDuration] = useState('120')
+  const [musicQuality, setMusicQuality] = useState('standard')
   const [musicLyrics, setMusicLyrics] = useState('')
   const [instrumental, setInstrumental] = useState(false)
   const [framework, setFramework] = useState<WebFramework>('html')
@@ -297,6 +304,7 @@ function Composer({
       attachments: attachments.length ? attachments : undefined,
       musicStyle,
       musicDuration: Number(musicDuration),
+      musicQuality: musicQuality as SendOptions['musicQuality'],
       musicLyrics: musicLyrics.trim() || undefined,
       instrumental,
       framework,
@@ -561,6 +569,23 @@ function Composer({
                     {MUSIC_DURATIONS.map((d) => (
                       <SelectItem key={d.value} value={d.value} className="text-xs">
                         {d.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Select value={musicQuality} onValueChange={setMusicQuality}>
+                  <SelectTrigger
+                    size="sm"
+                    className="h-9 w-[6.6rem] text-xs"
+                    aria-label="Qualité de rendu musical"
+                    title={MUSIC_QUALITIES.find((q) => q.value === musicQuality)?.hint}
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {MUSIC_QUALITIES.map((q) => (
+                      <SelectItem key={q.value} value={q.value} className="text-xs" title={q.hint}>
+                        {q.label}
                       </SelectItem>
                     ))}
                   </SelectContent>

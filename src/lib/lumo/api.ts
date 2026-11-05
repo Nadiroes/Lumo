@@ -161,6 +161,8 @@ export interface MusicRequest {
   duration?: number
   /** Instrumental : DiffRhythm compose sans voix chantées */
   instrumental?: boolean
+  /** Qualité de rendu : rapide | standard | studio (solveur + nombre de pas de diffusion) */
+  quality?: 'rapide' | 'standard' | 'studio'
   format?: 'mp3' | 'wav' | 'ogg'
 }
 
@@ -172,6 +174,12 @@ export interface MusicDoneEvent {
   bytes: number
   mime: string
   durationSec: number
+  /** Présélection de rendu utilisée (badge du lecteur) */
+  quality?: string
+  steps?: number
+  solver?: string
+  /** true si le morceau a été découpé à la durée demandée (fondu de sortie) */
+  trimmed?: boolean
 }
 
 /** Tentative de studio exécutée directement depuis le navigateur (quota ZeroGPU propre à l'IP de l'utilisateur). */

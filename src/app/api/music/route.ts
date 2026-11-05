@@ -1,3 +1,8 @@
+import { execFile } from 'node:child_process'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { promisify } from 'node:util'
 import { NextRequest } from 'next/server'
 import ZAI from 'z-ai-web-dev-sdk'
 import { db } from '@/lib/db'
@@ -51,7 +56,24 @@ interface MusicBody {
   duration?: number
   /** Instrumental : DiffRhythm compose sans paroles chantées */
   instrumental?: boolean
+  /** Qualité de rendu : rapide (16 euler), standard (24 midpoint), studio (40 midpoint) */
+  quality?: 'rapide' | 'standard' | 'studio'
   format?: 'mp3' | 'wav' | 'ogg'
+}
+
+/**
+ * Présélections de rendu — le couple (steps, solveur) détermine la netteté du chant.
+ * « midpoint » (ordre 2) double le nombre effectif d'évaluations : 24 midpoint ≈ 48 euler
+ * pour un coût GPU ~2× — c'est le meilleur compromis qualité/temps sur ZeroGPU.
+ */
+const QUALITY_PRESETS: Record<'rapide' | 'standard' | 'studio', { steps: number; solver: string; label: string }> = {
+  rapide: { steps: 16, solver: 'euler', label: 'Rapide' },
+  standard: { steps: 24, solver: 'midpoint', label: 'Standard' },
+  studio: { steps: 40, solver: 'midpoint', label: 'Studio' },
+}
+
+function qualityPreset(body: MusicBody) {
+  return QUALITY_PRESETS[body.quality ?? 'standard'] ?? QUALITY_PRESETS.standard
 }
 
 /** Traduction des préréglages UI en tags de style anglais (compris par MuQMuLan) */
@@ -282,6 +304,72 @@ interface GradioClient {
   predict: (endpoint: string, params?: unknown) => Promise<{ data: unknown }>
 }
 
+/* --------- Post-traitement audio : durée réelle + découpe honnête --------- */
+
+const runTool = promisify(execFile)
+
+/** Durée réelle du fichier via ffprobe (l'estimation par débit binaire est fausse en VBR). */
+async function probeDuration(file: string): Promise<number> {
+  const { stdout } = await runTool(
+    'ffprobe',
+    ['-v', 'error', '-show_entries', 'format=duration', '-of', 'json', file],
+    { timeout: 15_000 },
+  )
+  const d = Number(JSON.parse(stdout)?.format?.duration)
+  return Number.isFinite(d) && d > 0 ? d : 0
+}
+
+/**
+ * « Écoute honnête » :
+ * 1. mesure la durée réelle (ffprobe) ;
+ * 2. si le morceau dépasse nettement la durée demandée — le Space v2 rend toujours ~240 s,
+ *    quitte à enchainer 2 minutes de jam instrumental après la fin du chant — on coupe à la
+ *    durée cible avec un fondu de sortie de 3 s (pas de coupure brutale au milieu d'un temps fort) ;
+ * 3. jamais bloquant : ffmpeg absent ou en échec → fichier original conservé tel quel.
+ */
+async function refineAudio(
+  base64: string,
+  mime: string,
+  targetSec: number,
+): Promise<{ data: Buffer; durationSec: number; trimmed: boolean }> {
+  const ext = mime === 'audio/ogg' ? 'ogg' : mime === 'audio/wav' ? 'wav' : 'mp3'
+  const input = Buffer.from(base64, 'base64')
+  let real = 0
+  const dir = await mkdtemp(join(tmpdir(), 'lumo-audio-'))
+  const src = join(dir, `in.${ext}`)
+  const out = join(dir, `out.${ext}`)
+  try {
+    await writeFile(src, input)
+    try {
+      real = await probeDuration(src)
+    } catch {
+      return { data: input, durationSec: 0, trimmed: false }
+    }
+    const durationSec = Math.round(real)
+    const target = Math.max(30, Math.min(285, Math.round(targetSec)))
+    if (real <= target + 4) return { data: input, durationSec, trimmed: false }
+
+    const fadeStart = Math.max(0, target - 3)
+    const fadeDur = Math.min(3, target - fadeStart)
+    const args = [
+      '-v', 'error', '-y', '-i', src,
+      '-t', String(target),
+      '-af', `afade=t=in:st=0:d=0.05,afade=t=out:st=${fadeStart}:d=${fadeDur}`,
+    ]
+    if (ext === 'mp3') args.push('-c:a', 'libmp3lame', '-b:a', '192k')
+    else if (ext === 'ogg') args.push('-c:a', 'libvorbis', '-q:a', '6')
+    args.push(out)
+    await runTool('ffmpeg', args, { timeout: 60_000 })
+    const data = await readFile(out)
+    if (data.byteLength < 1000) throw new Error('découpe vide')
+    return { data, durationSec: target, trimmed: true }
+  } catch {
+    return { data: input, durationSec: Math.round(real) || 0, trimmed: false }
+  } finally {
+    void rm(dir, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
 /**
  * Appel Space avec reconnexion automatique (nouvelle session Gradio à chaque essai).
  * « 404: Session not found » = session périmée : le Space ZeroGPU a redémarré entre
@@ -325,16 +413,17 @@ function buildTextPrompt(body: MusicBody): string {
 
 /** Paramètres de l'endpoint /infer_music du Space DiffRhythm 2. */
 function buildV2Params(lrc: string, body: MusicBody): Record<string, unknown> {
+  const q = qualityPreset(body)
   return {
     lrc,
     audio_prompt: null,
     text_prompt: buildTextPrompt(body) || (body.instrumental ? 'instrumental' : 'pop, piano, warm vocals'),
     seed: 0,
     randomize_seed: true,
-    steps: 16,
+    steps: q.steps,
     cfg_strength: 1.3,
     file_type: body.format ?? 'mp3',
-    odeint_method: 'euler',
+    odeint_method: q.solver,
   }
 }
 
@@ -511,6 +600,7 @@ export async function POST(req: NextRequest) {
 
         let audio: AudioResult | undefined
         let lastReason = 'studio indisponible'
+        let refined: { durationSec: number; trimmed: boolean } | undefined
         for (let i = 0; i < attempts.length; i++) {
           const attempt = attempts[i]
           try {
@@ -518,6 +608,16 @@ export async function POST(req: NextRequest) {
             audio = await attempt.run()
             lastGoodAttempt = i
             lastGoodAt = Date.now()
+            /* Écoute honnête : durée réelle mesurée + découpe propre à la durée demandée
+             * (le Space v2 rend ~240 s même pour une chanson demandée à 1 ou 2 min). */
+            const targetSec = Math.min(Math.max(body.duration ?? 120, 30), 285)
+            const ref = await refineAudio(audio.base64, audio.mime, targetSec)
+            audio = {
+              ...audio,
+              base64: ref.data.toString('base64'),
+              bytes: ref.data.byteLength,
+            }
+            refined = { durationSec: ref.durationSec, trimmed: ref.trimmed }
             break
           } catch (e) {
             const raw = e instanceof Error ? e.message : String(e)
@@ -531,7 +631,12 @@ export async function POST(req: NextRequest) {
         }
 
         if (audio) {
-          const durationSec = audio.mime === 'audio/mpeg' ? Math.round((audio.bytes * 8) / 128_000) : 0
+          const durationSec =
+            refined?.durationSec && refined.durationSec > 0
+              ? refined.durationSec
+              : audio.mime === 'audio/mpeg'
+                ? Math.round((audio.bytes * 8) / 128_000)
+                : 0
           safeEmit({
             stage: 'done',
             engine: audio.engine,
@@ -541,6 +646,10 @@ export async function POST(req: NextRequest) {
             bytes: audio.bytes,
             mime: audio.mime,
             durationSec,
+            quality: qualityPreset(body).label,
+            steps: qualityPreset(body).steps,
+            solver: qualityPreset(body).solver,
+            trimmed: refined?.trimmed === true,
           })
         } else {
           /* Tous les chemins serveur sont morts (quotas IP serveur, Space en redémarrage).

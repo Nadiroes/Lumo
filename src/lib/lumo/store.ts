@@ -155,6 +155,8 @@ export interface SendOptions {
   attachments?: Attachment[]
   musicStyle?: string
   musicDuration?: number
+  /** Qualité de rendu DiffRhythm : rapide | standard | studio */
+  musicQuality?: 'rapide' | 'standard' | 'studio'
   /** Paroles fournies par l'utilisateur (v2, texte brut ou timestamps) — vides : Lumo les écrit */
   musicLyrics?: string
   instrumental?: boolean
@@ -907,6 +909,7 @@ export const useLumo = create<LumoState>()(
               style: opts.musicStyle ?? 'auto',
               duration: opts.musicDuration ?? 120,
               instrumental,
+              quality: opts.musicQuality ?? 'standard',
               format: 'mp3',
             },
             {
@@ -981,6 +984,10 @@ export const useLumo = create<LumoState>()(
                 lyrics: done.lrc,
                 durationSec: done.durationSec,
                 instrumental,
+                ...(done.quality ? { quality: done.quality } : {}),
+                ...(typeof done.steps === 'number' ? { steps: done.steps } : {}),
+                ...(done.solver ? { solver: done.solver } : {}),
+                ...(done.trimmed !== undefined ? { trimmed: done.trimmed } : {}),
               },
             }
             const dur = done.durationSec >= 60 ? `${Math.floor(done.durationSec / 60)} min ${String(done.durationSec % 60).padStart(2, '0')}` : `${done.durationSec} s`

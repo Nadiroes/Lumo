@@ -144,13 +144,27 @@ function useAudioObjectUrl(a: Artifact): string | undefined {
 /** Forme d'onde par défaut (pendant le décodage ou en cas d'échec) : vague régulière. */
 const DEFAULT_PEAKS = Array.from({ length: 84 }, (_, i) => 0.3 + Math.abs(Math.sin(i * 0.55)) * 0.45)
 
+/** Cache module : la décodage d'un morceau de 4 min coûte ~1 s — jamais deux fois pour le même artefact. */
+const peaksCache = new Map<string, { peaks: number[]; duration: number }>()
+
 /**
- * Décode l'audio réel via Web Audio et extrait 84 crêtes (0..1) —
+ * Décode l'audio réel via Web Audio et extrait 84 crêtes (0..1) + la durée exacte —
  * c'est la « bande » affichée : la vraie enveloppe du morceau généré.
+ * La durée renvoyée par decodeAudioData est exacte (le <audio> peut se tromper sur du MP3 VBR).
  */
-function useWaveformPeaks(url: string | undefined): { peaks: number[]; decoding: boolean } {
-  const [state, setState] = useState<{ peaks: number[]; decoding: boolean }>({ peaks: DEFAULT_PEAKS, decoding: true })
+function useWaveformPeaks(
+  url: string | undefined,
+  cacheKey: string,
+): { peaks: number[]; decoding: boolean; duration: number } {
+  const [state, setState] = useState<{ peaks: number[]; decoding: boolean; duration: number }>(() => {
+    const hit = peaksCache.get(cacheKey)
+    return hit
+      ? { peaks: hit.peaks, decoding: false, duration: hit.duration }
+      : { peaks: DEFAULT_PEAKS, decoding: true, duration: 0 }
+  })
   useEffect(() => {
+    const hit = peaksCache.get(cacheKey)
+    if (hit) return // déjà décodé : l'état initial a déjà chargé le cache
     if (!url) return
     let alive = true
     let ctx: AudioContext | undefined
@@ -177,9 +191,11 @@ function useWaveformPeaks(url: string | undefined): { peaks: number[]; decoding:
           out.push(max)
         }
         const top = Math.max(...out) || 1
-        setState({ peaks: out.map((p) => Math.min(1, Math.max(0.12, p / top))), decoding: false })
+        const duration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0
+        peaksCache.set(cacheKey, { peaks: out, duration })
+        setState({ peaks: out.map((p) => Math.min(1, Math.max(0.12, p / top))), decoding: false, duration })
       } catch {
-        if (alive) setState({ peaks: DEFAULT_PEAKS, decoding: false })
+        if (alive) setState({ peaks: DEFAULT_PEAKS, decoding: false, duration: 0 })
       } finally {
         void ctx?.close().catch(() => {})
       }
@@ -187,7 +203,7 @@ function useWaveformPeaks(url: string | undefined): { peaks: number[]; decoding:
     return () => {
       alive = false
     }
-  }, [url])
+  }, [url, cacheKey])
   return state
 }
 
@@ -227,9 +243,12 @@ function engineTheme(engine: string, isMusic: boolean): EngineTheme {
   return { badge: 'bg-primary/10 text-primary', label: 'Voix', played: 'bg-primary', knob: 'bg-primary', icon: '🔊' }
 }
 
+/** Seule lecture à la fois : démarrer un morceau met en pause les autres cartes audio. */
+let activeAudioEl: HTMLAudioElement | null = null
+
 export function AudioCard({ a }: { a: Artifact }) {
   const url = useAudioObjectUrl(a)
-  const { peaks, decoding } = useWaveformPeaks(url)
+  const { peaks, decoding, duration: decodedDuration } = useWaveformPeaks(url, a.id)
   const isMusic = !!a.meta?.music
   const voice = a.meta?.voice ? String(a.meta.voice) : 'voix'
   const style = a.meta?.style ? String(a.meta.style) : ''
@@ -237,20 +256,24 @@ export function AudioCard({ a }: { a: Artifact }) {
   const keyName = a.meta?.key ? String(a.meta.key) : ''
   const durationSec = a.meta?.durationSec ? Number(a.meta.durationSec) : 0
   const engine = a.meta?.engine ? String(a.meta.engine) : ''
+  const qualityLabel = a.meta?.quality ? String(a.meta.quality) : ''
   const instrumental = a.meta?.instrumental === true
   const lyrics = a.meta?.lyrics ? String(a.meta.lyrics) : ''
   const theme = engineTheme(engine, isMusic)
   const ext = a.mimeType?.includes('mpeg') ? 'MP3' : a.mimeType?.includes('ogg') ? 'OGG' : 'WAV'
   const { toast } = useToast()
 
-  /* Transport : lecture, progression, volume, boucle */
+  /* Transport : lecture, progression, volume, boucle.
+   * Durée retenue, par priorité : durée exacte décodée (Web Audio) → durée du <audio>
+   * → estimation des métadonnées. Le MP3 VBR peut induire le <audio> en erreur. */
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const [playing, setPlaying] = useState(false)
   const [cur, setCur] = useState(0)
-  const [dur, setDur] = useState(durationSec)
+  const [elDur, setElDur] = useState(0)
   const [vol, setVol] = useState(1)
   const [muted, setMuted] = useState(false)
   const [loop, setLoop] = useState(false)
+  const dur = decodedDuration > 0 ? decodedDuration : elDur > 0 ? elDur : durationSec
 
   const pct = dur > 0 ? Math.min(100, (cur / dur) * 100) : 0
 
@@ -311,13 +334,21 @@ export function AudioCard({ a }: { a: Artifact }) {
           preload="metadata"
           className="hidden"
           aria-label={`Lecture de ${a.name}`}
-          onPlay={() => setPlaying(true)}
+          onPlay={(e) => {
+            /* Lecture exclusive : le démarrage d'une carte met en pause la précédente —
+             * sinon deux morceaux se superposent et l'écoute devient incompréhensible. */
+            if (activeAudioEl && activeAudioEl !== e.currentTarget && !activeAudioEl.paused) {
+              activeAudioEl.pause()
+            }
+            activeAudioEl = e.currentTarget
+            setPlaying(true)
+          }}
           onPause={() => setPlaying(false)}
           onEnded={() => setPlaying(false)}
           onTimeUpdate={(e) => setCur(e.currentTarget.currentTime)}
           onLoadedMetadata={(e) => {
             const d = e.currentTarget.duration
-            if (Number.isFinite(d) && d > 0) setDur(d)
+            if (Number.isFinite(d) && d > 0) setElDur(d)
           }}
           onVolumeChange={(e) => setVol(e.currentTarget.volume)}
         />
@@ -345,6 +376,7 @@ export function AudioCard({ a }: { a: Artifact }) {
             }
           >
             {theme.icon} {theme.label}
+            {qualityLabel ? ` · ${qualityLabel}` : ''}
           </span>
           <Button
             size="sm"
