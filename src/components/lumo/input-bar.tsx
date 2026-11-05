@@ -66,6 +66,11 @@ const MUSIC_QUALITIES = [
   { value: 'standard', label: 'Standard', hint: 'Recommandé — chant net et clair (solveur midpoint)' },
   { value: 'studio', label: 'Studio', hint: 'Le plus fidèle et audible — plus lent, plus de quota GPU' },
 ]
+/** Moteur musical : option 1 DiffRhythm (studio HF), option 2 YuE 2 open source (local). */
+const MUSIC_ENGINES = [
+  { value: 'diffrhythm', label: 'DiffRhythm 2', hint: 'Option 1 — studio Hugging Face (quota GPU gratuit, chanson complète en ~1 min)' },
+  { value: 'yue', label: 'YuE 2 · local', hint: 'Option 2 — open source installé sur cette machine (paroles → score éditable → chanson 48 kHz). Nécessite l\'installation depuis le panneau HF.' },
+]
 
 const PLACEHOLDERS: Record<Session['mode'], string> = {
   text: 'Demandez quelque chose à Lumo…',
@@ -73,6 +78,7 @@ const PLACEHOLDERS: Record<Session['mode'], string> = {
   image: 'Décrivez l’image à générer…',
   video: 'Décrivez le clip à produire…',
   audio: 'Décrivez la chanson ou le texte à transformer…',
+  labs: 'Décrivez la chanson à composer dans le studio… (ex. : « une ballade folk sur les retrouvailles »)',
   book: 'Que dois écrire Lumo ? (chapitre, scène, dialogue…)',
   project: 'Décrivez votre livrable, Lumo le décompose…',
   webdev: 'Décrivez le site ou l’app web à coder… (ex. : « la vitrine d’un fleuriste avec galerie et contact »)',
@@ -144,7 +150,7 @@ export function InputBar({
   onStop: () => void
 }) {
   const editingMsg = useLumo((s) => s.editingMsg)
-  const [audioTab, setAudioTab] = useState<AudioTab>('voice')
+  const [audioTab, setAudioTab] = useState<AudioTab>(session.mode === 'labs' ? 'music' : 'voice')
   const fileRef = useRef<HTMLInputElement>(null)
   const { toast } = useToast()
 
@@ -267,6 +273,7 @@ function Composer({
   const [musicDuration, setMusicDuration] = useState('120')
   const [musicQuality, setMusicQuality] = useState('standard')
   const [musicLyrics, setMusicLyrics] = useState('')
+  const [musicEngine, setMusicEngine] = useState<'diffrhythm' | 'yue'>('diffrhythm')
   const [instrumental, setInstrumental] = useState(false)
   const [framework, setFramework] = useState<WebFramework>('html')
   const [micActive, setMicActive] = useState(false)
@@ -306,6 +313,7 @@ function Composer({
       musicDuration: Number(musicDuration),
       musicQuality: musicQuality as SendOptions['musicQuality'],
       musicLyrics: musicLyrics.trim() || undefined,
+      musicEngine: mode === 'labs' ? musicEngine : musicEngine === 'yue' ? 'yue' : undefined,
       instrumental,
       framework,
     }
@@ -391,7 +399,7 @@ function Composer({
 
   const isImage = mode === 'image'
   const isVideo = mode === 'video'
-  const isMusic = mode === 'audio' && audioTab === 'music'
+  const isMusic = mode === 'labs' || (mode === 'audio' && audioTab === 'music')
   const isWebdev = mode === 'webdev'
   const isAppDesign = mode === 'appdesign'
   const placeholder = isEditing
@@ -404,6 +412,12 @@ function Composer({
     <div className="border-t bg-background/90 px-4 pb-[calc(0.75rem+env(safe-area-inset-bottom))] pt-3 backdrop-blur sm:px-6">
       <div className="mx-auto max-w-3xl">
         {mode === 'audio' && <AudioTabs audioTab={audioTab} setAudioTab={setAudioTab} />}
+        {mode === 'labs' && (
+          <p className="mb-2.5 flex items-center gap-1.5 text-xs text-muted-foreground">
+            <Music className="h-3.5 w-3.5 text-primary" aria-hidden="true" />
+            Studio musical — chaque création produit paroles, voix et accompagnement.
+          </p>
+        )}
 
         {/* Bandeau d’édition */}
         {isEditing && (
@@ -549,6 +563,23 @@ function Composer({
             )}
             {isMusic && (
               <>
+                <Select value={musicEngine} onValueChange={(v) => setMusicEngine(v as 'diffrhythm' | 'yue')}>
+                  <SelectTrigger
+                    size="sm"
+                    className="h-9 w-[8.6rem] text-xs"
+                    aria-label="Moteur musical"
+                    title={MUSIC_ENGINES.find((e) => e.value === musicEngine)?.hint}
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {MUSIC_ENGINES.map((e) => (
+                      <SelectItem key={e.value} value={e.value} className="text-xs" title={e.hint}>
+                        {e.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
                 <Select value={musicStyle} onValueChange={setMusicStyle}>
                   <SelectTrigger size="sm" className="h-9 w-28 text-xs" aria-label="Style musical">
                     <SelectValue />

@@ -328,12 +328,8 @@ async function writeRegistry(models: LocalModel[]): Promise<void> {
 /** Parcours disque : tout .gguf présent (y compris déposé manuellement) est un modèle. */
 async function scanGguf(dir: string, depth: number, out: { repoId: string; file: string; addedAt: number }[]): Promise<void> {
   if (depth > 4) return
-  let entries: Awaited<ReturnType<typeof fsp.readdir>>
-  try {
-    entries = await fsp.readdir(dir, { withFileTypes: true })
-  } catch {
-    return
-  }
+  const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(() => null)
+  if (!entries) return
   for (const e of entries) {
     if (e.name.startsWith('.') || e.name === 'registry.json') continue
     const full = path.join(dir, e.name)

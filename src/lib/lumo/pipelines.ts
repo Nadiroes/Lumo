@@ -413,16 +413,13 @@ export function setupEnvironment(): { jobId: string } {
 
 /* ------------------------------ Téléchargements --------------------------- */
 
+/** Somme réelle des poids présents sur le disque */
 async function weightsOnDisk(id: PipelineId): Promise<number> {
   let total = 0
   const walk = async (dir: string, depth: number): Promise<void> => {
     if (depth > 6) return
-    let entries: Awaited<ReturnType<typeof fsp.readdir>>
-    try {
-      entries = await fsp.readdir(dir, { withFileTypes: true })
-    } catch {
-      return
-    }
+    const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(() => null)
+    if (!entries) return
     for (const e of entries) {
       if (e.name.startsWith('.')) continue
       const full = path.join(dir, e.name)

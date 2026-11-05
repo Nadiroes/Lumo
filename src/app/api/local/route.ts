@@ -15,13 +15,24 @@ import {
   startDownload,
   stopEngine,
 } from '@/lib/lumo/local-engine'
+import { LOCAL_CATALOG } from '@/lib/lumo/catalog'
+import { isPipelineReady, type PipelineId } from '@/lib/lumo/pipelines'
 
 export const runtime = 'nodejs'
 export const maxDuration = 300
 
-/** GET /api/local — état complet : runtime, disque, RAM, modèles, téléchargements */
+/** GET /api/local — état complet : runtime, disque, RAM, modèles, téléchargements, catalogue */
 export async function GET() {
-  const [runtime, disk, models] = await Promise.all([runtimeInfo(), diskInfo(), listLocalModels()])
+  const [runtime, disk, models, pipelinesEnv] = await Promise.all([
+    runtimeInfo(),
+    diskInfo(),
+    listLocalModels(),
+    // Sonde légère : les pipelines du catalogue (TTS/image/embeddings) prêts ?
+    Promise.all(
+      LOCAL_CATALOG.filter((e) => e.engine === 'pipeline' && e.pipelineId).map(async (e) => [e.id, await isPipelineReady(e.pipelineId as PipelineId)] as const),
+    ).then((rows) => Object.fromEntries(rows) as Record<string, boolean>),
+  ])
+  const repoInstalled = new Set(models.map((m) => m.repoId))
   return NextResponse.json({
     ok: true,
     runtime,
@@ -36,6 +47,17 @@ export async function GET() {
       engine: engineStatus(m.id),
     })),
     downloads: allDownloads(),
+    catalog: LOCAL_CATALOG.map((e) => ({
+      id: e.id,
+      title: e.title,
+      repo: e.repo,
+      kind: e.kind,
+      engine: e.engine,
+      file: e.file,
+      sizeBytes: e.sizeBytes,
+      installed:
+        e.engine === 'llamacpp' ? repoInstalled.has(e.repo) : e.pipelineId ? pipelinesEnv[e.id] === true : false,
+    })),
   })
 }
 

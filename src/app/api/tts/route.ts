@@ -1,8 +1,35 @@
 import { NextRequest, NextResponse } from 'next/server'
 import ZAI from 'z-ai-web-dev-sdk'
+import { isPipelineReady, runPipeline } from '@/lib/lumo/pipelines'
+import { mkdtemp } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 export const runtime = 'nodejs'
-export const maxDuration = 180
+export const maxDuration = 300
+
+/**
+ * Voie locale : pipeline Audio8-TTS-Realistic-Air (0.6B, 23 langues, Apache 2.0)
+ * installé sur la machine (vendor/pipelines/audio8-tts). Tourne sur CPU.
+ * Retourne un Buffer WAV ou undefined si le pipeline n'est pas prêt / échoue.
+ */
+async function attemptAudio8(text: string): Promise<{ buf: Buffer; note: string } | undefined> {
+  try {
+    if (!(await isPipelineReady('audio8-tts'))) return undefined
+    const dir = await mkdtemp(join(tmpdir(), 'lumo-tts8-'))
+    const final = (await runPipeline('audio8-tts', { text, outputDir: dir })) as Record<string, unknown>
+    const audio = String(final.audioBase64 ?? '')
+    if (!audio) return undefined
+    const buf = Buffer.from(audio, 'base64')
+    if (buf.byteLength < 1000) return undefined
+    return {
+      buf,
+      note: 'Synthèse locale Audio8 TTS (0.6B · Realistic Air) — aucune donnée envoyée en ligne.',
+    }
+  } catch {
+    return undefined // bascule silencieuse sur le moteur intégré
+  }
+}
 
 /** Voix Lumo → voix du moteur TTS (multilingues, lisent le français) */
 const VOICE_MAP: Record<string, string> = {
@@ -100,6 +127,22 @@ export async function POST(req: NextRequest) {
       )
     }
 
+    /* ---- 1) Pipeline local Audio8 TTS (si installé) ---- */
+    const local8 = await attemptAudio8(text)
+    if (local8) {
+      const wav = local8.buf
+      return NextResponse.json({
+        ok: true,
+        base64: wav.toString('base64'),
+        bytes: wav.length,
+        voice,
+        chunks: 1,
+        engine: 'audio8-tts (local)',
+        note: local8.note,
+      })
+    }
+
+    /* ---- 2) Moteur intégré ---- */
     const zai = await ZAI.create()
     const chunks = splitText(text)
     const buffers: Buffer[] = []

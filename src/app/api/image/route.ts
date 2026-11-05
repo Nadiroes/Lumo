@@ -1,9 +1,26 @@
 import { NextRequest, NextResponse } from 'next/server'
 import ZAI from 'z-ai-web-dev-sdk'
 import { db } from '@/lib/db'
+import { isPipelineReady, runPipeline } from '@/lib/lumo/pipelines'
 
 export const runtime = 'nodejs'
-export const maxDuration = 180
+export const maxDuration = 300
+
+/**
+ * Voie locale : pipeline MOSS-Image-SFT (5B, diffusers) installé sur la machine.
+ * Ne s'active que si les 27 Go de poids sont présents — sinon bascule silencieuse.
+ */
+async function attemptMoss(prompt: string): Promise<{ base64: string; bytes: number } | undefined> {
+  try {
+    if (!(await isPipelineReady('moss-image'))) return undefined
+    const final = (await runPipeline('moss-image', { prompt, steps: 30 })) as Record<string, unknown>
+    const b64 = String(final.imageBase64 ?? '')
+    if (!b64) return undefined
+    return { base64: b64, bytes: Number(final.bytes ?? 0) }
+  } catch {
+    return undefined
+  }
+}
 
 const SIZES = new Set([
   '1024x1024',
@@ -77,6 +94,19 @@ export async function POST(req: NextRequest) {
 
     const prompt = sanitizePrompt(rawPrompt)
     const chain: { source: string; model?: string; ok: boolean; error?: string }[] = []
+
+    /* ---- 0) Pipeline local MOSS-Image (si les poids sont installés) ---- */
+    const moss = await attemptMoss(prompt)
+    if (moss) {
+      return NextResponse.json({
+        ok: true,
+        base64: moss.base64,
+        bytes: moss.bytes,
+        engine: 'moss-image-sft (local)',
+        chain,
+        note: 'Image générée en local par MOSS-Image-SFT (open source) — aucune donnée envoyée en ligne.',
+      })
+    }
 
     /* ---- 1) Modèles Hugging Face : modèle du bloc → lien général ---- */
     if (blockHf || globalHf) {

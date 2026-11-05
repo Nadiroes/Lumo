@@ -10,6 +10,8 @@ import {
   apiChatStream,
   apiImage,
   apiMusicStream,
+  apiPipelineRun,
+  apiPipelinesStatus,
   apiTts,
   type ChatOverride,
   type ClientStudioEvent,
@@ -160,10 +162,25 @@ export interface SendOptions {
   musicQuality?: 'rapide' | 'standard' | 'studio'
   /** Paroles fournies par l'utilisateur (v2, texte brut ou timestamps) — vides : Lumo les écrit */
   musicLyrics?: string
+  /** Moteur musical : DiffRhythm (option 1) ou YuE 2 open source local (option 2, bloc Labs) */
+  musicEngine?: 'diffrhythm' | 'yue'
   instrumental?: boolean
   framework?: string
   /** Durée du clip vidéo (ex. « 8 s ») */
   duration?: string
+}
+
+/** Tags de style anglais pour YuE 2 (même vocabulaire que DiffRhythm, côté client) */
+const YUE_STYLE_TAGS: Record<string, string> = {
+  auto: 'pop, piano, warm vocals',
+  lofi: 'lo-fi chill, soft beats, vinyl warmth, cozy',
+  electro: 'electronic dance, bright synths, driving beat',
+  cinematic: 'cinematic orchestral, epic strings, emotional',
+  rock: 'energetic rock, electric guitars, live drums',
+  jazz: 'smooth jazz, saxophone, double bass, swing',
+  ambient: 'ambient atmospheric, ethereal pads, slow',
+  pop: 'catchy pop, bright vocals, modern production',
+  funk: 'groovy funk, slap bass, brass section, dance',
 }
 
 /**
@@ -791,8 +808,179 @@ export const useLumo = create<LumoState>()(
         }
       }
 
+      /** Titre de secours dérivé du prompt (côté client) */
+      function yueTitle(prompt: string): string {
+        const stop = new Set(['le', 'la', 'les', 'un', 'une', 'des', 'du', 'de', 'd', 'à', 'au', 'aux', 'et', 'en', 'avec', 'pour', 'sur', 'dans', 'chanson', 'musique'])
+        const words = prompt
+          .toLowerCase()
+          .replace(/[^a-zà-ÿ0-9\s'-]/g, ' ')
+          .split(/\s+/)
+          .filter((w) => w.length > 2 && !stop.has(w))
+          .slice(0, 4)
+        if (!words.length) return 'Chanson YuE'
+        return words.map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')
+      }
+
+      /**
+       * Option 2 du studio musical — YuE 2 open source, exécuté EN LOCAL
+       * (pipeline Python vendor/pipelines/yue : YuE2-3B + YuE2-Vae).
+       * Repli automatique sur DiffRhythm (option 1) en cas d'indisponibilité.
+       */
+      async function yueMusicFlow(sessionId: string, prompt: string, opts: SendOptions) {
+        const session = get().sessions.find((s) => s.id === sessionId)
+        if (!session) return
+        const provider = session.models.audio
+        const assistantId = uid()
+        const instrumental = opts.instrumental ?? false
+        const styleLabel = opts.musicStyle === 'auto' || !opts.musicStyle ? 'libre' : opts.musicStyle
+
+        addMessage(sessionId, {
+          id: assistantId,
+          role: 'assistant',
+          content: '🧪 **Labs · YuE 2** — vérification de l’installation locale (environnement + poids)…',
+          createdAt: Date.now(),
+          pending: true,
+          flow: 'audio-music',
+          provider,
+        })
+
+        const tick = setInterval(() => {
+          const m = get().sessions.find((s) => s.id === sessionId)?.messages.find((x) => x.id === assistantId)
+          if (m?.pending && /^(🧪|🎼)/.test(m.content)) {
+            const base = m.content.replace(/\s*⏱ \d+ s$/, '')
+            updateMessage(sessionId, assistantId, { content: base })
+          }
+        }, 1000)
+
+        /** Bascule DiffRhythm (option 1) après un échec YuE — le message YuE reste comme note */
+        async function fallbackDiffRhythm(reason: string) {
+          clearInterval(tick)
+          aborts.delete(sessionId)
+          updateMessage(sessionId, assistantId, {
+            pending: false,
+            content:
+              `⚠️ **YuE 2 indisponible** : ${reason.slice(0, 200)}\n\n` +
+              `→ Installation : panneau « HF · Labs » → section **Pipelines locaux** (environnement + poids 7,95 Go). ` +
+              `En attendant, bascule sur **DiffRhythm** (option 1)…`,
+          })
+          await musicFlow(sessionId, prompt, { ...opts, musicEngine: 'diffrhythm' })
+        }
+
+        try {
+          const ac = new AbortController()
+          aborts.set(sessionId, ac)
+
+          /* 1. Prévol : environnement + poids présents ? */
+          const st = await apiPipelinesStatus()
+          const yue = st.pipelines.find((p) => p.id === 'yue')
+          if (!st.env.ready) {
+            throw new Error(
+              st.env.error
+                ? `environnement Python en erreur (${st.env.error.slice(0, 120)})`
+                : 'environnement Python non installé — cliquez « Installer l’environnement » dans le panneau HF du bloc Labs.',
+            )
+          }
+          if (!yue?.weightsComplete) {
+            const have = ((yue?.bytesDownloaded ?? 0) / 1e9).toFixed(1)
+            const want = ((yue?.totalBytes ?? 0) / 1e9).toFixed(1)
+            throw new Error(`poids incomplets (${have} Go sur ${want} Go) — cliquez « Télécharger les poids » dans le panneau HF du bloc Labs.`)
+          }
+          if (!yue.hardware.ramOk) {
+            updateMessage(sessionId, assistantId, {
+              content: `🧪 **Labs · YuE 2** — attention : ${(yue.hardware.ramTotalBytes / 1e9).toFixed(1)} Go de RAM détectés (16 Go conseillés). Tentative locale en CPU…`,
+            })
+          } else {
+            updateMessage(sessionId, assistantId, {
+              content: '🧪 **Labs · YuE 2** — installation complète ✓ · chargement du modèle 3B en mémoire locale…',
+            })
+          }
+
+          /* 2. Exécution du pipeline local (NDJSON) */
+          const final = await apiPipelineRun(
+            'yue',
+            {
+              style: YUE_STYLE_TAGS[opts.musicStyle ?? 'auto'] ?? '',
+              lyrics: opts.musicLyrics?.trim() || '',
+              instrumental,
+              cot: 'full',
+              seed: Math.floor(Math.random() * 1_000_000),
+            },
+            {
+              onStage: (evt) => {
+                const stage = String(evt.stage ?? '')
+                const msg = String((evt.message as string) ?? '')
+                if (stage === 'load') {
+                  updateMessage(sessionId, assistantId, { content: '🧪 **Labs · YuE 2** — chargement du modèle en mémoire…' })
+                } else if (stage === 'loaded') {
+                  updateMessage(sessionId, assistantId, {
+                    content: `🎼 **YuE 2** prêt (${String(evt.device ?? 'cpu')}) — composition du plan mélodie/accords puis synthèse… ⏱ 0 s`,
+                  })
+                } else if (stage === 'compose' || stage === 'run-start') {
+                  updateMessage(sessionId, assistantId, { content: `🎼 **YuE 2** compose… ${msg ? `(${msg})` : ''} ⏱ 0 s` })
+                }
+              },
+            },
+            ac.signal,
+          )
+
+          clearInterval(tick)
+          aborts.delete(sessionId)
+
+          /* 3. Artefact : le serveur a converti le FLAC YuE en MP3 + extrait le score */
+          const base64 = String(final.audioBase64 ?? '')
+          if (!base64) throw new Error('audio manquant dans la réponse du pipeline')
+          const score = typeof final.score === 'string' ? final.score : undefined
+          const durationSec = Number(final.durationSec ?? 0)
+          const bytes = Number(final.bytes ?? 0)
+          const title = yueTitle(prompt)
+          const artifact: Artifact = {
+            id: uid(),
+            kind: 'audio',
+            name: `${title.replace(/[^\wÀ-ÿ]+/g, '_')}.mp3`,
+            mimeType: 'audio/mpeg',
+            createdAt: Date.now(),
+            provider: 'YuE 2 · local (open source)',
+            prompt,
+            data: base64,
+            bytes,
+            meta: {
+              music: true,
+              engine: 'yue2',
+              style: styleLabel,
+              lyrics: opts.musicLyrics ?? '',
+              ...(score ? { score } : {}),
+              durationSec,
+              instrumental,
+              device: String(final.device ?? 'cpu'),
+              ...(final.truncated ? { truncated: JSON.stringify(final.truncated) } : {}),
+            },
+          }
+          await putArtifactData(artifact.id, base64)
+          const dur = durationSec >= 60 ? `${Math.floor(durationSec / 60)} min ${String(durationSec % 60).padStart(2, '0')}` : `${durationSec} s`
+          updateMessage(sessionId, assistantId, {
+            pending: false,
+            content:
+              `Voici **« ${title} »** — chanson générée **en local par YuE 2** 🎉 (${dur}, moteur ${String(final.device ?? 'cpu')}).\n\n` +
+              `▶ Écoutez le morceau ci-dessous. Le **score mélodie/accords éditable (ABC)** est joint — dépliez-le pour voir la composition.${instrumental ? ' (pièce instrumentale)' : ''}`,
+            artifacts: [artifact],
+          })
+        } catch (e) {
+          if (e instanceof Error && /interrompue/i.test(e.message)) {
+            clearInterval(tick)
+            aborts.delete(sessionId)
+            return
+          }
+          await fallbackDiffRhythm(e instanceof Error ? e.message : 'erreur inconnue')
+        }
+      }
+
       /** Studio musical façon Suno — DiffRhythm 2 (Hugging Face) + repli synthèse locale */
       async function musicFlow(sessionId: string, prompt: string, opts: SendOptions) {
+        /* Option 2 : YuE 2 open source en local — bascule ici AVANT la chaîne DiffRhythm */
+        if (opts.musicEngine === 'yue') {
+          await yueMusicFlow(sessionId, prompt, opts)
+          return
+        }
         const session = get().sessions.find((s) => s.id === sessionId)
         if (!session) return
         const provider = session.models.audio
@@ -1455,7 +1643,8 @@ export const useLumo = create<LumoState>()(
           else if (session.mode === 'audio') {
             if (opts.audioTab === 'music') await musicFlow(sessionId, trimmed, opts)
             else await audioFlow(sessionId, trimmed, opts)
-          } else if (session.mode === 'webdev') await webDevFlow(sessionId, trimmed, opts)
+          } else if (session.mode === 'labs') await musicFlow(sessionId, trimmed, opts)
+          else if (session.mode === 'webdev') await webDevFlow(sessionId, trimmed, opts)
           else if (session.mode === 'appdesign') await designFlow(sessionId, trimmed, opts)
           else await chatFlow(sessionId, history)
         },
@@ -1483,6 +1672,7 @@ export const useLumo = create<LumoState>()(
           if (mode === 'image') await imageFlow(sessionId, edited.content, opts)
           else if (mode === 'video') await videoFlow(sessionId, edited.content, opts)
           else if (mode === 'audio') await audioFlow(sessionId, edited.content, { ...opts, audioTab: 'voice' })
+          else if (mode === 'labs') await musicFlow(sessionId, edited.content, { ...opts, audioTab: 'music' })
           else if (mode === 'webdev') {
             const fw = (session.messages[idx].artifacts?.[0]?.meta?.framework as string) ?? opts.framework ?? 'html'
             await webDevFlow(sessionId, edited.content, { ...opts, framework: fw })
@@ -1562,6 +1752,7 @@ export const useLumo = create<LumoState>()(
                 musicStyle: (meta.style as string) ?? 'auto',
                 musicDuration: (meta.durationSec as number) || undefined,
                 musicLyrics: (meta.lyrics as string) || undefined,
+                musicEngine: meta.engine === 'yue2' ? 'yue' : undefined,
                 instrumental: Boolean(meta.instrumental),
                 attachments: lastUser.attachments,
               })
@@ -1571,6 +1762,17 @@ export const useLumo = create<LumoState>()(
                 attachments: lastUser.attachments,
               })
             }
+          } else if (mode === 'labs') {
+            const meta = removed.artifacts?.[0]?.meta ?? {}
+            await musicFlow(sessionId, lastUser.content, {
+              audioTab: 'music',
+              musicStyle: (meta.style as string) ?? 'auto',
+              musicDuration: (meta.durationSec as number) || undefined,
+              musicLyrics: (meta.lyrics as string) || undefined,
+              musicEngine: meta.engine === 'yue2' ? 'yue' : undefined,
+              instrumental: Boolean(meta.instrumental),
+              attachments: lastUser.attachments,
+            })
           } else if (mode === 'webdev') {
             await webDevFlow(sessionId, lastUser.content, {
               framework: (removed.artifacts?.[0]?.meta?.framework as string) ?? 'html',

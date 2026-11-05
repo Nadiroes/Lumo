@@ -25,6 +25,7 @@ import {
   HardDrive,
   Link2,
   Loader2,
+  Package,
   Play,
   RotateCcw,
   ShieldCheck,
@@ -37,7 +38,16 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { useToast } from '@/hooks/use-toast'
-import { apiHfDetect, apiLocalAction, apiLocalStatus, type LocalStatus } from '@/lib/lumo/api'
+import {
+  apiHfDetect,
+  apiLocalAction,
+  apiLocalStatus,
+  apiPipelinesAction,
+  apiPipelinesStatus,
+  type LocalStatus,
+  type PipelineStatus,
+} from '@/lib/lumo/api'
+import { catalogFor, type CatalogEntry } from '@/lib/lumo/catalog'
 import { hfTaskToCaps, type Capability } from '@/lib/lumo/providers'
 import { useLumo } from '@/lib/lumo/store'
 import {
@@ -374,6 +384,244 @@ function LocalModelsSection({
 }
 
 /* ---------------------------------------------------------------- */
+/* Catalogue : modèles explicitement branchés dans le projet          */
+/* ---------------------------------------------------------------- */
+
+const KIND_LABELS: Record<string, string> = {
+  code: 'Code · apps',
+  vision: 'Vision',
+  chat: 'Chat',
+  embedding: 'Embeddings',
+  tts: 'Voix',
+  image: 'Image',
+  music: 'Musique',
+}
+
+function fmtGo(n?: number): string {
+  if (!n) return '?'
+  return `${(n / 1e9).toFixed(1)} Go`
+}
+
+/**
+ * Section « Catalogue » du panneau HF : les modèles choisis pour le projet.
+ *  - llamacpp : téléchargement du .gguf sur le disque (moteur local CPU).
+ *  - pipeline : environnement Python + poids (vendor/pipelines), exécutés hors ligne.
+ */
+function CatalogSection({
+  mode,
+  onInstallGguf,
+  busy,
+}: {
+  mode?: Mode
+  onInstallGguf: (repo: string, file: string, size: number) => void
+  busy: string | null
+}) {
+  const entries = catalogFor(mode)
+  const [pipes, setPipes] = useState<PipelineStatus[]>([])
+  const [envInstalled, setEnvInstalled] = useState(false)
+  const [pipeBusy, setPipeBusy] = useState<string | null>(null)
+
+  const refresh = useCallback(async () => {
+    try {
+      const st = await apiPipelinesStatus()
+      setPipes(st.pipelines)
+      setEnvInstalled(st.env.installed && st.env.ready)
+    } catch {
+      /* silencieux */
+    }
+  }, [])
+
+  useEffect(() => {
+    void refresh()
+  }, [refresh])
+
+  const downloading = pipes.some((p) => p.jobs.some((j) => j.kind === 'download' && j.status === 'run'))
+  useEffect(() => {
+    if (!downloading) return
+    const t = setInterval(() => void refresh(), 2500)
+    return () => clearInterval(t)
+  }, [downloading, refresh])
+
+  const pipeStatus = (entry: CatalogEntry): PipelineStatus | undefined =>
+    pipes.find((p) => p.id === entry.pipelineId)
+
+  const act = async (key: string, fn: () => Promise<unknown>, okTitle: string, okDesc: string) => {
+    setPipeBusy(key)
+    try {
+      await fn()
+      await refresh()
+    } catch (e) {
+      console.error(e)
+    } finally {
+      setPipeBusy(null)
+    }
+  }
+
+  if (!entries.length) return null
+  return (
+    <div className="rounded-lg border p-2.5">
+      <p className="flex items-center gap-1.5 text-xs font-semibold">
+        <Package className="h-3.5 w-3.5 shrink-0 text-primary" aria-hidden="true" />
+        Catalogue du projet
+        <span className="text-[10px] font-normal text-muted-foreground">— modèles branchés dans Lumo</span>
+      </p>
+      <ul className="mt-2 space-y-2">
+        {entries.map((e) => {
+          const pipe = e.engine === 'pipeline' ? pipeStatus(e) : undefined
+          const downloadingThis = pipe?.jobs.some((j) => j.kind === 'download' && j.status === 'run')
+          const pct =
+            pipe && pipe.totalBytes > 0 ? Math.min(100, Math.round((pipe.bytesDownloaded / pipe.totalBytes) * 100)) : 0
+          return (
+            <li key={e.id} className="rounded-md border bg-background px-2 py-2">
+              <div className="flex items-start gap-2">
+                <span
+                  className={`mt-0.5 h-1.5 w-1.5 shrink-0 rounded-full ${e.engine === 'pipeline' ? (pipe?.ready ? 'bg-emerald-500' : 'bg-muted-foreground/40') : ''}`}
+                  aria-hidden="true"
+                />
+                <div className="min-w-0 flex-1">
+                  <p className="flex flex-wrap items-center gap-x-1.5 text-xs font-medium">
+                    <span className="truncate">{e.title}</span>
+                    <span className="rounded-full bg-secondary px-1.5 text-[9px] font-semibold uppercase tracking-wide text-secondary-foreground">
+                      {KIND_LABELS[e.kind] ?? e.kind}
+                    </span>
+                  </p>
+                  <p className="truncate text-[10px] text-muted-foreground" title={e.repo}>
+                    {e.repo}
+                    {e.engine === 'llamacpp' ? ` · GGUF · ${fmtGo(e.sizeBytes)}` : pipe ? ` · poids ${fmtGo(pipe.totalBytes)}` : ''}
+                  </p>
+                  {e.note && <p className="mt-1 text-[10px] leading-snug text-muted-foreground">{e.note}</p>}
+                </div>
+              </div>
+
+              {/* Voie llama.cpp : téléchargement du GGUF (quant recommandée + variantes) */}
+              {e.engine === 'llamacpp' && e.file && e.sizeBytes && (
+                <div className="mt-1.5">
+                  <div className="flex items-center gap-1.5">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 shrink-0 gap-1 text-[11px]"
+                      disabled={busy?.startsWith('cat:') ?? false}
+                      onClick={() => onInstallGguf(e.repo, e.file!, e.sizeBytes!)}
+                    >
+                      {busy?.startsWith('cat:') ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : (
+                        <Download className="h-3 w-3" />
+                      )}
+                      Télécharger ({fmtGo(e.sizeBytes)})
+                    </Button>
+                    {(e.variants?.length ?? 0) > 1 && (
+                      <details className="min-w-0 flex-1">
+                        <summary className="cursor-pointer select-none text-[10px] text-muted-foreground hover:text-primary">
+                          {e.variants!.length - 1} autres quantifications…
+                        </summary>
+                        <ul className="mt-1 space-y-1">
+                          {e.variants!
+                            .filter((v) => v.file !== e.file)
+                            .map((v) => (
+                              <li key={v.file} className="flex items-center gap-1.5">
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-6 flex-1 justify-start gap-1 px-2 text-[10px]"
+                                  disabled={busy?.startsWith('cat:') ?? false}
+                                  onClick={() => onInstallGguf(e.repo, v.file, v.sizeBytes)}
+                                >
+                                  <Download className="h-2.5 w-2.5" />
+                                  {v.label}
+                                </Button>
+                              </li>
+                            ))}
+                        </ul>
+                      </details>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Voie pipeline : environnement Python + poids HF */}
+              {e.engine === 'pipeline' && pipe && (
+                <div className="mt-1.5 space-y-1">
+                  {!envInstalled && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 w-full gap-1 text-[11px]"
+                      disabled={pipeBusy !== null}
+                      onClick={() =>
+                        act(
+                          'env',
+                          () => apiPipelinesAction({ action: 'setup' }),
+                          'Environnement en préparation',
+                          'Python, PyTorch CPU et code YuE s’installent — quelques minutes.',
+                        )
+                      }
+                    >
+                      {pipeBusy === 'env' ? <Loader2 className="h-3 w-3 animate-spin" /> : <Download className="h-3 w-3" />}
+                      Installer l’environnement (Python + PyTorch CPU)
+                    </Button>
+                  )}
+                  {downloadingThis ? (
+                    <div className="rounded border px-2 py-1">
+                      <div className="flex items-center gap-1.5">
+                        <Loader2 className="h-3 w-3 shrink-0 animate-spin text-primary" aria-hidden="true" />
+                        <span className="text-[10px] text-muted-foreground">
+                          Téléchargement {fmtGo(pipe.bytesDownloaded)} / {fmtGo(pipe.totalBytes)}
+                        </span>
+                      </div>
+                      <div className="mt-1 h-1 overflow-hidden rounded-full bg-muted">
+                        <div className="h-full rounded-full bg-primary transition-all" style={{ width: `${pct}%` }} />
+                      </div>
+                    </div>
+                  ) : pipe.ready ? (
+                    <p className="flex items-center gap-1 text-[10px] text-emerald-600 dark:text-emerald-400">
+                      <Check className="h-3 w-3" aria-hidden="true" /> Installé — prêt à générer en local
+                    </p>
+                  ) : (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 w-full gap-1 text-[11px]"
+                      disabled={pipeBusy !== null || !envInstalled}
+                      onClick={() =>
+                        act(
+                          `dl:${e.id}`,
+                          () => apiPipelinesAction({ action: 'download', id: e.pipelineId }),
+                          'Téléchargement lancé',
+                          `${fmtGo(pipe.totalBytes)} de poids — progression visible ici.`,
+                        )
+                      }
+                      title={envInstalled ? undefined : 'Installez d’abord l’environnement'}
+                    >
+                      {pipeBusy === `dl:${e.id}` ? <Loader2 className="h-3 w-3 animate-spin" /> : <Download className="h-3 w-3" />}
+                      Télécharger les poids ({fmtGo(pipe.totalBytes)})
+                    </Button>
+                  )}
+                  {pipe.hardware && !pipe.hardware.diskOk && pipe.bytesDownloaded < pipe.totalBytes && (
+                    <p className="flex items-start gap-1 text-[10px] leading-snug text-amber-700 dark:text-amber-400">
+                      <TriangleAlert className="mt-0.5 h-3 w-3 shrink-0" aria-hidden="true" />
+                      Disque : {fmtGo(pipe.hardware.diskFreeBytes)} libres pour {fmtGo(pipe.totalBytes)} requis —
+                      libérez de la place ou utilisez un disque plus grand.
+                    </p>
+                  )}
+                  {pipe.hardware && !pipe.hardware.ramOk && (
+                    <p className="text-[10px] leading-snug text-muted-foreground">
+                      RAM détectée : {fmtGo(pipe.hardware.ramTotalBytes)} (conseillé : {fmtGo(pipe.totalBytes + 8e9)}).
+                      {pipe.hardware.gpu ? ' GPU détecté ✓' : e.pipelineId === 'yue' || e.pipelineId === 'moss-image' ? ' Sans GPU, l’inférence sera très lente.' : ''}
+                    </p>
+                  )}
+                </div>
+              )}
+            </li>
+          )
+        })}
+      </ul>
+    </div>
+  )
+}
+
+/* ---------------------------------------------------------------- */
 /* Composant principal                                               */
 /* ---------------------------------------------------------------- */
 
@@ -586,6 +834,29 @@ export function BlockHfButton({
     } catch (e) {
       toast({
         title: 'Installation impossible',
+        description: e instanceof Error ? e.message : 'Vérifiez l’espace disque.',
+        variant: 'destructive',
+      })
+    } finally {
+      setLocalBusy(null)
+    }
+  }
+
+  /** Installe un .gguf du catalogue du projet (repo explicite, quant au choix) */
+  const installCatalogGguf = async (repo: string, file: string, size: number) => {
+    const id = `${repo}::${file}`
+    setLocalBusy(`cat:${file.split('/').pop()}`)
+    try {
+      await apiLocalAction({ action: 'download', repoId: repo, file, sizeBytes: size })
+      setPendingStart(id)
+      void refreshLocal()
+      toast({
+        title: 'Installation du catalogue lancée',
+        description: `${file.split('/').pop()} (${fmtSize(size)}) — progression dans « Moteur local » ; le modèle sera automatiquement actif dans ce bloc.`,
+      })
+    } catch (e) {
+      toast({
+        title: 'Téléchargement refusé',
         description: e instanceof Error ? e.message : 'Vérifiez l’espace disque.',
         variant: 'destructive',
       })
@@ -875,6 +1146,9 @@ export function BlockHfButton({
               <span className="font-mono">Wan2.2</span> (recherche). {hfModels.length > 0 && `${hfModels.length} modèle(s) déjà dans la bibliothèque.`}
             </p>
           )}
+
+          {/* Catalogue du projet : modèles branchés (llama.cpp + pipelines locaux) */}
+          <CatalogSection mode={isGlobal ? undefined : mode} onInstallGguf={installCatalogGguf} busy={localBusy} />
 
           {/* Moteur local : runtime, disque, modèles installés */}
           <LocalModelsSection

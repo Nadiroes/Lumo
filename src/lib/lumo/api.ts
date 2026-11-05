@@ -149,6 +149,17 @@ export interface LocalDownloadState {
   speed?: number
 }
 
+export interface LocalCatalogEntry {
+  id: string
+  title: string
+  repo: string
+  kind: string
+  engine: 'llamacpp' | 'pipeline'
+  file?: string
+  sizeBytes?: number
+  installed: boolean
+}
+
 export interface LocalStatus {
   ok: true
   runtime: { installed: boolean; dir?: string; version?: string; url: string }
@@ -163,6 +174,7 @@ export interface LocalStatus {
     engine: LocalEngineStatus
   }[]
   downloads: LocalDownloadState[]
+  catalog?: LocalCatalogEntry[]
 }
 
 export async function apiLocalStatus(): Promise<LocalStatus> {
@@ -392,6 +404,135 @@ export async function apiMusicStream(req: MusicRequest, handlers: MusicStreamHan
       }
     }
   }
+}
+
+/* ---------------- Pipelines locaux (YuE, TTS, image, embeddings) ---------------- */
+
+export type PipelineId = 'yue' | 'audio8-tts' | 'moss-image' | 'embeddinggemma'
+
+export interface PipelineHardware {
+  gpu: boolean
+  ramTotalBytes: number
+  ramOk: boolean
+  diskFreeBytes: number
+  diskOk: boolean
+}
+
+export interface PipelineJob {
+  id: string
+  pipelineId: PipelineId
+  kind: 'setup' | 'download' | 'run'
+  status: 'run' | 'done' | 'error'
+  startedAt: number
+  endedAt?: number
+  lines: string[]
+  error?: string
+}
+
+export interface PipelineStatus {
+  id: PipelineId
+  label: string
+  kind: 'music' | 'tts' | 'image' | 'embedding'
+  description: string
+  totalBytes: number
+  weightsDir: string
+  bytesDownloaded: number
+  weightsComplete: boolean
+  ready: boolean
+  hardware: PipelineHardware
+  jobs: PipelineJob[]
+}
+
+export interface PipelinesStatus {
+  ok: boolean
+  env: { installed: boolean; ready: boolean; error?: string }
+  ram: { totalBytes: number; freeBytes: number }
+  cpus: number
+  pipelines: PipelineStatus[]
+}
+
+export async function apiPipelinesStatus(): Promise<PipelinesStatus> {
+  const res = await fetch('/api/pipelines')
+  const json = (await res.json()) as PipelinesStatus
+  if (!res.ok || !json.ok) throw new Error('Pipelines indisponibles.')
+  return json
+}
+
+export async function apiPipelinesAction(body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const res = await fetch('/api/pipelines', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const json = (await res.json()) as { ok?: boolean; error?: string }
+  if (!res.ok || !json.ok) throw new Error(json.error || 'Action du pipeline impossible.')
+  return json as Record<string, unknown>
+}
+
+export interface PipelineRunHandlers {
+  onWeights?: (repo: string, file: string, pct: number) => void
+  onStage?: (evt: Record<string, unknown>) => void
+}
+
+/**
+ * Exécute un pipeline (/api/pipelines action run) et consomme son flux NDJSON :
+ * événements {stage} au fil de l'eau puis {stage:'done', …} ou {stage:'error'}.
+ */
+export async function apiPipelineRun(
+  id: PipelineId,
+  args: Record<string, unknown>,
+  handlers: PipelineRunHandlers,
+  signal?: AbortSignal,
+): Promise<Record<string, unknown>> {
+  const res = await fetch('/api/pipelines', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'run', id, args }),
+    signal,
+  })
+  if (!res.ok || !res.body) {
+    const json = (await res.json().catch(() => ({}))) as { error?: string }
+    throw new Error(json.error || `Le pipeline a répondu ${res.status}.`)
+  }
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  let final: Record<string, unknown> | null = null
+  for (;;) {
+    let done = false
+    let value: Uint8Array | undefined
+    try {
+      ;({ done, value } = await reader.read())
+    } catch {
+      if (signal?.aborted) throw new Error('Génération interrompue.')
+      throw new Error('Flux du pipeline interrompu.')
+    }
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    let nl: number
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim()
+      buf = buf.slice(nl + 1)
+      if (!line) continue
+      let evt: Record<string, unknown>
+      try {
+        evt = JSON.parse(line) as Record<string, unknown>
+      } catch {
+        continue
+      }
+      if (evt.stage === 'weights') {
+        handlers.onWeights?.(String(evt.repo ?? ''), String(evt.file ?? ''), Number(evt.pct ?? 0))
+      } else if (evt.stage === 'done') {
+        final = evt
+      } else if (evt.stage === 'error') {
+        throw new Error(String(evt.message ?? 'Échec du pipeline.'))
+      } else {
+        handlers.onStage?.(evt)
+      }
+    }
+  }
+  if (!final) throw new Error('Le pipeline n’a pas abouti.')
+  return final
 }
 
 /* ---------------- Clés API ---------------- */
