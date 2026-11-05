@@ -35,11 +35,13 @@ def main():
     from transformers import AutoModel, AutoProcessor
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    # BF16 partout : le dépôt recommande BF16 (GPU) ; sur CPU il divise la RAM par 2
+    # (0.6B ≈ 1,2 Go au lieu de 2,4 Go) — indispensable sur les petites machines.
+    dtype = torch.bfloat16
 
     processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
     model = AutoModel.from_pretrained(model_dir, trust_remote_code=True, dtype=dtype).eval().to(device)
-    emit({"stage": "loaded", "device": device})
+    emit({"stage": "loaded", "device": device, "dtype": "bfloat16"})
 
     kwargs = {}
     ref_audio = req.get("refAudio")

@@ -21,6 +21,7 @@ import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { assertDiskSpace, diskInfo, ramInfo } from './local-engine'
+import { db } from '@/lib/db'
 
 /* ------------------------------ Types publics ----------------------------- */
 
@@ -411,6 +412,16 @@ export function setupEnvironment(): { jobId: string } {
   return { jobId: job.id }
 }
 
+/** Token HF de l'utilisateur (dépôts gated + quota plus élevé sur les téléchargements) */
+async function hfToken(): Promise<string | undefined> {
+  try {
+    const row = await db.apiKey.findUnique({ where: { provider: 'huggingface' } })
+    return row?.secret ?? undefined
+  } catch {
+    return undefined
+  }
+}
+
 /* ------------------------------ Téléchargements --------------------------- */
 
 /** Somme réelle des poids présents sur le disque */
@@ -445,18 +456,18 @@ async function downloadWeights(job: PipelineJob, def: PipelineDef): Promise<void
     const dir = path.join(weightsDir(def.id), spec.repo.replaceAll('/', '__'))
     await fsp.mkdir(dir, { recursive: true })
     jobLine(job, `[poids] ${spec.repo} → ${path.relative(ROOT, dir)} (${(spec.bytes / GB).toFixed(1)} Go)`)
-    await spawnLive(
-      venvBin('python'),
-      [
-        path.join(RUNNERS_DIR, 'hf_fetch.py'),
-        '--repo',
-        spec.repo,
-        '--dir',
-        dir,
-        '--patterns',
-        spec.patterns.join(','),
-      ],
-      {
+    const args = [
+      path.join(RUNNERS_DIR, 'hf_fetch.py'),
+      '--repo',
+      spec.repo,
+      '--dir',
+      dir,
+      '--patterns',
+      spec.patterns.join(','),
+    ]
+    const token = await hfToken()
+    if (token) args.push('--token', token)
+    await spawnLive(venvBin('python'), args, {
         timeoutMs: 0,
         env: { HF_HUB_DISABLE_PROGRESS_BARS: '1' },
         onLine: (l) => {
