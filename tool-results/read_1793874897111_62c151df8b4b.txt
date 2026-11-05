@@ -1,0 +1,901 @@
+     1→'use client'
+     2→
+     3→/**
+     4→ * Paramètre « Lien Hugging Face » d'un bloc (ou lien général de Lumo).
+     5→ *
+     6→ * - Collez un lien : dépôt précis (Qwen/Qwen2.5-Omni-7B), organisation complète
+     7→ *   (huggingface.co/deepseek-ai → tous ses modèles) ou simple nom à rechercher.
+     8→ * - Les modèles détectés sont listés pour être CHARGÉS puis UTILISÉS dans ce bloc,
+     9→ *   indépendamment du lien HF général (qui reste actif comme une connexion API).
+    10→ * - Moteur local (llama.cpp CPU) : les fichiers .gguf peuvent être INSTALLÉS sur la
+    11→ *   machine (vérification disque, aucune limite de taille) puis LANCÉS dans l'app.
+    12→ * - Chaîne de repli à la génération : modèle local → modèle du bloc → lien
+    13→ *   général → clés API → Lumo Core.
+    14→ */
+    15→
+    16→import { useCallback, useEffect, useState } from 'react'
+    17→import {
+    18→  ArrowUpRight,
+    19→  Check,
+    20→  Cuboid,
+    21→  Cpu,
+    22→  Database,
+    23→  Download,
+    24→  Folder,
+    25→  HardDrive,
+    26→  Link2,
+    27→  Loader2,
+    28→  Play,
+    29→  RotateCcw,
+    30→  ShieldCheck,
+    31→  Square,
+    32→  Trash2,
+    33→  TriangleAlert,
+    34→  X,
+    35→} from 'lucide-react'
+    36→import { Button } from '@/components/ui/button'
+    37→import { Input } from '@/components/ui/input'
+    38→import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+    39→import { useToast } from '@/hooks/use-toast'
+    40→import { apiHfDetect, apiLocalAction, apiLocalStatus, type LocalStatus } from '@/lib/lumo/api'
+    41→import { hfTaskToCaps, type Capability } from '@/lib/lumo/providers'
+    42→import { useLumo } from '@/lib/lumo/store'
+    43→import {
+    44→  MODE_INFO,
+    45→  type HfCandidate,
+    46→  type HfDetectResult,
+    47→  type HfLinkConfig,
+    48→  type Mode,
+    49→} from '@/lib/lumo/types'
+    50→
+    51→function fmtSize(n: number): string {
+    52→  if (!n) return 'taille inconnue'
+    53→  if (n >= 1_073_741_824) return `${(n / 1_073_741_824).toFixed(1)} Go`
+    54→  if (n >= 1_048_576) return `${(n / 1_048_576).toFixed(0)} Mo`
+    55→  return `${Math.max(1, Math.round(n / 1024))} Ko`
+    56→}
+    57→
+    58→function fmtDl(n?: number): string {
+    59→  if (!n) return ''
+    60→  return ` · ${n.toLocaleString('fr-FR')} téléch.`
+    61→}
+    62→
+    63→/* ---------------------------------------------------------------- */
+    64→/* Rangée « modèle proposé » (organisation / recherche)               */
+    65→/* ---------------------------------------------------------------- */
+    66→
+    67→function CandidateRow({
+    68→  c,
+    69→  caps,
+    70→  selected,
+    71→  onSelect,
+    72→}: {
+    73→  c: HfCandidate
+    74→  caps: Capability[]
+    75→  selected?: boolean
+    76→  onSelect: (c: HfCandidate) => void
+    77→}) {
+    78→  const compatible = caps.length > 0
+    79→  return (
+    80→    <li className="flex items-start gap-2 rounded-lg border bg-background p-2">
+    81→      <Cuboid className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" aria-hidden="true" />
+    82→      <div className="min-w-0 flex-1">
+    83→        <p className="truncate text-xs font-medium" title={c.id}>
+    84→          {c.id}
+    85→        </p>
+    86→        <p className="truncate text-[10px] text-muted-foreground">
+    87→          {c.task}
+    88→          {fmtDl(c.downloads)}
+    89→          {c.likes ? ` · ♥ ${c.likes}` : ''}
+    90→          {compatible ? '' : ' · hors capacité de ce bloc (relais possible)'}
+    91→        </p>
+    92→      </div>
+    93→      <Button
+    94→        size="sm"
+    95→        variant={selected ? 'secondary' : 'outline'}
+    96→        className="h-7 shrink-0 gap-1 text-[11px]"
+    97→        onClick={() => onSelect(c)}
+    98→        aria-pressed={selected}
+    99→      >
+   100→        {selected ? <Check className="h-3 w-3" /> : <Link2 className="h-3 w-3" />}
+   101→        {selected ? 'Actif' : 'Utiliser'}
+   102→      </Button>
+   103→    </li>
+   104→  )
+   105→}
+   106→
+   107→/* ---------------------------------------------------------------- */
+   108→/* Dépôt précis : fichiers + sous-dossiers                           */
+   109→/* ---------------------------------------------------------------- */
+   110→
+   111→function RepoFiles({
+   112→  repoId,
+   113→  kind,
+   114→  dirs,
+   115→  files,
+   116→  onOpenDir,
+   117→  loadingDir,
+   118→  onInstallLocal,
+   119→  busyFile,
+   120→}: {
+   121→  repoId: string
+   122→  kind: string
+   123→  dirs: string[]
+   124→  files: { path: string; size: number; ext: string }[]
+   125→  onOpenDir: (dir: string) => void
+   126→  loadingDir: boolean
+   127→  /** Installe un .gguf sur la machine (runtime CPU) */
+   128→  onInstallLocal?: (file: string, size: number) => void
+   129→  busyFile?: string | null
+   130→}) {
+   131→  return (
+   132→    <div className="mt-2 space-y-1.5">
+   133→      {dirs.length > 0 && (
+   134→        <ul className="flex flex-wrap gap-1">
+   135→          {dirs.map((d) => (
+   136→            <li key={d}>
+   137→              <Button
+   138→                size="sm"
+   139→                variant="outline"
+   140→                className="h-6 gap-1 rounded-full px-2 text-[10px]"
+   141→                disabled={loadingDir}
+   142→                onClick={() => onOpenDir(d)}
+   143→                title={`Explorer le dossier ${d}`}
+   144→              >
+   145→                <Folder className="h-2.5 w-2.5" /> {d.split('/').pop()}
+   146→              </Button>
+   147→            </li>
+   148→          ))}
+   149→        </ul>
+   150→      )}
+   151→      {files.length > 0 ? (
+   152→        <ul className="space-y-1">
+   153→          {files.map((f) => {
+   154→            const gguf = /\.gguf$/i.test(f.path)
+   155→            const weight = /\.(safetensors|gguf|onnx|bin|pth|ckpt|tar|tgz)$/i.test(f.path)
+   156→            return (
+   157→              <li key={f.path} className="flex items-center gap-2 rounded-md border bg-background px-2 py-1.5">
+   158→                <span className="min-w-0 flex-1 truncate font-mono text-[11px]" title={f.path}>
+   159→                  {f.path.split('/').pop()}
+   160→                </span>
+   161→                <span className="shrink-0 text-[10px] text-muted-foreground">
+   162→                  {weight ? 'poids · ' : 'config · '}
+   163→                  {fmtSize(f.size)}
+   164→                </span>
+   165→                {gguf && onInstallLocal && (
+   166→                  <Button
+   167→                    size="sm"
+   168→                    variant="outline"
+   169→                    className="h-6 shrink-0 gap-1 px-2 text-[10px]"
+   170→                    disabled={busyFile === f.path}
+   171→                    onClick={() => onInstallLocal(f.path, f.size)}
+   172→                    title="Installer ce modèle sur cette machine (CPU) et l'utiliser dans l'app"
+   173→                  >
+   174→                    {busyFile === f.path ? (
+   175→                      <Loader2 className="h-2.5 w-2.5 animate-spin" />
+   176→                    ) : (
+   177→                      <Download className="h-2.5 w-2.5" />
+   178→                    )}
+   179→                    Local
+   180→                  </Button>
+   181→                )}
+   182→                <a
+   183→                  href={`https://huggingface.co/${kind === 'dataset' ? 'datasets/' : ''}${repoId}/resolve/main/${f.path}`}
+   184→                  target="_blank"
+   185→                  rel="noopener noreferrer"
+   186→                  className="shrink-0 rounded p-1 text-muted-foreground hover:text-primary"
+   187→                  title="Télécharger ce fichier depuis Hugging Face"
+   188→                  aria-label={`Télécharger ${f.path}`}
+   189→                >
+   190→                  <ArrowUpRight className="h-3 w-3" />
+   191→                </a>
+   192→              </li>
+   193→            )
+   194→          })}
+   195→        </ul>
+   196→      ) : (
+   197→        dirs.length === 0 && (
+   198→          <p className="text-[11px] leading-snug text-muted-foreground">
+   199→            Aucun fichier de poids détecté — le dépôt reste utilisable par son identifiant.
+   200→          </p>
+   201→        )
+   202→      )}
+   203→    </div>
+   204→  )
+   205→}
+   206→
+   207→/* ---------------------------------------------------------------- */
+   208→/* Moteur local : runtime, disque, modèles installés, téléchargements */
+   209→/* ---------------------------------------------------------------- */
+   210→
+   211→function LocalModelsSection({
+   212→  local,
+   213→  busy,
+   214→  onSetupRuntime,
+   215→  onStart,
+   216→  onStop,
+   217→  onRemove,
+   218→}: {
+   219→  local: LocalStatus | null
+   220→  busy: string | null
+   221→  onSetupRuntime: () => void
+   222→  onStart: (id: string) => void
+   223→  onStop: (id: string) => void
+   224→  onRemove: (id: string) => void
+   225→}) {
+   226→  const installed = local?.runtime.installed ?? false
+   227→  const models = local?.models ?? []
+   228→  const dls = (local?.downloads ?? []).filter((d) => d.status !== 'done')
+   229→
+   230→  return (
+   231→    <div className="rounded-lg border p-2.5">
+   232→      <div className="flex items-center justify-between gap-2">
+   233→        <p className="flex items-center gap-1.5 text-xs font-semibold">
+   234→          <Cpu className="h-3.5 w-3.5 shrink-0 text-primary" aria-hidden="true" />
+   235→          Moteur local — CPU
+   236→          {installed && local?.runtime.version && (
+   237→            <span className="truncate text-[10px] font-normal text-muted-foreground">
+   238→              {local.runtime.version.split('(')[0].trim()}
+   239→            </span>
+   240→          )}
+   241→        </p>
+   242→        {local && (
+   243→          <p className="flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground" title="Espace disque libre">
+   244→            <HardDrive className="h-3 w-3" aria-hidden="true" />
+   245→            {fmtSize(local.disk.freeBytes)} libres
+   246→          </p>
+   247→        )}
+   248→      </div>
+   249→
+   250→      {!installed ? (
+   251→        <div className="mt-2 space-y-2">
+   252→          <p className="text-[11px] leading-snug text-muted-foreground">
+   253→            Exécutez les modèles <span className="font-mono">.gguf</span> directement sur cette machine (CPU) :
+   254→            aucune donnée envoyée en ligne, aucun quota. Installation une seule fois (~25 Mo).
+   255→          </p>
+   256→          <Button
+   257→            size="sm"
+   258→            className="h-7 w-full gap-1 text-[11px]"
+   259→            disabled={busy === 'runtime'}
+   260→            onClick={onSetupRuntime}
+   261→          >
+   262→            {busy === 'runtime' ? <Loader2 className="h-3 w-3 animate-spin" /> : <Download className="h-3 w-3" />}
+   263→            Installer le runtime local (llama.cpp)
+   264→          </Button>
+   265→        </div>
+   266→      ) : (
+   267→        <div className="mt-2 space-y-1.5">
+   268→          {/* Téléchargements en cours / en erreur */}
+   269→          {dls.map((d) => {
+   270→            const pct = d.total > 0 ? Math.min(100, Math.round((d.bytes / d.total) * 100)) : null
+   271→            return (
+   272→              <div key={d.id} className="rounded-md border bg-background px-2 py-1.5">
+   273→                <div className="flex items-center gap-2">
+   274→                  {d.status === 'download' ? (
+   275→                    <Loader2 className="h-3 w-3 shrink-0 animate-spin text-primary" aria-hidden="true" />
+   276→                  ) : (
+   277→                    <TriangleAlert className="h-3 w-3 shrink-0 text-destructive" aria-hidden="true" />
+   278→                  )}
+   279→                  <span className="min-w-0 flex-1 truncate font-mono text-[11px]">{d.file.split('/').pop()}</span>
+   280→                  <span className="shrink-0 text-[10px] text-muted-foreground">
+   281→                    {pct !== null ? `${pct} % · ${fmtSize(d.bytes)}` : fmtSize(d.bytes)}
+   282→                    {d.speed ? ` · ${fmtSize(d.speed)}/s` : ''}
+   283→                  </span>
+   284→                </div>
+   285→                {pct !== null && (
+   286→                  <div className="mt-1 h-1 overflow-hidden rounded-full bg-muted" role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}>
+   287→                    <div className="h-full rounded-full bg-primary transition-all" style={{ width: `${pct}%` }} />
+   288→                  </div>
+   289→                )}
+   290→                {d.status === 'error' && <p className="mt-1 text-[10px] text-destructive">{d.error}</p>}
+   291→              </div>
+   292→            )
+   293→          })}
+   294→
+   295→          {/* Modèles installés */}
+   296→          {models.map((m) => (
+   297→            <div key={m.id} className="flex items-center gap-2 rounded-md border bg-background px-2 py-1.5">
+   298→              <span
+   299→                className={`h-1.5 w-1.5 shrink-0 rounded-full ${m.engine.running ? 'bg-emerald-500' : 'bg-muted-foreground/40'}`}
+   300→                aria-hidden="true"
+   301→              />
+   302→              <div className="min-w-0 flex-1">
+   303→                <p className="truncate font-mono text-[11px]" title={m.file}>
+   304→                  {m.file.split('/').pop()}
+   305→                </p>
+   306→                <p className="truncate text-[10px] text-muted-foreground">
+   307→                  {m.repoId} · {fmtSize(m.size)}
+   308→                  {m.engine.running ? ` · en cours (port ${m.engine.port})` : ' · prêt'}
+   309→                </p>
+   310→              </div>
+   311→              <div className="flex shrink-0 items-center gap-0.5">
+   312→                {m.engine.running ? (
+   313→                  <Button
+   314→                    variant="ghost"
+   315→                    size="icon"
+   316→                    className="h-6 w-6"
+   317→                    disabled={busy === `stop:${m.id}`}
+   318→                    onClick={() => onStop(m.id)}
+   319→                    aria-label="Arrêter le modèle"
+   320→                    title="Arrêter (libère la RAM)"
+   321→                  >
+   322→                    {busy === `stop:${m.id}` ? (
+   323→                      <Loader2 className="h-3 w-3 animate-spin" />
+   324→                    ) : (
+   325→                      <Square className="h-2.5 w-2.5" />
+   326→                    )}
+   327→                  </Button>
+   328→                ) : (
+   329→                  <Button
+   330→                    variant="ghost"
+   331→                    size="icon"
+   332→                    className="h-6 w-6"
+   333→                    disabled={busy === `start:${m.id}`}
+   334→                    onClick={() => onStart(m.id)}
+   335→                    aria-label="Démarrer le modèle"
+   336→                    title="Démarrer en local"
+   337→                  >
+   338→                    {busy === `start:${m.id}` ? (
+   339→                      <Loader2 className="h-3 w-3 animate-spin" />
+   340→                    ) : (
+   341→                      <Play className="h-2.5 w-2.5" />
+   342→                    )}
+   343→                  </Button>
+   344→                )}
+   345→                <Button
+   346→                  variant="ghost"
+   347→                  size="icon"
+   348→                  className="h-6 w-6 text-muted-foreground hover:text-destructive"
+   349→                  disabled={busy === `rm:${m.id}`}
+   350→                  onClick={() => onRemove(m.id)}
+   351→                  aria-label="Supprimer le modèle local"
+   352→                  title="Supprimer du disque"
+   353→                >
+   354→                  {busy === `rm:${m.id}` ? (
+   355→                    <Loader2 className="h-3 w-3 animate-spin" />
+   356→                  ) : (
+   357→                    <Trash2 className="h-2.5 w-2.5" />
+   358→                  )}
+   359→                </Button>
+   360→              </div>
+   361→            </div>
+   362→          ))}
+   363→
+   364→          {models.length === 0 && dls.length === 0 && (
+   365→            <p className="text-[10px] leading-snug text-muted-foreground">
+   366→              Aucun modèle local — cliquez « Local » à côté d'un fichier <span className="font-mono">.gguf</span>{' '}
+   367→              d'un dépôt pour l'installer ici. La vérification du disque est automatique, sans limite de taille.
+   368→            </p>
+   369→          )}
+   370→        </div>
+   371→      )}
+   372→    </div>
+   373→  )
+   374→}
+   375→
+   376→/* ---------------------------------------------------------------- */
+   377→/* Composant principal                                               */
+   378→/* ---------------------------------------------------------------- */
+   379→
+   380→export function BlockHfButton({
+   381→  mode,
+   382→  variant = 'block',
+   383→  trigger,
+   384→}: {
+   385→  /** Mode du bloc — requis pour la variante « bloc » */
+   386→  mode?: Mode
+   387→  variant?: 'block' | 'global'
+   388→  trigger?: React.ReactNode
+   389→}) {
+   390→  const isGlobal = variant === 'global'
+   391→  const blockHf = useLumo((s) => (isGlobal || !mode ? undefined : s.blockHf[mode]))
+   392→  const globalHf = useLumo((s) => s.globalHf)
+   393→  const setBlockHf = useLumo((s) => s.setBlockHf)
+   394→  const clearBlockHf = useLumo((s) => s.clearBlockHf)
+   395→  const setGlobalHf = useLumo((s) => s.setGlobalHf)
+   396→  const clearGlobalHf = useLumo((s) => s.clearGlobalHf)
+   397→  const hfModels = useLumo((s) => s.hfModels)
+   398→  const addHfModel = useLumo((s) => s.addHfModel)
+   399→  const { toast } = useToast()
+   400→
+   401→  const [open, setOpen] = useState(false)
+   402→  const [link, setLink] = useState('')
+   403→  const [loading, setLoading] = useState(false)
+   404→  const [result, setResult] = useState<HfDetectResult | null>(null)
+   405→  const [dir, setDir] = useState<string | undefined>(undefined)
+   406→
+   407→  /* ----- état du moteur local ----- */
+   408→  const [local, setLocal] = useState<LocalStatus | null>(null)
+   409→  const [localBusy, setLocalBusy] = useState<string | null>(null)
+   410→  /** Modèle fraîchement installé à démarrer dès que le téléchargement est fini */
+   411→  const [pendingStart, setPendingStart] = useState<string | null>(null)
+   412→
+   413→  const refreshLocal = useCallback(async () => {
+   414→    try {
+   415→      setLocal(await apiLocalStatus())
+   416→    } catch {
+   417→      /* panneau local indisponible : silencieux */
+   418→    }
+   419→  }, [])
+   420→
+   421→  useEffect(() => {
+   422→    if (open) void refreshLocal()
+   423→  }, [open, refreshLocal])
+   424→
+   425→  const hasActiveDownload = local?.downloads.some((d) => d.status === 'download') ?? false
+   426→  useEffect(() => {
+   427→    if (!open || (!hasActiveDownload && !pendingStart)) return
+   428→    const t = setInterval(() => void refreshLocal(), 1500)
+   429→    return () => clearInterval(t)
+   430→  }, [open, hasActiveDownload, pendingStart, refreshLocal])
+   431→
+   432→  const cfg: HfLinkConfig | null | undefined = isGlobal ? globalHf : blockHf
+   433→  const label = isGlobal ? 'Lien HF général' : mode ? `Bloc ${MODE_INFO[mode].label}` : 'Bloc'
+   434→  const capability: Capability | undefined = !isGlobal && mode ? MODE_INFO[mode].capability : undefined
+   435→
+   436→  async function detect(target?: string, targetDir?: string) {
+   437→    const value = (target ?? link).trim()
+   438→    if (!value) return
+   439→    setLoading(true)
+   440→    try {
+   441→      const r = await apiHfDetect(value, targetDir)
+   442→      setResult(r)
+   443→      setDir(targetDir)
+   444→
+   445→      if (r.kind === 'model' || r.kind === 'dataset') {
+   446→        const m = r.model
+   447→        if (!m) return
+   448→        // Résultat « heuristique » = le Hub n'a pas répondu : on n'active PAS un dépôt non vérifié
+   449→        const verified = m.source === 'api'
+   450→        // Lien précis : on enregistre le lien + le modèle (auto-sélection si vérifié et exécutable)
+   451→        const cfgNew: HfLinkConfig = {
+   452→          link: value,
+   453→          kind: r.kind,
+   454→          repoId: m.id,
+   455→          models: [{ id: m.id, task: m.task, downloads: m.downloads, likes: m.likes }],
+   456→          selected: r.kind === 'model' && verified ? m.id : undefined,
+   457→          local: cfg?.repoId === m.id ? cfg?.local : undefined,
+   458→          status:
+   459→            r.kind === 'dataset'
+   460→              ? 'Jeu de données reconnu — consultation/téléchargement uniquement (non exécutable).'
+   461→              : verified
+   462→                ? `Modèle actif : ${m.id}`
+   463→                : 'Dépôt non vérifié (Hub momentanément injoignable) — recliquez « Détecter » pour confirmer.',
+   464→          updatedAt: Date.now(),
+   465→        }
+   466→        // Bibliothèque (affichage sélecteur) : entrée HfModel complète
+   467→        addHfModel(m)
+   468→        if (isGlobal) setGlobalHf({ ...cfgNew })
+   469→        else if (mode) setBlockHf(mode, cfgNew)
+   470→        toast({
+   471→          title: r.kind === 'dataset' ? 'Jeu de données reconnu' : verified ? (isGlobal ? 'Lien général prêt' : 'Modèle chargé dans le bloc') : 'Dépôt non vérifié',
+   472→          description:
+   473→            r.kind === 'dataset'
+   474→              ? `${m.id} — un dataset n'est pas exécutable comme modèle.`
+   475→              : verified
+   476→                ? `${m.id}${isGlobal ? ' servira de relais général.' : ` travaille maintenant dans le bloc ${mode ? MODE_INFO[mode].label : ''}.`}`
+   477→                : `${m.id} — le Hub n'a pas répondu : recliquez « Détecter ».`,
+   478→        })
+   479→      } else if (r.kind === 'org' && r.models?.length) {
+   480→        toast({
+   481→          title: `Organisation ${r.query} — ${r.models.length} modèles`,
+   482→          description: 'Choisissez le modèle à utiliser dans la liste.',
+   483→        })
+   484→      } else if (r.kind === 'search' && r.models?.length) {
+   485→        toast({
+   486→          title: `${r.models.length} modèles trouvés`,
+   487→          description: `Le dépôt exact « ${r.query} » n'existe pas — choisissez une proposition.`,
+   488→        })
+   489→      }
+   490→    } catch (e) {
+   491→      toast({
+   492→        title: 'Détection impossible',
+   493→        description: e instanceof Error ? e.message : 'Vérifiez le lien.',
+   494→        variant: 'destructive',
+   495→      })
+   496→    } finally {
+   497→      setLoading(false)
+   498→    }
+   499→  }
+   500→
+   501→  /** Charge un modèle proposé (organisation / recherche) dans le bloc ou en relais général */
+   502→  function useCandidate(c: HfCandidate) {
+   503→    const cfgNew: HfLinkConfig = {
+   504→      link: result?.query ?? c.id,
+   505→      kind: result?.kind === 'org' ? 'org' : 'search',
+   506→      repoId: result?.kind === 'org' ? result.query : c.id.split('/')[0],
+   507→      models: result?.models ?? [c],
+   508→      selected: c.id,
+   509→      local: cfg?.repoId === c.id ? cfg?.local : undefined,
+   510→      status: `Modèle actif : ${c.id}`,
+   511→      updatedAt: Date.now(),
+   512→    }
+   513→    if (isGlobal) {
+   514→      setGlobalHf(cfgNew)
+   515→      toast({ title: 'Relais général activé', description: `${c.id} prendra le relais dans tous les blocs.` })
+   516→    } else if (mode) {
+   517→      setBlockHf(mode, cfgNew)
+   518→      // Ajout à la bibliothèque pour le sélecteur multi-capacités
+   519→      addHfModel({ id: c.id, task: c.task, downloads: c.downloads, likes: c.likes, source: 'api', addedAt: Date.now(), kind: 'model' })
+   520→      toast({
+   521→        title: `Modèle chargé — bloc ${MODE_INFO[mode].label}`,
+   522→        description: `${c.id} travaille dans ce bloc. En cas de quota, le lien général prend le relais.`,
+   523→      })
+   524→    }
+   525→  }
+   526→
+   527→  function clear() {
+   528→    if (isGlobal) {
+   529→      clearGlobalHf()
+   530→      toast({ title: 'Lien général désactivé' })
+   531→    } else if (mode) {
+   532→      clearBlockHf(mode)
+   533→      toast({ title: `Lien du bloc ${MODE_INFO[mode].label} désactivé`, description: 'Le lien général et les clés API restent actifs.' })
+   534→    }
+   535→    setResult(null)
+   536→    setLink('')
+   537→  }
+   538→
+   539→  function resetSelection() {
+   540→    if (isGlobal) {
+   541→      if (globalHf) {
+   542→        setGlobalHf({ ...globalHf, selected: undefined, status: 'Modèle en attente — choisissez dans la liste.' })
+   543→      }
+   544→    } else if (mode) {
+   545→      const cur = blockHf
+   546→      if (cur) setBlockHf(mode, { ...cur, selected: undefined, status: 'Modèle en attente — choisissez dans la liste.' })
+   547→    }
+   548→  }
+   549→
+   550→  /* ----- actions du moteur local ----- */
+   551→
+   552→  const setupRuntime = async () => {
+   553→    setLocalBusy('runtime')
+   554→    try {
+   555→      await apiLocalAction({ action: 'setup-runtime' })
+   556→      await refreshLocal()
+   557→      toast({
+   558→        title: 'Runtime local installé',
+   559→        description: 'llama.cpp est prêt — installez un .gguf depuis un dépôt pour travailler hors ligne.',
+   560→      })
+   561→    } catch (e) {
+   562→      toast({
+   563→        title: 'Installation impossible',
+   564→        description: e instanceof Error ? e.message : 'Réessayez.',
+   565→        variant: 'destructive',
+   566→      })
+   567→    } finally {
+   568→      setLocalBusy(null)
+   569→    }
+   570→  }
+   571→
+   572→  /** Installe un .gguf du dépôt détecté sur la machine (disque vérifié côté serveur) */
+   573→  const installLocal = async (file: string, size: number) => {
+   574→    const repoId = result?.model?.id ?? cfg?.repoId ?? link.trim()
+   575→    if (!repoId.includes('/')) return
+   576→    const id = `${repoId}::${file}`
+   577→    setLocalBusy(`dl:${file}`)
+   578→    try {
+   579→      await apiLocalAction({ action: 'download', repoId, file, sizeBytes: size })
+   580→      setPendingStart(id)
+   581→      void refreshLocal()
+   582→      toast({
+   583→        title: 'Installation locale lancée',
+   584→        description: `${file.split('/').pop()} (${fmtSize(size)}) — progression dans « Moteur local ». Le démarrage est automatique à la fin.`,
+   585→      })
+   586→    } catch (e) {
+   587→      toast({
+   588→        title: 'Installation impossible',
+   589→        description: e instanceof Error ? e.message : 'Vérifiez l’espace disque.',
+   590→        variant: 'destructive',
+   591→      })
+   592→    } finally {
+   593→      setLocalBusy(null)
+   594→    }
+   595→  }
+   596→
+   597→  const startLocal = async (id: string) => {
+   598→    setLocalBusy(`start:${id}`)
+   599→    try {
+   600→      await apiLocalAction({ action: 'start', id })
+   601→      await refreshLocal()
+   602→      const m = local?.models.find((x) => x.id === id)
+   603→      // Le bloc adopte le modèle local : priorité maximale dans la chaîne de repli
+   604→      if (!isGlobal && mode) {
+   605→        const repoId = m?.repoId ?? id.split('::')[0]
+   606→        const file = m?.file ?? id.split('::')[1] ?? id
+   607→        const cur: HfLinkConfig =
+   608→          cfg ?? {
+   609→            link: `https://huggingface.co/${repoId}`,
+   610→            kind: 'model',
+   611→            repoId,
+   612→            models: [],
+   613→            status: '',
+   614→            updatedAt: Date.now(),
+   615→          }
+   616→        setBlockHf(mode, {
+   617→          ...cur,
+   618→          repoId: cur.repoId ?? repoId,
+   619→          local: id,
+   620→          status: `Modèle local actif : ${file.split('/').pop()} (CPU) — prioritaire dans ce bloc.`,
+   621→          updatedAt: Date.now(),
+   622→        })
+   623→      }
+   624→      toast({
+   625→        title: 'Modèle lancé en local',
+   626→        description: isGlobal
+   627→          ? 'Le modèle tourne sur cette machine.'
+   628→          : `${m?.file.split('/').pop() ?? id} travaille dans le bloc ${mode ? MODE_INFO[mode].label : ''} — priorité sur les liens HF.`,
+   629→      })
+   630→    } catch (e) {
+   631→      toast({
+   632→        title: 'Démarrage impossible',
+   633→        description: e instanceof Error ? e.message : 'Le modèle n’a pas pu être chargé en RAM.',
+   634→        variant: 'destructive',
+   635→      })
+   636→    } finally {
+   637→      setPendingStart(null)
+   638→      setLocalBusy(null)
+   639→    }
+   640→  }
+   641→
+   642→  const stopLocal = async (id: string) => {
+   643→    setLocalBusy(`stop:${id}`)
+   644→    try {
+   645→      await apiLocalAction({ action: 'stop', id })
+   646→      await refreshLocal()
+   647→      toast({ title: 'Modèle arrêté', description: 'La RAM est libérée — il reste installé sur le disque.' })
+   648→    } catch (e) {
+   649→      toast({ title: 'Arrêt impossible', description: e instanceof Error ? e.message : '', variant: 'destructive' })
+   650→    } finally {
+   651→      setLocalBusy(null)
+   652→    }
+   653→  }
+   654→
+   655→  const removeLocal = async (id: string) => {
+   656→    setLocalBusy(`rm:${id}`)
+   657→    try {
+   658→      await apiLocalAction({ action: 'remove', id })
+   659→      await refreshLocal()
+   660→      if (!isGlobal && mode && cfg?.local === id) {
+   661→        setBlockHf(mode, { ...cfg, local: undefined, status: 'Modèle local supprimé — retour au lien du bloc.' })
+   662→      }
+   663→      toast({ title: 'Modèle supprimé', description: 'Le disque est libéré.' })
+   664→    } catch (e) {
+   665→      toast({ title: 'Suppression impossible', description: e instanceof Error ? e.message : '', variant: 'destructive' })
+   666→    } finally {
+   667→      setLocalBusy(null)
+   668→    }
+   669→  }
+   670→
+   671→  /* Démarrage auto après installation : le modèle apparaît dans la liste → on le lance */
+   672→  useEffect(() => {
+   673→    if (!pendingStart || !local) return
+   674→    const done = local.models.find((m) => m.id === pendingStart)
+   675→    if (done) {
+   676→      setPendingStart(null)
+   677→      void startLocal(done.id)
+   678→      return
+   679→    }
+   680→    const dl = local.downloads.find((d) => d.id === pendingStart)
+   681→    if (dl?.status === 'error') {
+   682→      setPendingStart(null)
+   683→      toast({
+   684→        title: 'Téléchargement interrompu',
+   685→        description: dl.error,
+   686→        variant: 'destructive',
+   687→      })
+   688→    }
+   689→  }, [local, pendingStart])
+   690→
+   691→  const capsFor = (c: HfCandidate) => hfTaskToCaps(c.task, c.id).filter((x) => (capability ? x === capability : true))
+   692→
+   693→  return (
+   694→    <Popover open={open} onOpenChange={setOpen}>
+   695→      <PopoverTrigger asChild>
+   696→        {trigger ?? (
+   697→          <Button
+   698→            variant="outline"
+   699→            size="sm"
+   700→            className={`h-8 max-w-48 gap-1.5 text-xs ${cfg?.selected || cfg?.local ? 'border-primary/50 text-primary' : ''}`}
+   701→            aria-label={`${label} : ${cfg?.local ? `modèle local actif (${cfg.local.split('::').pop()})` : cfg?.selected ? `actif (${cfg.selected})` : 'non configuré'}. Configurer le lien Hugging Face.`}
+   702→          >
+   703→            {cfg?.kind === 'dataset' ? (
+   704→              <Database className="h-3.5 w-3.5 shrink-0 text-amber-500" aria-hidden="true" />
+   705→            ) : cfg?.local ? (
+   706→              <Cpu className="h-3.5 w-3.5 shrink-0 text-primary" aria-hidden="true" />
+   707→            ) : (
+   708→              <Link2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+   709→            )}
+   710→            <span className="truncate">
+   711→              {isGlobal ? 'HF général' : `HF · ${mode ? MODE_INFO[mode].label : ''}`}
+   712→              {cfg?.local
+   713→                ? ` : ${cfg.local.split('::').pop()?.replace(/\.gguf$/i, '')}`
+   714→                : cfg?.selected
+   715→                  ? ` : ${cfg.selected.split('/').pop()}`
+   716→                  : ''}
+   717→            </span>
+   718→            <span
+   719→              className={`h-1.5 w-1.5 shrink-0 rounded-full ${cfg?.local ? 'bg-emerald-500' : cfg?.selected ? 'bg-emerald-500' : cfg ? 'bg-amber-500' : 'bg-muted-foreground/40'}`}
+   720→              aria-hidden="true"
+   721→            />
+   722→          </Button>
+   723→        )}
+   724→      </PopoverTrigger>
+   725→      <PopoverContent align="end" className="w-[26rem] p-0">
+   726→        <div className="border-b px-3 py-2.5">
+   727→          <p className="text-xs font-semibold">{isGlobal ? 'Lien HF général — relais de Lumo' : `Lien HF du ${label.toLowerCase()}`}</p>
+   728→          <p className="mt-0.5 text-[11px] leading-snug text-muted-foreground">
+   729→            {isGlobal
+   730→              ? 'Exploite tout le contenu d’un lien (ex. une organisation DeepSeek). Il reste actif partout et prend le relais quand un lien de bloc tombe.'
+   731→              : 'Ce bloc travaille avec ce lien et ses modèles — indépendamment du lien général, qui reste le relais en cas de quota.'}
+   732→          </p>
+   733→        </div>
+   734→
+   735→        <div className="max-h-[32rem] space-y-3 overflow-y-auto p-3 scrollbar-thin">
+   736→          {/* Lien actif */}
+   737→          {cfg && (
+   738→            <div className="rounded-lg border bg-primary/5 p-2.5">
+   739→              <div className="flex items-start justify-between gap-2">
+   740→                <div className="min-w-0">
+   741→                  <p className="flex items-center gap-1.5 text-xs font-medium">
+   742→                    {cfg.local ? (
+   743→                      <Cpu className="h-3.5 w-3.5 shrink-0 text-emerald-500" aria-hidden="true" />
+   744→                    ) : (
+   745→                      <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-emerald-500" aria-hidden="true" />
+   746→                    )}
+   747→                    <span className="truncate">{cfg.local ?? cfg.selected ?? cfg.repoId ?? cfg.link}</span>
+   748→                  </p>
+   749→                  <p className="mt-0.5 truncate text-[10px] text-muted-foreground">
+   750→                    {cfg.local
+   751→                      ? 'modèle local (CPU) · prioritaire dans ce bloc'
+   752→                      : isGlobal
+   753→                        ? 'relais général'
+   754→                        : 'prioritaire dans ce bloc'}{' '}
+   755→                    · {cfg.kind}
+   756→                    {cfg.selected || cfg.local ? '' : ' — aucun modèle actif'}
+   757→                  </p>
+   758→                  {cfg.status && <p className="mt-1 text-[10px] leading-snug text-muted-foreground">{cfg.status}</p>}
+   759→                </div>
+   760→                <div className="flex shrink-0 gap-1">
+   761→                  {(cfg.selected || cfg.local) && (
+   762→                    <Button
+   763→                      variant="ghost"
+   764→                      size="icon"
+   765→                      className="h-6 w-6 text-muted-foreground hover:text-primary"
+   766→                      aria-label="Changer de modèle"
+   767→                      title="Changer de modèle"
+   768→                      onClick={resetSelection}
+   769→                    >
+   770→                      <RotateCcw className="h-3 w-3" />
+   771→                    </Button>
+   772→                  )}
+   773→                  <Button
+   774→                    variant="ghost"
+   775→                    size="icon"
+   776→                    className="h-6 w-6 text-muted-foreground hover:text-destructive"
+   777→                    aria-label={isGlobal ? 'Désactiver le lien général' : 'Désactiver le lien du bloc'}
+   778→                    title="Désactiver ce lien"
+   779→                    onClick={clear}
+   780→                  >
+   781→                    <X className="h-3 w-3" />
+   782→                  </Button>
+   783→                </div>
+   784→              </div>
+   785→            </div>
+   786→          )}
+   787→
+   788→          {/* Saisie du lien */}
+   789→          <div className="flex gap-1.5">
+   790→            <Input
+   791→              value={link}
+   792→              onChange={(e) => setLink(e.target.value)}
+   793→              onKeyDown={(e) => e.key === 'Enter' && detect()}
+   794→              placeholder="https://huggingface.co/Qwen/Qwen2.5-Omni-7B ou huggingface.co/deepseek-ai"
+   795→              className="h-8 text-[11px]"
+   796→              aria-label="Lien Hugging Face"
+   797→            />
+   798→            <Button size="sm" className="h-8 shrink-0 gap-1 text-[11px]" disabled={loading || !link.trim()} onClick={() => detect()}>
+   799→              {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Link2 className="h-3.5 w-3.5" />}
+   800→              Détecter
+   801→            </Button>
+   802→          </div>
+   803→
+   804→          {/* Résultats */}
+   805→          {result && (
+   806→            <div className="space-y-2">
+   807→              {(result.kind === 'org' || result.kind === 'search') && (
+   808→                <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+   809→                  {result.kind === 'org'
+   810→                    ? `Modèles de ${result.query} (${result.models?.length ?? 0})`
+   811→                    : `Propositions pour « ${result.query} » (${result.models?.length ?? 0})`}
+   812→                </p>
+   813→              )}
+   814→              {(result.kind === 'org' || result.kind === 'search') &&
+   815→                (result.models?.length ? (
+   816→                  <ul className="space-y-1.5">
+   817→                    {result.models.map((c) => (
+   818→                      <CandidateRow
+   819→                        key={c.id}
+   820→                        c={c}
+   821→                        caps={capsFor(c)}
+   822→                        selected={cfg?.selected === c.id}
+   823→                        onSelect={useCandidate}
+   824→                      />
+   825→                    ))}
+   826→                  </ul>
+   827→                ) : (
+   828→                  <p className="rounded-lg border border-dashed p-2.5 text-[11px] text-muted-foreground">
+   829→                    Aucun modèle public répertorié pour « {result.query} ».
+   830→                  </p>
+   831→                ))}
+   832→
+   833→              {(result.kind === 'model' || result.kind === 'dataset') && result.model && (
+   834→                <div className="rounded-lg border p-2.5">
+   835→                  <p className="flex items-center gap-1.5 text-xs font-medium">
+   836→                    {result.kind === 'dataset' ? (
+   837→                      <Database className="h-3.5 w-3.5 shrink-0 text-amber-500" aria-hidden="true" />
+   838→                    ) : (
+   839→                      <Cuboid className="h-3.5 w-3.5 shrink-0 text-primary" aria-hidden="true" />
+   840→                    )}
+   841→                    <span className="truncate">{result.model.id}</span>
+   842→                  </p>
+   843→                  <p className="mt-0.5 text-[10px] text-muted-foreground">
+   844→                    {result.model.task}
+   845→                    {fmtDl(result.model.downloads)}
+   846→                  </p>
+   847→                  {result.kind === 'dataset' && (
+   848→                    <p className="mt-1.5 flex items-start gap-1.5 rounded-md bg-amber-500/10 px-2 py-1.5 text-[10px] leading-snug text-amber-700 dark:text-amber-400">
+   849→                      <TriangleAlert className="mt-0.5 h-3 w-3 shrink-0" aria-hidden="true" />
+   850→                      Un dataset ne peut pas être exécuté comme modèle : téléchargez ses fichiers ou importez un modèle.
+   851→                    </p>
+   852→                  )}
+   853→                  <RepoFiles
+   854→                    repoId={result.model.id}
+   855→                    kind={result.kind}
+   856→                    dirs={result.model.dirs ?? []}
+   857→                    files={result.model.files ?? []}
+   858→                    loadingDir={loading}
+   859→                    onInstallLocal={installLocal}
+   860→                    busyFile={localBusy?.startsWith('dl:') ? localBusy.slice(3) : null}
+   861→                    onOpenDir={(d) => {
+   862→                      const base = (result.model?.id ?? link).trim()
+   863→                      void detect(base, d)
+   864→                    }}
+   865→                  />
+   866→                </div>
+   867→              )}
+   868→            </div>
+   869→          )}
+   870→
+   871→          {!result && !cfg && (
+   872→            <p className="rounded-lg border border-dashed p-2.5 text-[11px] leading-relaxed text-muted-foreground">
+   873→              Exemples : <span className="font-mono">Qwen/Qwen2.5-Omni-7B</span> (modèle précis),{' '}
+   874→              <span className="font-mono">huggingface.co/deepseek-ai</span> (toute l’organisation),{' '}
+   875→              <span className="font-mono">Wan2.2</span> (recherche). {hfModels.length > 0 && `${hfModels.length} modèle(s) déjà dans la bibliothèque.`}
+   876→            </p>
+   877→          )}
+   878→
+   879→          {/* Moteur local : runtime, disque, modèles installés */}
+   880→          <LocalModelsSection
+   881→            local={local}
+   882→            busy={localBusy}
+   883→            onSetupRuntime={setupRuntime}
+   884→            onStart={startLocal}
+   885→            onStop={stopLocal}
+   886→            onRemove={removeLocal}
+   887→          />
+   888→        </div>
+   889→
+   890→        <div className="border-t bg-muted/40 px-3 py-2">
+   891→          <p className="text-[10px] leading-snug text-muted-foreground">
+   892→            <strong>Chaîne de repli :</strong> modèle local (CPU) → modèle du bloc → lien général → clés API (Mistral,
+   893→            Agnes…) → moteur Lumo. En cas de quota épuisé ou d'absence de réseau, le relais s'active automatiquement et
+   894→            la note s'affiche sous la réponse.
+   895→          </p>
+   896→        </div>
+   897→      </PopoverContent>
+   898→    </Popover>
+   899→  )
+   900→}
+   901→
