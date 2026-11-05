@@ -5,6 +5,7 @@ export type Mode =
   | 'image'
   | 'video'
   | 'audio'
+  | 'labs'
   | 'book'
   | 'project'
   | 'free'
@@ -266,6 +267,13 @@ export const MODE_INFO: Record<Mode, ModeInfo> = {
     label: 'Audio',
     tagline: 'Voix, chansons DiffRhythm, transcription',
     description: 'Synthèse vocale, génération de musique (façon Suno) et transcription de fichiers audio.',
+    capability: 'audio',
+  },
+  labs: {
+    label: 'Labs',
+    tagline: 'Studio musical — DiffRhythm & YuE',
+    description:
+      'Studio musical dédié : option 1 DiffRhythm (studio HF), option 2 YuE 2 open source installé en local sur votre machine (paroles → score éditable → chanson complète 48 kHz).',
     capability: 'audio',
   },
   book: {

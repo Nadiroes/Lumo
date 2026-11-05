@@ -7,6 +7,7 @@ import {
   FolderKanban,
   Image as ImageIcon,
   LayoutDashboard,
+  Music4,
   PenLine,
   Sparkles,
   SquareCode,
@@ -23,6 +24,8 @@ export function ModeIcon({ mode, className }: { mode: Mode; className?: string }
       return <Clapperboard className={className} aria-hidden="true" />
     case 'audio':
       return <AudioLines className={className} aria-hidden="true" />
+    case 'labs':
+      return <Music4 className={className} aria-hidden="true" />
     case 'book':
       return <BookOpen className={className} aria-hidden="true" />
     case 'project':
