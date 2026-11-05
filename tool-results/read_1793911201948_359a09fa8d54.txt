@@ -1,0 +1,689 @@
+     1→import { execFile } from 'node:child_process'
+     2→import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+     3→import { tmpdir } from 'node:os'
+     4→import { join } from 'node:path'
+     5→import { promisify } from 'node:util'
+     6→import { NextRequest } from 'next/server'
+     7→import ZAI from 'z-ai-web-dev-sdk'
+     8→import { db } from '@/lib/db'
+     9→
+    10→export const runtime = 'nodejs'
+    11→export const maxDuration = 300
+    12→
+    13→/**
+    14→ * Studio musical Lumo — génération de chansons complètes façon Suno.
+    15→ *
+    16→ * Chaîne de production (serveur) :
+    17→ *   1. Paroles  : GLM écrit des paroles structurées (format DiffRhythm 2)
+    18→ *                 ou restructure celles fournies par l'utilisateur.
+    19→ *   2. Musique  : appel du Space officiel Hugging Face « ASLP-lab/DiffRhythm2 »
+    20→ *                 (modèle semi-autorégressif à blocs — voix + accompagnement),
+    21→ *                 avec le token HF de l'utilisateur s'il est enregistré (quota ZeroGPU).
+    22→ *   3. Repli    : si le studio est indisponible, on prévient le client
+    23→ *                 (event « fallback ») qui bascule sur sa synthèse locale.
+    24→ *
+    25→ * Le flux de réponse est du NDJSON : un objet {stage:...} par ligne, ce qui
+    26→ * permet à l'interface d'afficher chaque étape en temps réel.
+    27→ */
+    28→
+    29→const SPACE_V2 = 'https://aslp-lab-diffrhythm2.hf.space'
+    30→const SPACE_V1 = 'https://aslp-lab-diffrhythm.hf.space'
+    31→const ENGINE = 'DiffRhythm 2'
+    32→
+    33→/** Erreur typique ZeroGPU : quota gratuit épuisé (repérable pour message clair + repli). */
+    34→function isQuotaError(msg: string): boolean {
+    35→  return /zerogpu|gpu quota|exceeded your/i.test(msg)
+    36→}
+    37→
+    38→/** Extrait « Try again in 21:41:07 » d'un message de quota ZeroGPU. */
+    39→function quotaResetIn(msg: string): string | undefined {
+    40→  return msg.match(/try again in ([\d:]+)/i)?.[1]
+    41→}
+    42→
+    43→/* Mémoire courte (module) : index du dernier chemin studio gagnant, valable 10 min. */
+    44→let lastGoodAttempt = -1
+    45→let lastGoodAt = 0
+    46→
+    47→interface MusicBody {
+    48→  prompt: string
+    49→  /** Paroles fournies : format DiffRhythm 2, texte brut, ou timestamps [mm:ss] (nettoyés) */
+    50→  lyrics?: string
+    51→  /** Tags de style libres (text_prompt pour le modèle) */
+    52→  tags?: string
+    53→  /** Style préréglé de l'interface : auto | lofi | electro | ... */
+    54→  style?: string
+    55→  /** Durée cible approximative (s) — pilote le volume de paroles écrit */
+    56→  duration?: number
+    57→  /** Instrumental : DiffRhythm compose sans paroles chantées */
+    58→  instrumental?: boolean
+    59→  /** Qualité de rendu : rapide (16 euler), standard (24 midpoint), studio (40 midpoint) */
+    60→  quality?: 'rapide' | 'standard' | 'studio'
+    61→  format?: 'mp3' | 'wav' | 'ogg'
+    62→}
+    63→
+    64→/**
+    65→ * Présélections de rendu — le couple (steps, solveur) détermine la netteté du chant.
+    66→ * « midpoint » (ordre 2) double le nombre effectif d'évaluations : 24 midpoint ≈ 48 euler
+    67→ * pour un coût GPU ~2× — c'est le meilleur compromis qualité/temps sur ZeroGPU.
+    68→ */
+    69→const QUALITY_PRESETS: Record<'rapide' | 'standard' | 'studio', { steps: number; solver: string; label: string }> = {
+    70→  rapide: { steps: 16, solver: 'euler', label: 'Rapide' },
+    71→  standard: { steps: 24, solver: 'midpoint', label: 'Standard' },
+    72→  studio: { steps: 40, solver: 'midpoint', label: 'Studio' },
+    73→}
+    74→
+    75→function qualityPreset(body: MusicBody) {
+    76→  return QUALITY_PRESETS[body.quality ?? 'standard'] ?? QUALITY_PRESETS.standard
+    77→}
+    78→
+    79→/** Traduction des préréglages UI en tags de style anglais (compris par MuQMuLan) */
+    80→const STYLE_TAGS: Record<string, string> = {
+    81→  auto: '',
+    82→  lofi: 'lo-fi chill, soft beats, vinyl warmth, cozy',
+    83→  electro: 'electronic dance, bright synths, driving beat',
+    84→  cinematic: 'cinematic orchestral, epic strings, emotional',
+    85→  rock: 'energetic rock, electric guitars, live drums',
+    86→  jazz: 'smooth jazz, saxophone, double bass, swing',
+    87→  ambient: 'ambient atmospheric, ethereal pads, slow',
+    88→  pop: 'catchy pop, bright vocals, modern production',
+    89→  funk: 'groovy funk, slap bass, brass section, dance',
+    90→}
+    91→
+    92→/** Nombre de couplets selon la durée cible (le modèle v2 adapte la durée au volume de paroles) */
+    93→function structureHint(duration: number): string {
+    94→  if (duration <= 60) return '1 couplet + 1 refrain — chanson très courte (~1 min)'
+    95→  if (duration <= 120) return '2 couplets + 2 refrains (~2 min)'
+    96→  if (duration <= 200) return '3 couplets, 2-3 refrains, 1 pont (~3 min)'
+    97→  return '4-5 couplets, refrains, 1 pont, final longue (~4 min et plus)'
+    98→}
+    99→
+   100→function jsonEvent(controller: ReadableStreamDefaultController<Uint8Array>, enc: TextEncoder, obj: unknown) {
+   101→  controller.enqueue(enc.encode(JSON.stringify(obj) + '\n'))
+   102→}
+   103→
+   104→/** Nettoie des paroles : retire les timestamps [mm:ss.xx], les séparateurs, normalise */
+   105→function cleanUserLyrics(raw: string): string {
+   106→  return raw
+   107→    .split('\n')
+   108→    .map((l) => l.replace(/^\s*\[\d{1,2}:\d{2}(?:[.:]\d{1,3})?\]\s*/, '').trim()) // timestamps v1
+   109→    .filter((l) => l.length > 0 && !/^[#>/*-]{1,6}\s*$/.test(l)) // vides / séparateurs
+   110→    .join('\n')
+   111→    .trim()
+   112→}
+   113→
+   114→/** Détecte si les paroles suivent déjà le format à sections de DiffRhythm 2 */
+   115→function hasV2Sections(raw: string): boolean {
+   116→  return /^\s*\[(?:start|intro|verse|chorus|bridge|outro)\]/im.test(raw)
+   117→}
+   118→
+   119→async function getUserHfToken(): Promise<`hf_${string}` | undefined> {
+   120→  try {
+   121→    const key = await db.apiKey.findFirst({ where: { provider: 'huggingface' }, select: { secret: true } })
+   122→    return (key?.secret || undefined) as `hf_${string}` | undefined
+   123→  } catch {
+   124→    return undefined
+   125→  }
+   126→}
+   127→
+   128→interface LyricsResult {
+   129→  title: string
+   130→  lrc: string
+   131→}
+   132→
+   133→/** Nettoie un lrc parsé : « \\n » littéraux → retours ligne, backslashes parasites, espaces. */
+   134→function sanitizeLrc(raw: string): string {
+   135→  return raw
+   136→    .replace(/\\r/g, '')
+   137→    .replace(/\\n/g, '\n') // « \n » écrit littéralement par le modèle
+   138→    .replace(/\\(?!["\\/bfnrtu])/g, '') // backslash isolé parasite
+   139→    .split('\n')
+   140→    .map((l) => l.replace(/\s+$/, ''))
+   141→    .join('\n')
+   142→    .replace(/\n{3,}/g, '\n\n')
+   143→    .trim()
+   144→}
+   145→
+   146→/**
+   147→ * Parse la réponse du parolier avec tolérance :
+   148→ * 1. JSON strict extrait du texte ; 2. réparation des échappements invalides
+   149→ * et caractères de contrôle ; 3. extraction par regex du champ lrc en dernier recours.
+   150→ */
+   151→function tolerantParseLyrics(raw: string): { title: string; lrc: string } | undefined {
+   152→  const start = raw.indexOf('{')
+   153→  const end = raw.lastIndexOf('}')
+   154→  if (start < 0 || end <= start) return undefined
+   155→  const chunk = raw.slice(start, end + 1)
+   156→
+   157→  try {
+   158→    const parsed = JSON.parse(chunk) as { title?: string; lrc?: string }
+   159→    if (parsed?.lrc) return { title: String(parsed.title ?? ''), lrc: String(parsed.lrc) }
+   160→  } catch {
+   161→    /* réparation ci-dessous */
+   162→  }
+   163→
+   164→  try {
+   165→    const repaired = chunk
+   166→      .replace(/\\(?!["\\/bfnrtu])/g, '\\\\') // \x invalide → \\x
+   167→      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, ' ') // contrôles bruts
+   168→    const parsed = JSON.parse(repaired) as { title?: string; lrc?: string }
+   169→    if (parsed?.lrc) return { title: String(parsed.title ?? ''), lrc: String(parsed.lrc) }
+   170→  } catch {
+   171→    /* extraction regex ci-dessous */
+   172→  }
+   173→
+   174→  const lrcMatch = chunk.match(/"lrc"\s*:\s*"([\s\S]*)/) // jusqu'à la fin, on déséchappe à la main
+   175→  if (lrcMatch) {
+   176→    let body = lrcMatch[1]
+   177→    const lastQuote = body.lastIndexOf('"')
+   178→    if (lastQuote > 0) body = body.slice(0, lastQuote)
+   179→    const unescaped = body
+   180→      .replace(/\\"/g, '"')
+   181→      .replace(/\\\\/g, '\\')
+   182→      .replace(/\\n/g, '\n')
+   183→    const titleMatch = chunk.match(/"title"\s*:\s*"([^"]*)"/)
+   184→    return { title: titleMatch?.[1] ?? '', lrc: unescaped }
+   185→  }
+   186→  return undefined
+   187→}
+   188→
+   189→function parseLyricsJson(raw: string, what: string): LyricsResult {
+   190→  const parsed = tolerantParseLyrics(raw)
+   191→  if (!parsed) throw new Error(`${what} : réponse illisible`)
+   192→  const lrc = sanitizeLrc(parsed.lrc)
+   193→  if (!lrc || !hasV2Sections(lrc)) throw new Error(`${what} : sections absentes`)
+   194→  return { title: parsed.title.trim() || 'Chanson Lumo', lrc }
+   195→}
+   196→
+   197→/** Appel GLM : écrit des paroles complètes pour DiffRhythm 2. */
+   198→async function generateLyrics(body: MusicBody): Promise<LyricsResult> {
+   199→  const preset = STYLE_TAGS[body.style ?? 'auto'] ?? ''
+   200→  const freeTags = (body.tags ?? '').trim()
+   201→  const styleLine = [preset, freeTags].filter(Boolean).join(', ') || 'au choix selon le thème'
+   202→  const target = Math.min(Math.max(body.duration ?? 120, 30), 285)
+   203→
+   204→  const sys =
+   205→    'Tu es un parolier professionnel travaillant pour un studio de génération musicale IA (DiffRhythm 2). ' +
+   206→    'Tu écris des chansons riches, imagées, émotionnellement progressives. ' +
+   207→    'Tu réponds UNIQUEMENT avec un objet JSON valide, sans markdown ni commentaire.'
+   208→
+   209→  const user = [
+   210→    `Écris une chanson complète sur le thème : « ${body.prompt} ».`,
+   211→    `Style musical : ${styleLine}.`,
+   212→    `Structure visée : ${structureHint(target)}.`,
+   213→    'Les paroles doivent être dans la même langue que le thème (français si le thème est en français).',
+   214→    '',
+   215→    'FORMAT LRC STRICT (champ "lrc" du JSON) :',
+   216→    '- Première ligne : [start]',
+   217→    '- Sections autorisées entre crochets, une par ligne : [intro] [verse] [chorus] [bridge] [outro]',
+   218→    '- Chaque phrase de la chanson sur sa propre ligne (sans timestamp, sans annotation)',
+   219→    '- Utilise [verse] pour chaque couplet et répète [chorus] à l’identique',
+   220→    '- Aucun texte entre parenthèses, aucune indication (pas de « (couplet 2) », pas de « Solo »)',
+   221→    '- Longueurs de lignes naturellement variées',
+   222→    '',
+   223→    'Le JSON final : {"title": "titre court et évocateur (3-6 mots)", "lrc": "le texte complet avec \\n"}',
+   224→  ].join('\n')
+   225→
+   226→  const zai = await ZAI.create()
+   227→  // 1re tentative, puis 1 reprise avec consigne renforcée si le JSON est inexploitable
+   228→  for (let essai = 0; essai < 2; essai++) {
+   229→    const completion = await zai.chat.completions.create({
+   230→      messages: [
+   231→        { role: 'assistant', content: sys },
+   232→        {
+   233→          role: 'user',
+   234→          content:
+   235→            essai === 0
+   236→              ? user
+   237→              : user +
+   238→                '\n\nATTENTION : ta réponse précédente était un JSON invalide. Réponds avec un UNIQUE objet JSON valide ' +
+   239→                '(échappements \" et \\n corrects, aucun backslash superflu), sans texte autour.',
+   240→        },
+   241→      ],
+   242→      thinking: { type: 'disabled' },
+   243→    })
+   244→    const raw = completion.choices[0]?.message?.content ?? ''
+   245→    try {
+   246→      return parseLyricsJson(raw, 'Parolier')
+   247→    } catch (e) {
+   248→      if (essai === 1) throw e
+   249→    }
+   250→  }
+   251→  throw new Error('Parolier : réponse illisible')
+   252→}
+   253→
+   254→/** Structure des paroles fournies par l'utilisateur (préserve ses mots). */
+   255→async function structureUserLyrics(body: MusicBody, cleaned: string): Promise<LyricsResult> {
+   256→  const preset = STYLE_TAGS[body.style ?? 'auto'] ?? ''
+   257→  const sys =
+   258→    'Tu es un arrangeur musical. On te donne les paroles d’une chanson (éventuellement désordonnées). ' +
+   259→    'Tu les organises au format DiffRhythm 2 SANS réécrire le texte : tu ne fais qu’ajouter les balises de sections, ' +
+   260→    'regrouper les lignes en couplets cohérents, répéter un refrain si certains vers reviennent. ' +
+   261→    'Tu ne supprimes ni ne modifie les mots de l’auteur (tu peux retirer des doublons de lignes évidents). ' +
+   262→    'Réponds UNIQUEMENT avec un JSON {"title": "...", "lrc": "..."} — lrc commence par [start], ' +
+   263→    'sections parmi [intro] [verse] [chorus] [bridge] [outro], une ligne par phrase, aucun commentaire.'
+   264→  const user = `Thème/contexte : « ${body.prompt} ». Style : ${[preset, body.tags ?? ''].filter(Boolean).join(', ') || 'libre'}.\n\nParoles à organiser :\n${cleaned}`
+   265→  const zai = await ZAI.create()
+   266→  for (let essai = 0; essai < 2; essai++) {
+   267→    const completion = await zai.chat.completions.create({
+   268→      messages: [
+   269→        { role: 'assistant', content: sys },
+   270→        { role: 'user', content: user },
+   271→      ],
+   272→      thinking: { type: 'disabled' },
+   273→    })
+   274→    const raw = completion.choices[0]?.message?.content ?? ''
+   275→    try {
+   276→      return parseLyricsJson(raw, 'Arrangeur')
+   277→    } catch (e) {
+   278→      if (essai === 1) throw e
+   279→    }
+   280→  }
+   281→  throw new Error('Arrangeur : réponse illisible')
+   282→}
+   283→
+   284→/** Titre de secours dérivé du prompt ou de la première ligne de paroles. */
+   285→function fallbackTitle(body: MusicBody, lrc: string): string {
+   286→  const firstLine =
+   287→    lrc
+   288→      .split('\n')
+   289→      .map((l) => l.trim())
+   290→      .find((l) => l && !l.startsWith('[')) ?? body.prompt
+   291→  const words = (firstLine || 'Chanson Lumo').split(/\s+/).slice(0, 6).join(' ')
+   292→  return (words || 'Chanson Lumo').slice(0, 60)
+   293→}
+   294→
+   295→interface AudioResult {
+   296→  base64: string
+   297→  bytes: number
+   298→  mime: string
+   299→  engine: string
+   300→}
+   301→
+   302→/** Shape minimal du client Gradio utilisé ici. */
+   303→interface GradioClient {
+   304→  predict: (endpoint: string, params?: unknown) => Promise<{ data: unknown }>
+   305→}
+   306→
+   307→/* --------- Post-traitement audio : durée réelle + découpe honnête --------- */
+   308→
+   309→const runTool = promisify(execFile)
+   310→
+   311→/** Durée réelle du fichier via ffprobe (l'estimation par débit binaire est fausse en VBR). */
+   312→async function probeDuration(file: string): Promise<number> {
+   313→  const { stdout } = await runTool(
+   314→    'ffprobe',
+   315→    ['-v', 'error', '-show_entries', 'format=duration', '-of', 'json', file],
+   316→    { timeout: 15_000 },
+   317→  )
+   318→  const d = Number(JSON.parse(stdout)?.format?.duration)
+   319→  return Number.isFinite(d) && d > 0 ? d : 0
+   320→}
+   321→
+   322→/**
+   323→ * « Écoute honnête » :
+   324→ * 1. mesure la durée réelle (ffprobe) ;
+   325→ * 2. si le morceau dépasse nettement la durée demandée — le Space v2 rend toujours ~240 s,
+   326→ *    quitte à enchainer 2 minutes de jam instrumental après la fin du chant — on coupe à la
+   327→ *    durée cible avec un fondu de sortie de 3 s (pas de coupure brutale au milieu d'un temps fort) ;
+   328→ * 3. jamais bloquant : ffmpeg absent ou en échec → fichier original conservé tel quel.
+   329→ */
+   330→async function refineAudio(
+   331→  base64: string,
+   332→  mime: string,
+   333→  targetSec: number,
+   334→): Promise<{ data: Buffer; durationSec: number; trimmed: boolean }> {
+   335→  const ext = mime === 'audio/ogg' ? 'ogg' : mime === 'audio/wav' ? 'wav' : 'mp3'
+   336→  const input = Buffer.from(base64, 'base64')
+   337→  let real = 0
+   338→  const dir = await mkdtemp(join(tmpdir(), 'lumo-audio-'))
+   339→  const src = join(dir, `in.${ext}`)
+   340→  const out = join(dir, `out.${ext}`)
+   341→  try {
+   342→    await writeFile(src, input)
+   343→    try {
+   344→      real = await probeDuration(src)
+   345→    } catch {
+   346→      return { data: input, durationSec: 0, trimmed: false }
+   347→    }
+   348→    const durationSec = Math.round(real)
+   349→    const target = Math.max(30, Math.min(285, Math.round(targetSec)))
+   350→    if (real <= target + 4) return { data: input, durationSec, trimmed: false }
+   351→
+   352→    const fadeStart = Math.max(0, target - 3)
+   353→    const fadeDur = Math.min(3, target - fadeStart)
+   354→    const args = [
+   355→      '-v', 'error', '-y', '-i', src,
+   356→      '-t', String(target),
+   357→      '-af', `afade=t=in:st=0:d=0.05,afade=t=out:st=${fadeStart}:d=${fadeDur}`,
+   358→    ]
+   359→    if (ext === 'mp3') args.push('-c:a', 'libmp3lame', '-b:a', '192k')
+   360→    else if (ext === 'ogg') args.push('-c:a', 'libvorbis', '-q:a', '6')
+   361→    args.push(out)
+   362→    await runTool('ffmpeg', args, { timeout: 60_000 })
+   363→    const data = await readFile(out)
+   364→    if (data.byteLength < 1000) throw new Error('découpe vide')
+   365→    return { data, durationSec: target, trimmed: true }
+   366→  } catch {
+   367→    return { data: input, durationSec: Math.round(real) || 0, trimmed: false }
+   368→  } finally {
+   369→    void rm(dir, { recursive: true, force: true }).catch(() => {})
+   370→  }
+   371→}
+   372→
+   373→/**
+   374→ * Appel Space avec reconnexion automatique (nouvelle session Gradio à chaque essai).
+   375→ * « 404: Session not found » = session périmée : le Space ZeroGPU a redémarré entre
+   376→ * la connexion et l'appel — une reconnexion fraîche suffit presque toujours.
+   377→ */
+   378→async function predictWithRetry(
+   379→  connect: () => Promise<GradioClient>,
+   380→  endpoint: string,
+   381→  params: Record<string, unknown>,
+   382→  timeoutMs = 240_000,
+   383→  tries = 3,
+   384→): Promise<{ data: unknown }> {
+   385→  let lastErr: unknown
+   386→  for (let i = 0; i < tries; i++) {
+   387→    try {
+   388→      const client = await connect()
+   389→      return (await Promise.race([
+   390→        client.predict(endpoint, params),
+   391→        new Promise<never>((_, rej) =>
+   392→          setTimeout(() => rej(new Error(`Délai du studio dépassé (${Math.round(timeoutMs / 1000)} s)`)), timeoutMs),
+   393→        ),
+   394→      ])) as { data: unknown }
+   395→    } catch (e) {
+   396→      lastErr = e
+   397→      const msg = e instanceof Error ? e.message : String(e)
+   398→      const transient =
+   399→        /session not found|connection closed|fetch failed|network|econnreset|socket|502|503|overloaded/i.test(msg)
+   400→      if (!transient || i === tries - 1) throw e
+   401→      await new Promise((r) => setTimeout(r, 1500 * (i + 1)))
+   402→    }
+   403→  }
+   404→  throw lastErr
+   405→}
+   406→
+   407→/** Prompt de style consolidé (tags préréglés + tags libres + thème [+ instrumental]). */
+   408→function buildTextPrompt(body: MusicBody): string {
+   409→  const preset = STYLE_TAGS[body.style ?? 'auto'] ?? ''
+   410→  const base = [preset, (body.tags ?? '').trim(), body.prompt].filter(Boolean).join(', ').slice(0, 260)
+   411→  return body.instrumental ? `${base ? base + ', ' : ''}instrumental, no vocals, music only`.slice(0, 300) : base
+   412→}
+   413→
+   414→/** Paramètres de l'endpoint /infer_music du Space DiffRhythm 2. */
+   415→function buildV2Params(lrc: string, body: MusicBody): Record<string, unknown> {
+   416→  const q = qualityPreset(body)
+   417→  return {
+   418→    lrc,
+   419→    audio_prompt: null,
+   420→    text_prompt: buildTextPrompt(body) || (body.instrumental ? 'instrumental' : 'pop, piano, warm vocals'),
+   421→    seed: 0,
+   422→    randomize_seed: true,
+   423→    steps: q.steps,
+   424→    cfg_strength: 1.3,
+   425→    file_type: body.format ?? 'mp3',
+   426→    odeint_method: q.solver,
+   427→  }
+   428→}
+   429→
+   430→/**
+   431→ * Paramètres du Space DiffRhythm 1 : convertit les paroles à sections en LRC
+   432→ * horodaté (~4,2 s par ligne, chant régulier), durée plafonnée à 95 s.
+   433→ */
+   434→function buildV1Params(lrc: string, body: MusicBody): Record<string, unknown> {
+   435→  const lines = lrc
+   436→    .split('\n')
+   437→    .map((l) => l.trim())
+   438→    .filter((l) => l && !l.startsWith('['))
+   439→  const START = 12
+   440→  const PER_LINE = 4.2
+   441→  let t = START
+   442→  const stamped = lines.map((line) => {
+   443→    const mm = String(Math.floor(t / 60)).padStart(2, '0')
+   444→    const ss = (t % 60).toFixed(3).padStart(6, '0')
+   445→    const out = `[${mm}:${ss}] ${line}`
+   446→    t += PER_LINE
+   447→    return out
+   448→  })
+   449→  const duration = Math.max(30, Math.min(95, Math.round(START + lines.length * PER_LINE + 8)))
+   450→  return {
+   451→    /* v1 chante chaque ligne : en instrumental on laisse une seule ligne de vocalise minimale */
+   452→    lrc: body.instrumental && stamped.length === 0 ? '[00:12.000] ♪' : stamped.join('\n'),
+   453→    ref_audio_path: null,
+   454→    text_prompt: buildTextPrompt(body) || (body.instrumental ? 'instrumental' : 'pop, piano, warm vocals'),
+   455→    seed: 0,
+   456→    randomize_seed: true,
+   457→    steps: 32,
+   458→    cfg_strength: 4.0,
+   459→    file_type: body.format ?? 'mp3',
+   460→    odeint_method: 'euler',
+   461→    preference_infer: 'quality first',
+   462→    Music_Duration: duration,
+   463→  }
+   464→}
+   465→
+   466→/** Appel du Space DiffRhythm 2 (avec ou sans token HF) et téléchargement du morceau. */
+   467→async function callSpaceV2(
+   468→  lrc: string,
+   469→  body: MusicBody,
+   470→  token?: `hf_${string}`,
+   471→): Promise<AudioResult> {
+   472→  const { Client } = await import('@gradio/client')
+   473→  const format = body.format ?? 'mp3'
+   474→
+   475→  const result = await predictWithRetry(
+   476→    () => Client.connect(SPACE_V2, token ? { token } : undefined) as Promise<GradioClient>,
+   477→    '/infer_music',
+   478→    buildV2Params(lrc, body),
+   479→  )
+   480→
+   481→  const first = Array.isArray(result.data) ? result.data[0] : result.data
+   482→  const url = (first as { url?: string })?.url
+   483→  if (!url) throw new Error('Le studio n’a pas renvoyé de fichier audio')
+   484→
+   485→  const dl = await fetch(url, { signal: AbortSignal.timeout(90_000) })
+   486→  if (!dl.ok) throw new Error(`Téléchargement du morceau impossible (${dl.status})`)
+   487→  const buf = await dl.arrayBuffer()
+   488→  return {
+   489→    base64: Buffer.from(buf).toString('base64'),
+   490→    bytes: buf.byteLength,
+   491→    mime: format === 'mp3' ? 'audio/mpeg' : format === 'ogg' ? 'audio/ogg' : 'audio/wav',
+   492→    engine: token ? 'DiffRhythm 2 · compte HF' : 'DiffRhythm 2 · accès public',
+   493→  }
+   494→}
+   495→
+   496→/**
+   497→ * Dernier recours : Space officiel DiffRhythm 1 (95 s max, LRC avec timestamps).
+   498→ * Convertit les paroles à sections en LRC horodaté (~4,2 s par ligne, chant régulier).
+   499→ */
+   500→async function callSpaceV1(lrc: string, body: MusicBody): Promise<AudioResult> {
+   501→  const { Client } = await import('@gradio/client')
+   502→  const format = body.format ?? 'mp3'
+   503→
+   504→  const result = await predictWithRetry(
+   505→    () => Client.connect(SPACE_V1, {}) as Promise<GradioClient>,
+   506→    '/infer_music',
+   507→    buildV1Params(lrc, body),
+   508→  )
+   509→
+   510→  const first = Array.isArray(result.data) ? result.data[0] : result.data
+   511→  const url = (first as { url?: string })?.url
+   512→  if (!url) throw new Error('Le studio n’a pas renvoyé de fichier audio')
+   513→
+   514→  const dl = await fetch(url, { signal: AbortSignal.timeout(90_000) })
+   515→  if (!dl.ok) throw new Error(`Téléchargement du morceau impossible (${dl.status})`)
+   516→  const buf = await dl.arrayBuffer()
+   517→  return {
+   518→    base64: Buffer.from(buf).toString('base64'),
+   519→    bytes: buf.byteLength,
+   520→    mime: format === 'mp3' ? 'audio/mpeg' : format === 'ogg' ? 'audio/ogg' : 'audio/wav',
+   521→    engine: 'DiffRhythm 1 · accès public',
+   522→  }
+   523→}
+   524→
+   525→export async function POST(req: NextRequest) {
+   526→  const enc = new TextEncoder()
+   527→  let body: MusicBody
+   528→  try {
+   529→    body = (await req.json()) as MusicBody
+   530→  } catch {
+   531→    return new Response(JSON.stringify({ ok: false, error: 'Corps de requête invalide' }), { status: 400 })
+   532→  }
+   533→  const prompt = (body.prompt ?? '').trim()
+   534→  const userLyrics = (body.lyrics ?? '').trim()
+   535→  if (!prompt && !userLyrics) {
+   536→    return new Response(
+   537→      JSON.stringify({ ok: false, error: 'Décrivez au moins le thème de la chanson' }),
+   538→      { status: 400 },
+   539→    )
+   540→  }
+   541→
+   542→  const stream = new ReadableStream<Uint8Array>({
+   543→    async start(controller) {
+   544→      let closed = false
+   545→      const safeEmit = (obj: unknown) => {
+   546→        if (!closed) controller.enqueue(enc.encode(JSON.stringify(obj) + '\n'))
+   547→      }
+   548→      try {
+   549→        /* ---- 1. Paroles ---- */
+   550→        let title: string
+   551→        let lrc: string
+   552→        if (body.instrumental) {
+   553→          /* Instrumental : pas de parolier — LRC minimal, le prompt « no vocals » dirige le style.
+   554→           * DiffRhythm 2 génère alors une pièce musicale sans voix. */
+   555→          title = fallbackTitle(body, '')
+   556→          lrc = '[start]'
+   557→          safeEmit({ stage: 'lyrics', source: 'instrumental', title, lrc })
+   558→        } else if (userLyrics && hasV2Sections(userLyrics)) {
+   559→          title = fallbackTitle(body, userLyrics)
+   560→          lrc = userLyrics.startsWith('[start]') ? userLyrics : `[start]\n${userLyrics}`
+   561→          safeEmit({ stage: 'lyrics', source: 'user', title, lrc })
+   562→        } else {
+   563→          try {
+   564→            const res = userLyrics
+   565→              ? await structureUserLyrics(body, cleanUserLyrics(userLyrics))
+   566→              : await generateLyrics(body)
+   567→            title = res.title
+   568→            lrc = res.lrc
+   569→            safeEmit({ stage: 'lyrics', source: userLyrics ? 'user-structured' : 'glm', title, lrc })
+   570→          } catch (e) {
+   571→            if (userLyrics) {
+   572→              title = fallbackTitle(body, userLyrics)
+   573→              lrc = `[start]\n[verse]\n${cleanUserLyrics(userLyrics)}`
+   574→              safeEmit({ stage: 'lyrics', source: 'user-raw', title, lrc })
+   575→            } else {
+   576→              throw e
+   577→            }
+   578→          }
+   579→        }
+   580→
+   581→        /* ---- 2. Studio DiffRhythm — chaîne de repli (quota ZeroGPU ≠ par compte) ----
+   582→         *  a) DiffRhythm 2 avec le token HF de l'utilisateur (quota personnel)
+   583→         *  b) DiffRhythm 2 en accès public (seau de quota anonyme, distinct)
+   584→         *  c) DiffRhythm 1 en accès public (95 s max, LRC horodaté)
+   585→         * On ne bascule vers la synthèse locale qu'en dernier ressort. */
+   586→        safeEmit({ stage: 'studio', engine: ENGINE })
+   587→        const token = await getUserHfToken()
+   588→        const attempts: { label: string; run: () => Promise<AudioResult> }[] = [
+   589→          ...(token ? [{ label: 'votre compte Hugging Face', run: () => callSpaceV2(lrc, body, token) }] : []),
+   590→          { label: 'l’accès public DiffRhythm 2', run: () => callSpaceV2(lrc, body) },
+   591→          { label: 'DiffRhythm 1 (extraits ≤ 95 s)', run: () => callSpaceV1(lrc, body) },
+   592→        ]
+   593→
+   594→        /* On commence directement par le chemin qui a fonctionné récemment
+   595→         * (évite de refaire échouer les tentatives en quota mort à chaque génération). */
+   596→        if (lastGoodAttempt > 0 && lastGoodAttempt < attempts.length && Date.now() - lastGoodAt < 10 * 60_000) {
+   597→          const [good] = attempts.splice(lastGoodAttempt, 1)
+   598→          attempts.unshift(good)
+   599→        }
+   600→
+   601→        let audio: AudioResult | undefined
+   602→        let lastReason = 'studio indisponible'
+   603→        let refined: { durationSec: number; trimmed: boolean } | undefined
+   604→        for (let i = 0; i < attempts.length; i++) {
+   605→          const attempt = attempts[i]
+   606→          try {
+   607→            safeEmit({ stage: 'studio-attempt', label: attempt.label })
+   608→            audio = await attempt.run()
+   609→            lastGoodAttempt = i
+   610→            lastGoodAt = Date.now()
+   611→            /* Écoute honnête : durée réelle mesurée + découpe propre à la durée demandée
+   612→             * (le Space v2 rend ~240 s même pour une chanson demandée à 1 ou 2 min). */
+   613→            const targetSec = Math.min(Math.max(body.duration ?? 120, 30), 285)
+   614→            const ref = await refineAudio(audio.base64, audio.mime, targetSec)
+   615→            audio = {
+   616→              ...audio,
+   617→              base64: ref.data.toString('base64'),
+   618→              bytes: ref.data.byteLength,
+   619→            }
+   620→            refined = { durationSec: ref.durationSec, trimmed: ref.trimmed }
+   621→            break
+   622→          } catch (e) {
+   623→            const raw = e instanceof Error ? e.message : String(e)
+   624→            lastReason = isQuotaError(raw)
+   625→              ? `Quota GPU Hugging Face épuisé pour ${attempt.label}` + (quotaResetIn(raw) ? ` (réinitialisation dans ${quotaResetIn(raw)})` : '')
+   626→              : /session not found/i.test(raw)
+   627→                ? `session du studio expirée (${attempt.label}) — le Space a redémarré, nouvelles tentatives effectuées`
+   628→                : raw.slice(0, 180)
+   629→            safeEmit({ stage: 'studio-retry', label: attempt.label, reason: lastReason })
+   630→          }
+   631→        }
+   632→
+   633→        if (audio) {
+   634→          const durationSec =
+   635→            refined?.durationSec && refined.durationSec > 0
+   636→              ? refined.durationSec
+   637→              : audio.mime === 'audio/mpeg'
+   638→                ? Math.round((audio.bytes * 8) / 128_000)
+   639→                : 0
+   640→          safeEmit({
+   641→            stage: 'done',
+   642→            engine: audio.engine,
+   643→            title,
+   644→            lrc,
+   645→            base64: audio.base64,
+   646→            bytes: audio.bytes,
+   647→            mime: audio.mime,
+   648→            durationSec,
+   649→            quality: qualityPreset(body).label,
+   650→            steps: qualityPreset(body).steps,
+   651→            solver: qualityPreset(body).solver,
+   652→            trimmed: refined?.trimmed === true,
+   653→          })
+   654→        } else {
+   655→          /* Tous les chemins serveur sont morts (quotas IP serveur, Space en redémarrage).
+   656→           * Dernière carte : le navigateur de l'utilisateur appelle lui-même le Space —
+   657→           * sa connexion possède son propre seau de quota ZeroGPU, indépendant du serveur. */
+   658→          safeEmit({
+   659→            stage: 'client-studio',
+   660→            reason: lastReason,
+   661→            title,
+   662→            lrc,
+   663→            attempts: [
+   664→              { space: SPACE_V2, label: 'DiffRhythm 2', params: buildV2Params(lrc, body) },
+   665→              { space: SPACE_V1, label: 'DiffRhythm 1 (≤ 95 s)', params: buildV1Params(lrc, body) },
+   666→            ],
+   667→          })
+   668→        }
+   669→      } catch (e) {
+   670→        safeEmit({
+   671→          stage: 'fallback',
+   672→          reason: e instanceof Error ? e.message.slice(0, 180) : 'erreur inattendue',
+   673→        })
+   674→      } finally {
+   675→        closed = true
+   676→        controller.close()
+   677→      }
+   678→    },
+   679→  })
+   680→
+   681→  return new Response(stream, {
+   682→    headers: {
+   683→      'Content-Type': 'application/x-ndjson; charset=utf-8',
+   684→      'Cache-Control': 'no-cache, no-transform',
+   685→      'X-Accel-Buffering': 'no',
+   686→    },
+   687→  })
+   688→}
+   689→

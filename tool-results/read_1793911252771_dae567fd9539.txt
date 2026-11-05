@@ -1,0 +1,727 @@
+     1→/**
+     2→ * Moteur local Lumo — runtime llama.cpp (CPU) + modèles GGUF.
+     3→ *
+     4→ * - Runtime : binaire officiel précompilé (llama-server) téléchargé depuis les
+     5→ *   releases GitHub de ggml-org/llama.cpp, extrait dans `vendor/llama.cpp/`.
+     6→ *   Installation en un clic, aucune compilation, prise en charge immédiate.
+     7→ * - Modèles : fichiers .gguf téléchargés directement depuis Hugging Face
+     8→ *   (resolve/main), SANS LIMITE DE TAILLE — seule la capacité réelle du disque
+     9→ *   est vérifiée avant chaque téléchargement (marge de sécurité incluse).
+    10→ * - Exécution : llama-server est lancé en processus local (CPU), l'application
+    11→ *   lui parle via son API compatible OpenAI (127.0.0.1, jamais exposé).
+    12→ * - Chaîne de repli : ce moteur est la tête de chaîne dans /api/chat
+    13→ *   (local → modèle du bloc → lien général HF → clés API → Lumo Core).
+    14→ *
+    15→ * Tout est persisté côté disque (models/registry.json) : les modèles survivent
+    16→ * aux redémarrages, les téléchargements reprennent là où ils se sont arrêtés.
+    17→ */
+    18→
+    19→import { execFile, spawn, type ChildProcess } from 'node:child_process'
+    20→import { createWriteStream, existsSync } from 'node:fs'
+    21→import fsp from 'node:fs/promises'
+    22→import net from 'node:net'
+    23→import os from 'node:os'
+    24→import path from 'node:path'
+    25→import { Readable, Transform } from 'node:stream'
+    26→import { pipeline } from 'node:stream/promises'
+    27→import type { ReadableStream as NodeWebReadableStream } from 'node:stream/web'
+    28→import { db } from '@/lib/db'
+    29→
+    30→/* ------------------------------ Types publics ----------------------------- */
+    31→
+    32→export interface LocalModel {
+    33→  /** Identifiant stable : `repoId::file` (ex. `Qwen/…-GGUF::qwen2.5-…q4_k_m.gguf`) */
+    34→  id: string
+    35→  repoId: string
+    36→  file: string
+    37→  size: number
+    38→  addedAt: number
+    39→}
+    40→
+    41→export interface LocalDownload {
+    42→  id: string
+    43→  repoId: string
+    44→  file: string
+    45→  status: 'download' | 'done' | 'error'
+    46→  bytes: number
+    47→  total: number
+    48→  startedAt: number
+    49→  error?: string
+    50→  /** Octets/s (mesuré glissant) */
+    51→  speed?: number
+    52→}
+    53→
+    54→export interface RuntimeInfo {
+    55→  installed: boolean
+    56→  dir?: string
+    57→  version?: string
+    58→  url: string
+    59→}
+    60→
+    61→export interface DiskInfo {
+    62→  totalBytes: number
+    63→  freeBytes: number
+    64→}
+    65→
+    66→/* -------------------------------- Chemins --------------------------------- */
+    67→
+    68→const ROOT = process.cwd()
+    69→const VENDOR_DIR = path.join(ROOT, 'vendor', 'llama.cpp')
+    70→const MODELS_DIR = path.join(ROOT, 'models')
+    71→const REGISTRY_FILE = path.join(MODELS_DIR, 'registry.json')
+    72→const RUNTIME_MARKER = path.join(VENDOR_DIR, 'runtime.json')
+    73→
+    74→/** Release épinglée si l'API GitHub est injoignable (build CPU ubuntu x64) */
+    75→const RUNTIME_URL_FALLBACK =
+    76→  'https://github.com/ggml-org/llama.cpp/releases/download/b12125/llama-b12125-bin-ubuntu-x64.tar.gz'
+    77→
+    78→/** Marge de sécurité avant tout téléchargement (le système a aussi besoin de place) */
+    79→const DISK_MARGIN = 512 * 1024 * 1024
+    80→
+    81→/** Délai maximal de chargement d'un modèle en RAM (CPU) */
+    82→const LOAD_TIMEOUT_MS = 150_000
+    83→
+    84→/* ------------------------------- Utilitaires ------------------------------ */
+    85→
+    86→export function localModelId(repoId: string, file: string): string {
+    87→  return `${repoId}::${file}`
+    88→}
+    89→
+    90→/** Chemin disque d'un modèle. Le pseudo-repo `local` = dépôt manuel à la racine. */
+    91→function modelPath(repoId: string, file: string): string {
+    92→  const safeFile = file.replace(/^\/+/, '')
+    93→  if (repoId === 'local') return path.join(MODELS_DIR, safeFile)
+    94→  const safeRepo = repoId.replace(/\.\.+/g, '.')
+    95→  return path.join(MODELS_DIR, safeRepo, safeFile)
+    96→}
+    97→
+    98→function fmtBytes(n: number): string {
+    99→  if (!Number.isFinite(n) || n <= 0) return '?'
+   100→  const units = ['o', 'Ko', 'Mo', 'Go', 'To']
+   101→  let i = 0
+   102→  let v = n
+   103→  while (v >= 1024 && i < units.length - 1) {
+   104→    v /= 1024
+   105→    i++
+   106→  }
+   107→  return `${v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)} ${units[i]}`
+   108→}
+   109→
+   110→function hfUrl(repoId: string, file: string): string {
+   111→  return `https://huggingface.co/${repoId}/resolve/main/${file}`
+   112→}
+   113→
+   114→async function hfToken(): Promise<string | undefined> {
+   115→  try {
+   116→    const row = await db.apiKey.findUnique({ where: { provider: 'huggingface' } })
+   117→    return row?.secret ?? undefined
+   118→  } catch {
+   119→    return undefined
+   120→  }
+   121→}
+   122→
+   123→/* ------------------------------ Disque et RAM ----------------------------- */
+   124→
+   125→export async function diskInfo(dir: string = MODELS_DIR): Promise<DiskInfo> {
+   126→  await fsp.mkdir(dir, { recursive: true })
+   127→  try {
+   128→    const s = await fsp.statfs(dir)
+   129→    return { totalBytes: Number(s.blocks) * Number(s.bsize), freeBytes: Number(s.bavail) * Number(s.bsize) }
+   130→  } catch {
+   131→    // Repli portable : df -k (POSIX)
+   132→    const out = await new Promise<string>((resolve, reject) => {
+   133→      execFile('df', ['-k', '-P', dir], { timeout: 5000 }, (err, stdout) =>
+   134→        err ? reject(err) : resolve(stdout),
+   135→      )
+   136→    })
+   137→    const lines = out.trim().split('\n')
+   138→    const cols = (lines[lines.length - 1] ?? '').split(/\s+/)
+   139→    return { totalBytes: Number(cols[1]) * 1024, freeBytes: Number(cols[3]) * 1024 }
+   140→  }
+   141→}
+   142→
+   143→/**
+   144→ * Garde-fou AVANT tout téléchargement : le disque doit pouvoir accueillir le
+   145→ * fichier + la marge de sécurité. AUCUNE limite de taille artificielle — un
+   146→ * modèle de 22 Go ou 80 Go passe, tant que le disque le permet.
+   147→ */
+   148→export async function assertDiskSpace(neededBytes: number): Promise<DiskInfo> {
+   149→  const d = await diskInfo()
+   150→  if (d.freeBytes < neededBytes + DISK_MARGIN) {
+   151→    throw new Error(
+   152→      `Espace disque insuffisant : ${fmtBytes(neededBytes)} nécessaires, ${fmtBytes(d.freeBytes)} libres. ` +
+   153→        'Libérez de la place ou choisissez un modèle plus léger.',
+   154→    )
+   155→  }
+   156→  return d
+   157→}
+   158→
+   159→export function ramInfo(): DiskInfo {
+   160→  return { totalBytes: os.totalmem(), freeBytes: os.freemem() }
+   161→}
+   162→
+   163→/* ---------------------------- Runtime llama.cpp --------------------------- */
+   164→
+   165→let serverBinCache: string | null | undefined
+   166→
+   167→async function findServerBin(refresh = false): Promise<string | null> {
+   168→  if (serverBinCache !== undefined && !refresh) return serverBinCache
+   169→  const direct = path.join(VENDOR_DIR, 'llama-server')
+   170→  if (existsSync(direct)) return (serverBinCache = direct)
+   171→  try {
+   172→    const entries = await fsp.readdir(VENDOR_DIR, { withFileTypes: true, recursive: true })
+   173→    for (const e of entries) {
+   174→      if (!e.isFile() || (e.name !== 'llama-server' && e.name !== 'llama-server.exe')) continue
+   175→      const dir = (e as unknown as { parentPath?: string; path?: string }).parentPath ??
+   176→        (e as unknown as { path?: string }).path ?? VENDOR_DIR
+   177→      return (serverBinCache = path.join(dir, e.name))
+   178→    }
+   179→  } catch {
+   180→    /* runtime pas encore installé */
+   181→  }
+   182→  return (serverBinCache = null)
+   183→}
+   184→
+   185→/** Asset précompilé adapté à la plateforme courante (build CPU officiel) */
+   186→function runtimeAssetPattern(): RegExp | null {
+   187→  if (process.platform === 'darwin') {
+   188→    return process.arch === 'arm64' ? /^llama-.*-bin-macos-arm64\.tar\.gz$/ : /^llama-.*-bin-macos-x64\.tar\.gz$/
+   189→  }
+   190→  if (process.platform === 'linux') {
+   191→    return process.arch === 'arm64' ? /^llama-.*-bin-ubuntu-arm64\.tar\.gz$/ : /^llama-.*-bin-ubuntu-x64\.tar\.gz$/
+   192→  }
+   193→  return null // Windows : pas d'archive précompilée CPU officielle fiable
+   194→}
+   195→
+   196→async function resolveRuntimeUrl(): Promise<string> {
+   197→  const want = runtimeAssetPattern()
+   198→  if (!want) return RUNTIME_URL_FALLBACK
+   199→  try {
+   200→    const res = await fetch('https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30', {
+   201→      headers: { 'User-Agent': 'Lumo', Accept: 'application/vnd.github+json' },
+   202→      signal: AbortSignal.timeout(15_000),
+   203→    })
+   204→    if (res.ok) {
+   205→      const releases = (await res.json()) as { assets?: { name: string; browser_download_url: string }[] }[]
+   206→      for (const r of releases) {
+   207→        for (const a of r.assets ?? []) {
+   208→          if (want.test(a.name) && !/cuda|vulkan|sycl|rocm|openvino/i.test(a.name)) return a.browser_download_url
+   209→        }
+   210→      }
+   211→    }
+   212→  } catch {
+   213→    /* repli sur l'URL épinglée */
+   214→  }
+   215→  return RUNTIME_URL_FALLBACK
+   216→}
+   217→
+   218→function execOut(cmd: string, args: string[], timeout = 60_000): Promise<{ out: string; err: string }> {
+   219→  return new Promise((resolve, reject) => {
+   220→    execFile(cmd, args, { timeout, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) =>
+   221→      err ? reject(err instanceof Error ? err : new Error(String(err))) : resolve({ out: String(stdout), err: String(stderr) }),
+   222→    )
+   223→  })
+   224→}
+   225→
+   226→/** llama.cpp affiche sa bannière sur stderr — on lit les deux flux. */
+   227→function firstVersionLine(stdout: string, stderr: string): string {
+   228→  for (const line of `${stdout}\n${stderr}`.split('\n')) {
+   229→    const t = line.trim()
+   230→    if (t.toLowerCase().startsWith('version:')) return t.replace(/^version:\s*/i, '').trim()
+   231→  }
+   232→  return ''
+   233→}
+   234→
+   235→export async function runtimeInfo(): Promise<RuntimeInfo> {
+   236→  const bin = await findServerBin()
+   237→  if (!bin) {
+   238→    let pending = RUNTIME_URL_FALLBACK
+   239→    try {
+   240→      pending = await resolveRuntimeUrl()
+   241→    } catch {
+   242→      /* URL épinglée */
+   243→    }
+   244→    return { installed: false, url: pending }
+   245→  }
+   246→  let version = 'llama.cpp'
+   247→  try {
+   248→    const { out, err } = await execOut(bin, ['--version'], 10_000)
+   249→    version = firstVersionLine(out, err) || 'llama.cpp'
+   250→  } catch {
+   251→    /* binaire présent mais non exécutable — on tentera au démarrage */
+   252→  }
+   253→  let url = RUNTIME_URL_FALLBACK
+   254→  try {
+   255→    url = (JSON.parse(await fsp.readFile(RUNTIME_MARKER, 'utf8')) as { url?: string }).url ?? RUNTIME_URL_FALLBACK
+   256→  } catch {
+   257→    /* pas de marqueur */
+   258→  }
+   259→  return { installed: true, dir: path.dirname(bin), version, url }
+   260→}
+   261→
+   262→/**
+   263→ * Installation du runtime en un clic : téléchargement de l'archive officielle
+   264→ * précompilée (~25 Mo), extraction, vérification de llama-server. Idempotent.
+   265→ */
+   266→export async function setupRuntime(): Promise<RuntimeInfo> {
+   267→  const existing = await findServerBin()
+   268→  if (existing) return runtimeInfo()
+   269→
+   270→  const want = runtimeAssetPattern()
+   271→  if (!want) {
+   272→    throw new Error('Runtime précompilé disponible pour Linux et macOS — sur Windows, utilisez WSL2.')
+   273→  }
+   274→  await fsp.mkdir(VENDOR_DIR, { recursive: true })
+   275→  const url = await resolveRuntimeUrl()
+   276→  const archive = path.join(VENDOR_DIR, 'runtime.tar.gz')
+   277→
+   278→  try {
+   279→    await new Promise<void>((resolve, reject) => {
+   280→      const child = spawn('curl', ['-fL', '--retry', '3', '--connect-timeout', '20', '-o', archive, url], {
+   281→        stdio: 'ignore',
+   282→      })
+   283→      child.on('error', reject)
+   284→      child.on('exit', (code) =>
+   285→        code === 0 ? resolve() : reject(new Error(`Téléchargement du runtime impossible (curl ${code}).`)),
+   286→      )
+   287→    })
+   288→    await execOut('tar', ['-xzf', archive, '-C', VENDOR_DIR])
+   289→  } finally {
+   290→    await fsp.rm(archive, { force: true }).catch(() => undefined)
+   291→  }
+   292→
+   293→  const bin = await findServerBin(true)
+   294→  if (!bin) throw new Error('Archive du runtime inattendue : llama-server introuvable après extraction.')
+   295→  await execOut('chmod', ['+x', bin]).catch(() => ({ out: '', err: '' }))
+   296→
+   297→  const info = await runtimeInfo()
+   298→  await fsp.mkdir(VENDOR_DIR, { recursive: true })
+   299→  await fsp.writeFile(RUNTIME_MARKER, JSON.stringify({ url, installedAt: Date.now(), version: info.version }, null, 2))
+   300→  return info
+   301→}
+   302→
+   303→/* ---------------------------- Registre de modèles ------------------------- */
+   304→
+   305→async function readRegistry(): Promise<LocalModel[]> {
+   306→  try {
+   307→    const raw = JSON.parse(await fsp.readFile(REGISTRY_FILE, 'utf8')) as Partial<LocalModel>[]
+   308→    if (!Array.isArray(raw)) return []
+   309→    return raw
+   310→      .filter((m) => typeof m.repoId === 'string' && typeof m.file === 'string')
+   311→      .map((m) => ({
+   312→        id: m.id ?? localModelId(String(m.repoId), String(m.file)),
+   313→        repoId: String(m.repoId),
+   314→        file: String(m.file),
+   315→        size: Number(m.size ?? 0),
+   316→        addedAt: Number(m.addedAt ?? 0),
+   317→      }))
+   318→  } catch {
+   319→    return []
+   320→  }
+   321→}
+   322→
+   323→async function writeRegistry(models: LocalModel[]): Promise<void> {
+   324→  await fsp.mkdir(MODELS_DIR, { recursive: true })
+   325→  await fsp.writeFile(REGISTRY_FILE, JSON.stringify(models, null, 2))
+   326→}
+   327→
+   328→/** Parcours disque : tout .gguf présent (y compris déposé manuellement) est un modèle. */
+   329→async function scanGguf(dir: string, depth: number, out: { repoId: string; file: string; addedAt: number }[]): Promise<void> {
+   330→  if (depth > 4) return
+   331→  let entries: Awaited<ReturnType<typeof fsp.readdir>>
+   332→  try {
+   333→    entries = await fsp.readdir(dir, { withFileTypes: true })
+   334→  } catch {
+   335→    return
+   336→  }
+   337→  for (const e of entries) {
+   338→    if (e.name.startsWith('.') || e.name === 'registry.json') continue
+   339→    const full = path.join(dir, e.name)
+   340→    if (e.isDirectory()) {
+   341→      await scanGguf(full, depth + 1, out)
+   342→    } else if (e.isFile() && e.name.toLowerCase().endsWith('.gguf')) {
+   343→      const rel = path.relative(MODELS_DIR, full).split(path.sep)
+   344→      const fileName = rel.pop() ?? e.name
+   345→      const repoId = rel.length >= 2 ? `${rel[0]}/${rel[1]}` : rel.length === 1 ? rel[0] : 'local'
+   346→      const file = rel.length > 2 ? [...rel.slice(2), fileName].join('/') : fileName
+   347→      let addedAt = 0
+   348→      try {
+   349→        addedAt = (await fsp.stat(full)).mtimeMs
+   350→      } catch {
+   351→        /* ignoré */
+   352→      }
+   353→      out.push({ repoId, file, addedAt })
+   354→    }
+   355→  }
+   356→}
+   357→
+   358→/** Modèles installés = registre ∪ fichiers .gguf réellement présents sur disque. */
+   359→export async function listLocalModels(): Promise<LocalModel[]> {
+   360→  await fsp.mkdir(MODELS_DIR, { recursive: true })
+   361→  const reg = await readRegistry()
+   362→  const byId = new Map<string, LocalModel>(reg.map((m) => [m.id, m]))
+   363→
+   364→  const scanned: { repoId: string; file: string; addedAt: number }[] = []
+   365→  await scanGguf(MODELS_DIR, 0, scanned)
+   366→  let discovered = false
+   367→  for (const s of scanned) {
+   368→    const id = localModelId(s.repoId, s.file)
+   369→    if (!byId.has(id)) {
+   370→      byId.set(id, { id, repoId: s.repoId, file: s.file, size: 0, addedAt: s.addedAt || Date.now() })
+   371→      discovered = true
+   372→    }
+   373→  }
+   374→
+   375→  const models: LocalModel[] = []
+   376→  for (const m of byId.values()) {
+   377→    try {
+   378→      const st = await fsp.stat(modelPath(m.repoId, m.file))
+   379→      if (st.isFile()) models.push({ ...m, size: st.size })
+   380→    } catch {
+   381→      /* le fichier a disparu — retiré de la liste */
+   382→    }
+   383→  }
+   384→  models.sort((a, b) => b.addedAt - a.addedAt)
+   385→
+   386→  if (discovered || models.length !== reg.length) await writeRegistry(models)
+   387→  return models
+   388→}
+   389→
+   390→/** Retrouve un modèle local installé correspondant à un dépôt HF (lien de bloc). */
+   391→export async function findLocalForRepo(repoRef: string): Promise<LocalModel | undefined> {
+   392→  const models = await listLocalModels()
+   393→  if (!models.length) return undefined
+   394→  const ref = repoRef.trim().replace(/\/+$/, '').toLowerCase()
+   395→  if (!ref) return undefined
+   396→  const base = ref.split('/').pop() ?? ''
+   397→  return (
+   398→    models.find((m) => m.repoId.toLowerCase() === ref) ??
+   399→    (base.length > 2 ? models.find((m) => m.repoId.toLowerCase().endsWith(`/${base}`) || m.repoId.toLowerCase() === base) : undefined) ??
+   400→    (base.length > 2 ? models.find((m) => m.file.toLowerCase().includes(base)) : undefined)
+   401→  )
+   402→}
+   403→
+   404→export async function removeLocalModel(id: string): Promise<void> {
+   405→  const model = (await listLocalModels()).find((m) => m.id === id)
+   406→  await stopEngine(id)
+   407→  if (!model) throw new Error('Modèle introuvable.')
+   408→  const dest = modelPath(model.repoId, model.file)
+   409→  if (!path.resolve(dest).startsWith(path.resolve(MODELS_DIR))) {
+   410→    throw new Error('Chemin de modèle invalide.')
+   411→  }
+   412→  await fsp.rm(dest, { force: true })
+   413→  // Nettoyage des dossiers devenus vides
+   414→  let dir = path.dirname(dest)
+   415→  while (path.resolve(dir).startsWith(path.resolve(MODELS_DIR)) && path.resolve(dir) !== path.resolve(MODELS_DIR)) {
+   416→    try {
+   417→      await fsp.rmdir(dir)
+   418→    } catch {
+   419→      break
+   420→    }
+   421→    dir = path.dirname(dir)
+   422→  }
+   423→  await writeRegistry((await readRegistry()).filter((m) => m.id !== id))
+   424→}
+   425→
+   426→/* ----------------------------- Téléchargements ---------------------------- */
+   427→
+   428→const downloads = new Map<string, LocalDownload>()
+   429→
+   430→export function allDownloads(): LocalDownload[] {
+   431→  return [...downloads.values()].map((d) => ({ ...d }))
+   432→}
+   433→
+   434→export function downloadState(id: string): LocalDownload | undefined {
+   435→  const d = downloads.get(id)
+   436→  return d ? { ...d } : undefined
+   437→}
+   438→
+   439→/**
+   440→ * Téléchargement HF direct (resolve/main), avec reprise automatique (Range) sur
+   441→ * téléchargement partiel et jeton HF optionnel pour les dépôts privés/gated.
+   442→ * Tourne en arrière-plan : la requête HTTP rend la main immédiatement.
+   443→ */
+   444→export async function startDownload(repoId: string, file: string, total?: number): Promise<void> {
+   445→  const id = localModelId(repoId, file)
+   446→  const cur = downloads.get(id)
+   447→  if (cur && cur.status === 'download') return // déjà en cours
+   448→
+   449→  const dest = modelPath(repoId, file)
+   450→  if (!path.resolve(dest).startsWith(path.resolve(MODELS_DIR))) {
+   451→    throw new Error('Chemin de destination invalide.')
+   452→  }
+   453→  await fsp.mkdir(path.dirname(dest), { recursive: true })
+   454→  // Reprise sur le fichier partiel (.part) — le .gguf final n'apparaît qu'une fois complet
+   455→  const part = `${dest}.part`
+   456→  let resumeFrom = 0
+   457→  try {
+   458→    resumeFrom = (await fsp.stat(part)).size
+   459→  } catch {
+   460→    /* nouveau fichier */
+   461→  }
+   462→
+   463→  const st: LocalDownload = {
+   464→    id,
+   465→    repoId,
+   466→    file,
+   467→    status: 'download',
+   468→    bytes: resumeFrom,
+   469→    total: total ?? 0,
+   470→    startedAt: Date.now(),
+   471→  }
+   472→  downloads.set(id, st)
+   473→  void pump(st, hfUrl(repoId, file), dest, part, resumeFrom)
+   474→}
+   475→
+   476→async function pump(st: LocalDownload, url: string, dest: string, part: string, resumeFrom: number): Promise<void> {
+   477→  let lastTick = Date.now()
+   478→  let lastBytes = resumeFrom
+   479→  try {
+   480→    const headers: Record<string, string> = { 'User-Agent': 'Lumo' }
+   481→    if (resumeFrom > 0) headers.Range = `bytes=${resumeFrom}-`
+   482→    const token = await hfToken()
+   483→    if (token) headers.Authorization = `Bearer ${token}`
+   484→
+   485→    const res = await fetch(url, { headers, redirect: 'follow' })
+   486→
+   487→    // 416 : le fichier local est déjà complet
+   488→    if (res.status === 416 && resumeFrom > 0) {
+   489→      await fsp.rename(part, dest)
+   490→      st.status = 'done'
+   491→      st.bytes = resumeFrom
+   492→      st.total = resumeFrom
+   493→      await registerModel(st)
+   494→      return
+   495→    }
+   496→    if (!res.ok || !res.body) {
+   497→      throw new Error(
+   498→        res.status === 401 || res.status === 403
+   499→          ? 'Accès refusé par Hugging Face (dépôt privé ou gated — vérifiez le jeton HF dans Paramètres).'
+   500→          : `Hugging Face a répondu ${res.status}.`,
+   501→      )
+   502→    }
+   503→
+   504→    // Taille totale : Content-Range (reprise) ou Content-Length (début)
+   505→    const contentRange = res.headers.get('content-range')
+   506→    const contentLength = Number(res.headers.get('content-length') ?? 0)
+   507→    if (contentRange) {
+   508→      const t = Number(contentRange.split('/')[1])
+   509→      if (Number.isFinite(t) && t > 0) st.total = t
+   510→    } else if (contentLength > 0) {
+   511→      st.total = resumeFrom + contentLength
+   512→    }
+   513→
+   514→    // Si le serveur a ignoré la reprise (200 au lieu de 206), on repart de zéro
+   515→    const ranged = resumeFrom > 0 && res.status === 206
+   516→    if (resumeFrom > 0 && !ranged) {
+   517→      resumeFrom = 0
+   518→      st.bytes = 0
+   519→      lastBytes = 0
+   520→    }
+   521→
+   522→    const nodeStream = Readable.fromWeb(res.body as unknown as NodeWebReadableStream<Uint8Array>)
+   523→    const counter = new Transform({
+   524→      transform(chunk: Buffer, _enc, cb) {
+   525→        st.bytes += chunk.length
+   526→        const now = Date.now()
+   527→        if (now - lastTick >= 800) {
+   528→          st.speed = Math.round(((st.bytes - lastBytes) * 1000) / (now - lastTick))
+   529→          lastTick = now
+   530→          lastBytes = st.bytes
+   531→        }
+   532→        cb(null, chunk)
+   533→      },
+   534→    })
+   535→    const ws = createWriteStream(part, { flags: ranged ? 'a' : 'w' })
+   536→    await pipeline(nodeStream, counter, ws)
+   537→
+   538→    st.status = 'done'
+   539→    st.speed = undefined
+   540→    if (st.total > 0) st.bytes = st.total
+   541→    await fsp.rename(part, dest)
+   542→    await registerModel(st)
+   543→  } catch (e) {
+   544→    st.status = 'error'
+   545→    st.speed = undefined
+   546→    st.error = e instanceof Error ? e.message : 'Téléchargement interrompu.'
+   547→  }
+   548→}
+   549→
+   550→async function registerModel(st: LocalDownload): Promise<void> {
+   551→  const reg = await readRegistry()
+   552→  const size = st.total > 0 ? st.total : st.bytes
+   553→  const i = reg.findIndex((m) => m.id === st.id)
+   554→  const entry: LocalModel = { id: st.id, repoId: st.repoId, file: st.file, size, addedAt: Date.now() }
+   555→  if (i >= 0) reg[i] = entry
+   556→  else reg.unshift(entry)
+   557→  await writeRegistry(reg)
+   558→}
+   559→
+   560→/* ------------------------------ Moteur (serveur) -------------------------- */
+   561→
+   562→interface Engine {
+   563→  id: string
+   564→  port: number
+   565→  child: ChildProcess
+   566→  startedAt: number
+   567→  ready: boolean
+   568→}
+   569→
+   570→const engines = new Map<string, Engine>()
+   571→const stderrTail = new Map<string, string>()
+   572→
+   573→export function engineStatus(id: string): { running: boolean; port?: number } {
+   574→  const e = engines.get(id)
+   575→  if (!e || e.child.exitCode !== null) return { running: false }
+   576→  return { running: true, port: e.port }
+   577→}
+   578→
+   579→async function freePort(start: number): Promise<number> {
+   580→  for (let p = start; p < start + 64; p++) {
+   581→    const ok = await new Promise<boolean>((resolve) => {
+   582→      const srv = net.createServer()
+   583→      srv.once('error', () => resolve(false))
+   584→      srv.once('listening', () => srv.close(() => resolve(true)))
+   585→      srv.listen(p, '127.0.0.1')
+   586→    })
+   587→    if (ok) return p
+   588→  }
+   589→  throw new Error('Aucun port libre pour le moteur local.')
+   590→}
+   591→
+   592→async function waitHealthy(engine: Engine, label: string, timeoutMs: number): Promise<void> {
+   593→  const deadline = Date.now() + timeoutMs
+   594→  for (;;) {
+   595→    const child = engine.child
+   596→    if (!child || child.exitCode !== null) {
+   597→      const tail = (stderrTail.get(engine.id) ?? '').trim().split('\n').filter(Boolean).pop()
+   598→      throw new Error(
+   599→        `llama-server s'est arrêté (${child?.exitCode ?? child?.signalCode ?? '?'})${tail ? ` — ${tail.slice(0, 200)}` : ''}`,
+   600→      )
+   601→    }
+   602→    try {
+   603→      const res = await fetch(`http://127.0.0.1:${engine.port}/health`, { signal: AbortSignal.timeout(1200) })
+   604→      if (res.ok) {
+   605→        engine.ready = true
+   606→        return
+   607→      }
+   608→    } catch {
+   609→      /* pas encore prêt */
+   610→    }
+   611→    if (Date.now() > deadline) {
+   612→      throw new Error(
+   613→        `Le modèle ${label} met trop de temps à se charger en RAM (CPU). ` +
+   614→          'Le chargement continue en arrière-plan — réessayez dans un instant.',
+   615→      )
+   616→    }
+   617→    await new Promise((r) => setTimeout(r, 700))
+   618→  }
+   619→}
+   620→
+   621→async function killEngine(e: Engine): Promise<void> {
+   622→  const child = e.child
+   623→  if (!child || child.exitCode !== null) {
+   624→    engines.delete(e.id)
+   625→    return
+   626→  }
+   627→  await new Promise<void>((resolve) => {
+   628→    child.once('exit', () => resolve())
+   629→    try {
+   630→      child.kill('SIGTERM')
+   631→    } catch {
+   632→      /* déjà mort */
+   633→    }
+   634→    setTimeout(() => {
+   635→      if (child.exitCode === null) {
+   636→        try {
+   637→          child.kill('SIGKILL')
+   638→        } catch {
+   639→          /* déjà mort */
+   640→        }
+   641→      }
+   642→      setTimeout(resolve, 1500)
+   643→    }, 3000)
+   644→  })
+   645→  engines.delete(e.id)
+   646→}
+   647→
+   648→/**
+   649→ * Démarre (ou réutilise) le llama-server du modèle : chargement en RAM puis
+   650→ * /health OK. Un seul modèle à la fois (CPU/RAM) — le précédent est arrêté.
+   651→ */
+   652→export async function ensureEngine(id: string): Promise<{ port: number }> {
+   653→  const bin = await findServerBin()
+   654→  if (!bin) throw new Error('Runtime llama.cpp non installé — cliquez d’abord sur « Installer le runtime ».')
+   655→  const model = (await listLocalModels()).find((m) => m.id === id)
+   656→  if (!model) throw new Error('Modèle local introuvable — installez-le d’abord.')
+   657→
+   658→  const cur = engines.get(id)
+   659→  if (cur && cur.child.exitCode === null) {
+   660→    if (!cur.ready) await waitHealthy(cur, model.file, LOAD_TIMEOUT_MS)
+   661→    return { port: cur.port }
+   662→  }
+   663→
+   664→  // Un seul moteur actif à la fois : on arrête proprement les autres
+   665→  for (const e of [...engines.values()]) {
+   666→    if (e.id !== id && e.child.exitCode === null) await killEngine(e)
+   667→  }
+   668→
+   669→  const port = await freePort(8710)
+   670→  const dest = modelPath(model.repoId, model.file)
+   671→  const threads = Math.max(1, Math.min(os.cpus().length, 8))
+   672→  const child = spawn(
+   673→    bin,
+   674→    ['-m', dest, '--host', '127.0.0.1', '--port', String(port), '-c', '4096', '-t', String(threads), '--no-webui'],
+   675→    { stdio: ['ignore', 'ignore', 'pipe'] },
+   676→  )
+   677→  stderrTail.set(id, '')
+   678→  child.stderr?.on('data', (chunk: Buffer) => {
+   679→    stderrTail.set(id, ((stderrTail.get(id) ?? '') + chunk.toString()).slice(-900))
+   680→  })
+   681→  const engine: Engine = { id, port, child, startedAt: Date.now(), ready: false }
+   682→  engines.set(id, engine)
+   683→
+   684→  await waitHealthy(engine, model.file, LOAD_TIMEOUT_MS)
+   685→  return { port }
+   686→}
+   687→
+   688→export async function stopEngine(id: string): Promise<void> {
+   689→  const e = engines.get(id)
+   690→  if (!e) return
+   691→  await killEngine(e)
+   692→  stderrTail.delete(id)
+   693→}
+   694→
+   695→/* ------------------------------ Génération -------------------------------- */
+   696→
+   697→/**
+   698→ * Conversation via le moteur local (API compatible OpenAI de llama-server).
+   699→ * Démarre le modèle si nécessaire — la première génération inclut le chargement.
+   700→ */
+   701→export async function chatLocal(
+   702→  localId: string,
+   703→  system: string,
+   704→  history: { role: 'user' | 'assistant'; content: string }[],
+   705→): Promise<string> {
+   706→  const { port } = await ensureEngine(localId)
+   707→  const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+   708→    method: 'POST',
+   709→    headers: { 'Content-Type': 'application/json' },
+   710→    body: JSON.stringify({
+   711→      messages: [{ role: 'system', content: system }, ...history.slice(-12)],
+   712→      temperature: 0.7,
+   713→      max_tokens: 1024,
+   714→      stream: false,
+   715→    }),
+   716→    signal: AbortSignal.timeout(110_000),
+   717→  })
+   718→  const json = (await res.json().catch(() => null)) as
+   719→    | { choices?: { message?: { content?: string } }[]; error?: { message?: string } }
+   720→    | null
+   721→  const content = json?.choices?.[0]?.message?.content
+   722→  if (!res.ok || typeof content !== 'string' || !content.trim()) {
+   723→    throw new Error(json?.error?.message || `Le moteur local a répondu ${res.status}.`)
+   724→  }
+   725→  return content.trim()
+   726→}
+   727→
